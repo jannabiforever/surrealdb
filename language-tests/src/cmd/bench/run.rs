@@ -1,52 +1,45 @@
-//TODO: Remove once cache and other backends are properly implemented.
-#![allow(dead_code)]
-
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
-use std::time::Instant;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
-use crate::cmd::bench::DEFAULT_NOISE_THRESHOLD;
-use crate::cmd::bench::DEFAULT_SIGNIFICANCE_THRESHOLD;
-use crate::cmd::bench::stats::ComparisonData;
-use crate::cmd::bench::stats::MeasurementData;
-use crate::cmd::bench::store::BenchMarkRun;
-use crate::cmd::bench::store::StoreConfig;
-use crate::cmd::bench::store::get_store;
-use crate::cmd::util;
-use crate::cmd::util::ImportFailure;
-use crate::tests::RunSetBuilder;
-use crate::tests::TestRun;
-use crate::tests::run::CaseImports;
-use crate::tests::run::RunConfig;
-use crate::tests::schema::BoolOr;
-use crate::tests::schema::NewPlannerStrategyConfig;
-use crate::tests::schema::TestConfig;
-use crate::{
-	cli::{Backend, ColorMode},
-	tests::CaseSet,
-};
-use anyhow::Context;
-use anyhow::Result;
-use anyhow::{anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::ArgMatches;
 use semver::Version;
 use sha2::{Digest, Sha256};
 use surrealdb_core::channel;
-use surrealdb_core::dbs::Capabilities;
 use surrealdb_core::dbs::capabilities::Targets;
+use surrealdb_core::dbs::{Capabilities, Session};
 use surrealdb_core::env::VERSION;
-use surrealdb_core::kvs::Builder;
-use surrealdb_core::kvs::Datastore;
+use surrealdb_core::kvs::{Builder, Datastore};
+
+use crate::cli::{Backend, ColorMode};
+use crate::cmd::bench::stats::{ComparisonData, MeasurementData};
+use crate::cmd::bench::store::{BenchMarkRun, StoreConfig, get_store};
+use crate::cmd::bench::{DEFAULT_NOISE_THRESHOLD, DEFAULT_SIGNIFICANCE_THRESHOLD};
+use crate::cmd::util;
+use crate::cmd::util::ImportFailure;
+use crate::tests::run::{CaseImports, RunConfig, TestRunId};
+use crate::tests::schema::{BoolOr, NewPlannerStrategyConfig, TestConfig};
+use crate::tests::{CaseSet, RunSetBuilder, TestRun};
 
 struct BenchRunConfig {
 	cache_id: String,
+	/// Short label of the dataset variant this run uses (from `[bench].datasets`),
+	/// or `None` when the bench runs once against its `[env].imports`.
+	variant: Option<String>,
+	/// Per-variant import chain to run instead of `case.imports`. `None` falls
+	/// back to the case's own resolved imports.
+	imports: Option<Vec<Arc<crate::tests::case::TestCase>>>,
 }
 
 impl RunConfig for BenchRunConfig {
 	fn name(&self, case: &CaseImports) -> String {
-		case.test.origin.path.clone()
+		match &self.variant {
+			Some(v) => format!("{} [{v}]", case.test.origin.path),
+			None => case.test.origin.path.clone(),
+		}
 	}
 }
 
@@ -71,13 +64,55 @@ fn calc_cache_id(case: &CaseImports) -> String {
 }
 
 struct BenchConfig {
+	// Placeholder for the deferred dataset-cache work; scoped allow so the rest
+	// of the module stays lint-checked for dead code.
+	#[allow(dead_code)]
 	ds_cache: String,
 	backend: Backend,
+	/// Temp directory under which file-backed datastores (rocksdb/surrealkv) are
+	/// built; `None` for the in-memory backend. Removed when `run()` returns.
+	bench_root: Option<PathBuf>,
 	new_planner: NewPlannerStrategyConfig,
+}
+
+/// Counter for unique per-datastore subdirectories under `bench_root`.
+static DS_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Connection string for the configured backend. File-backed engines get a fresh
+/// subdirectory each call, so every `prepare()` builds a clean datastore.
+fn datastore_conn(config: &BenchConfig) -> String {
+	let scheme = match config.backend {
+		Backend::Memory => return "mem://".to_string(),
+		Backend::RocksDb => "rocksdb",
+		Backend::SurrealKv => "surrealkv",
+		Backend::TikV => unreachable!("TiKV is rejected before prepare()"),
+	};
+	let root = config.bench_root.as_ref().expect("file backend requires a bench root");
+	let id = DS_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+	format!("{scheme}://{}", root.join(format!("store_{id}")).display())
+}
+
+/// Removes its directory tree on drop, cleaning up file-backed datastores.
+struct CleanupDir(PathBuf);
+
+impl Drop for CleanupDir {
+	fn drop(&mut self) {
+		let _ = std::fs::remove_dir_all(&self.0);
+	}
+}
+
+/// Creates (clean) the temp root for this run's file-backed datastores.
+fn make_bench_root() -> Result<PathBuf> {
+	let root = std::env::temp_dir().join(format!("surreal_bench_{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&root);
+	std::fs::create_dir_all(&root).context("Could not create bench datastore directory")?;
+	Ok(root)
 }
 
 struct CmdConfig<'a> {
 	path: &'a String,
+	filter: Option<&'a String>,
+	dataset: Option<&'a String>,
 	backend: Backend,
 	ds_cache: &'a String,
 	save: bool,
@@ -88,12 +123,16 @@ impl<'a> CmdConfig<'a> {
 	fn from_matches(parent: &'a ArgMatches, current: &'a ArgMatches) -> Self {
 		let path: &String = current.get_one("path").unwrap();
 
+		let filter = current.get_one::<String>("filter");
+		let dataset = current.get_one::<String>("dataset");
 		let backend = *current.get_one::<Backend>("backend").unwrap();
 		let ds_cache = current.get_one::<String>("ds-cache").unwrap();
 		let save = current.get_flag("save");
 
 		Self {
 			path,
+			filter,
+			dataset,
 			backend,
 			ds_cache,
 			save,
@@ -115,32 +154,44 @@ pub async fn run(color: ColorMode, parent: &ArgMatches, current: &ArgMatches) ->
 	let cfg = CmdConfig::from_matches(parent, current);
 	let set = CaseSet::load_surrealql_files(cfg.path, &mut load_errors).await?;
 
+	// Resolve the backend. The in-memory engine needs no storage; file-backed
+	// engines (rocksdb/surrealkv) build into a temporary directory (a fresh
+	// subdir per datastore). TiKV needs an external cluster, so it's unsupported.
+	let bench_root = match cfg.backend {
+		Backend::Memory => None,
+		#[cfg(feature = "backend-rocksdb")]
+		Backend::RocksDb => Some(make_bench_root()?),
+		#[cfg(not(feature = "backend-rocksdb"))]
+		Backend::RocksDb => {
+			bail!("RocksDb benchmarking requires building with `--features backend-rocksdb`")
+		}
+		// surrealkv is always available under the `bench` feature (kv-surrealkv).
+		Backend::SurrealKv => Some(make_bench_root()?),
+		Backend::TikV => {
+			bail!("TiKV is not supported for benchmarking (it needs an external cluster)")
+		}
+	};
+	// Removes the whole temp tree when `run()` returns; declared here so it drops
+	// after every datastore created during the run.
+	let _bench_root_cleanup = bench_root.clone().map(CleanupDir);
+
 	let config = BenchConfig {
 		ds_cache: cfg.ds_cache.clone(),
 		backend: cfg.backend,
+		bench_root,
 		new_planner: NewPlannerStrategyConfig::BestEffortRo,
 	};
 
 	let mut store = get_store(&cfg.store).await?;
 
-	// Check if the backend is supported by the enabled features.
-	match cfg.backend {
-		Backend::Memory => {}
-		#[cfg(feature = "backend-rocksdb")]
-		Backend::RocksDb => {}
-		#[cfg(not(feature = "backend-rocksdb"))]
-		Backend::RocksDb => bail!("RocksDb backend feature is not enabled"),
-		#[cfg(feature = "backend-surrealkv")]
-		Backend::SurrealKv => {}
-		#[cfg(not(feature = "backend-surrealkv"))]
-		Backend::SurrealKv => bail!("SurrealKV backend feature is not enabled"),
-		Backend::TikV => bail!("TiKV backend is not supported for benchmarking"),
-	}
-
 	let core_version = Version::parse(VERSION).unwrap();
 	let set_builder = RunSetBuilder::new(&set, &mut load_errors)
 		// Only run test for which run is enabled.
 		.with_filter(|x| x.test.config.parsed.bench.run)
+		// Only run benches whose path matches the optional filter.
+		.with_filter(|x| {
+			cfg.filter.is_none_or(|filter| x.test.origin.path.contains(filter.as_str()))
+		})
 		// Only run test for this backend.
 		.with_filter(|x| {
 			let config_backend = &x.test.config.parsed.env.backend;
@@ -170,24 +221,88 @@ pub async fn run(color: ColorMode, parent: &ArgMatches, current: &ArgMatches) ->
 
 			true
 		})
-		// Run for all config the test has configured.
+		// One config per bench; dataset-matrix expansion happens after build()
+		// (below) where the CaseSet is available for resolving import chains.
 		.with_expander(|x| {
 			vec![BenchRunConfig {
 				cache_id: calc_cache_id(x),
+				variant: None,
+				imports: None,
 			}]
 		});
 
-	let set = set_builder.build();
+	let built = set_builder.build();
 
-	if set.is_empty() {
+	// Expand each bench that declares `[bench].datasets` into one run per dataset,
+	// resolving each dataset's (transitive) import chain. Benches without
+	// `datasets` pass through unchanged and use their `[env].imports`.
+	let mut runs = Vec::with_capacity(built.len());
+	for run in built {
+		let datasets = run.case.test.config.parsed.bench.datasets.clone();
+		if datasets.is_empty() {
+			runs.push(run);
+			continue;
+		}
+		for (name, path) in &datasets {
+			// `--dataset` selects a single matrix variant by its (exact) name.
+			if let Some(want) = cfg.dataset
+				&& name != want.as_str()
+			{
+				continue;
+			}
+			let chain = set.resolve_imports(
+				std::slice::from_ref(path),
+				run.case.test.id,
+				&run.case.test.origin,
+				&mut load_errors,
+			);
+			let Some(chain) = chain else {
+				continue;
+			};
+			runs.push(TestRun {
+				// Reassigned to a unique value below.
+				id: TestRunId::new(0),
+				case: run.case.clone(),
+				config: BenchRunConfig {
+					cache_id: run.config.cache_id.clone(),
+					variant: Some(name.clone()),
+					imports: Some(chain),
+				},
+			});
+		}
+	}
+
+	// Passthrough runs keep their original `build()` ids while expanded runs are
+	// freshly created, so renumber to keep ids unique across the final set.
+	for (idx, run) in runs.iter_mut().enumerate() {
+		run.id = TestRunId::new(idx);
+	}
+
+	if runs.is_empty() {
 		println!("No benchmarks found, exiting");
 		return Ok(());
 	}
 
 	let mut measurements = Vec::new();
-	for i in set.into_iter() {
+	for i in runs.into_iter() {
+		// `rebuild = true` benches rebuild the datastore and re-run their imports
+		// every iteration. On a file backend that means re-importing the dataset
+		// to disk each time, which is impractically slow — so restrict mutating
+		// benches to the in-memory backend and skip them elsewhere.
+		if cfg.backend != Backend::Memory && i.case.test.config.parsed.bench.rebuild {
+			println!(
+				"Skipping {} (`rebuild = true` benches only run on the `mem` backend)",
+				i.name()
+			);
+			continue;
+		}
+
+		// Key the baseline on the run name, not just the file path, so the two
+		// variants of a dataset-matrix bench (`[unindexed]`/`[indexed]`) don't
+		// share — and overwrite — one baseline slot. For non-matrix benches the
+		// name is just the path, so this is unchanged.
 		let baseline = store
-			.fetch_latest(&i.case.test.origin.path, cfg.backend)
+			.fetch_latest(&i.name(), cfg.backend)
 			.await
 			.context("Could not fetch latest measurement data")?;
 
@@ -220,6 +335,14 @@ pub async fn run(color: ColorMode, parent: &ArgMatches, current: &ArgMatches) ->
 			BenchRunResult::Ok(measurement, compare) => {
 				measurements.push((i, measurement, compare));
 			}
+		}
+
+		// The bench's datastore has dropped (run_bench returned), so reclaim the
+		// file-backed store dir(s) before the next bench rather than letting them
+		// accumulate until the whole tree is removed at the end of the run.
+		if let Some(root) = config.bench_root.as_deref() {
+			let _ = std::fs::remove_dir_all(root);
+			let _ = std::fs::create_dir_all(root);
 		}
 	}
 
@@ -337,7 +460,8 @@ pub async fn run(color: ColorMode, parent: &ArgMatches, current: &ArgMatches) ->
 			store
 				.add(BenchMarkRun {
 					measurement: m,
-					path: i.case.test.origin.path.clone(),
+					// Match the variant-aware key used by `fetch_latest` above.
+					path: i.name(),
 					backend: cfg.backend,
 				})
 				.await
@@ -381,6 +505,47 @@ enum BenchRunResult {
 	Ok(MeasurementData, Option<ComparisonData>),
 }
 
+/// Builds a fresh in-memory datastore, runs the bench's imports, and performs
+/// index compaction so the datastore is ready to execute the timed statement.
+///
+/// Returns `Ok(Err(..))` when an import fails so the caller can surface it as an
+/// [`BenchRunResult::Import`].
+async fn prepare(
+	run: &TestRun<BenchRunConfig>,
+	config: &BenchConfig,
+	token: &tokio_util::sync::CancellationToken,
+) -> Result<std::result::Result<(Arc<Datastore>, Session), ImportFailure>> {
+	let dbs = Arc::new(
+		builder_from_config(&run.case.test.config.parsed)
+			.build_with_path(&datastore_conn(config))
+			.await?,
+	);
+
+	let session =
+		util::session_from_test_config(&run.case.test.config.parsed, config.new_planner.into());
+
+	// Use the per-variant dataset import chain (from `[bench].datasets`) when one
+	// was selected, otherwise fall back to the bench's own resolved imports.
+	let imports = run.config.imports.as_deref().unwrap_or(&run.case.imports);
+	if let Some(e) = util::run_imports_list(imports, session.clone(), &dbs).await? {
+		return Ok(Err(e));
+	}
+
+	Datastore::index_compaction(dbs.clone(), Duration::from_secs(1), token.clone()).await?;
+
+	Ok(Ok((dbs, session)))
+}
+
+/// Emits a sentinel line on stderr delimiting the measured region of a bench,
+/// so an external profiler can attach for only the timed statements and skip the
+/// dataset import + warmup (see `scripts/bench/profile.sh`). No-op unless the
+/// `BENCH_MARKERS` env var is set, to keep normal `bench run` output clean.
+fn bench_marker(name: &str) {
+	if std::env::var_os("BENCH_MARKERS").is_some() {
+		eprintln!("{name}");
+	}
+}
+
 async fn run_bench(
 	run: &TestRun<BenchRunConfig>,
 	config: &BenchConfig,
@@ -394,23 +559,31 @@ async fn run_bench(
 	let warmup_time = bench_config.warmup.0;
 	let token = tokio_util::sync::CancellationToken::new();
 
+	// When the bench is read-only (`rebuild = false`, the default) the datastore
+	// is built and populated once, then reused across every warmup and measured
+	// iteration so we time only the statement against a stable dataset. Mutating
+	// benches (`rebuild = true`) instead get a fresh datastore per iteration.
+	let shared = if bench_config.rebuild {
+		None
+	} else {
+		match prepare(run, config, &token).await? {
+			Ok(prepared) => Some(prepared),
+			Err(e) => return Ok(BenchRunResult::Import(e)),
+		}
+	};
+
 	let before_warmup = Instant::now();
 	let mut count = 0usize;
 	loop {
-		let dbs = Arc::new(
-			builder_from_config(&run.case.test.config.parsed).build_with_path("mem").await?,
-		);
-
-		let session =
-			util::session_from_test_config(&run.case.test.config.parsed, config.new_planner.into());
-
-		if let Some(e) = util::run_imports(run, session.clone(), &dbs).await? {
-			return Ok(BenchRunResult::Import(e));
+		if let Some((dbs, session)) = shared.as_ref() {
+			let _ = dbs.execute(&run.case.test.source, session, None).await?;
+		} else {
+			let (dbs, session) = match prepare(run, config, &token).await? {
+				Ok(prepared) => prepared,
+				Err(e) => return Ok(BenchRunResult::Import(e)),
+			};
+			let _ = dbs.execute(&run.case.test.source, &session, None).await?;
 		}
-
-		Datastore::index_compaction(dbs.clone(), Duration::from_secs(1), token.clone()).await?;
-
-		let _ = dbs.execute(&run.case.test.source, &session, None).await?;
 
 		count += 1;
 
@@ -443,33 +616,35 @@ async fn run_bench(
 		Duration::from_secs_f64(estimate)
 	);
 
+	// Mark the measured region so a profiler attaching mid-run (after the dataset
+	// import + warmup) samples only the timed statements.
+	bench_marker("__BENCH_MEASURE_START__");
+
 	let mut iterations = Vec::new();
 	let mut samples = Vec::new();
 	for _ in 0..bench_config.sample_size {
 		let mut sample_duration = 0.0;
 		for _ in 0..iterations_per_samples {
-			let dbs = Arc::new(
-				builder_from_config(&run.case.test.config.parsed).build_with_path("mem").await?,
-			);
+			if let Some((dbs, session)) = shared.as_ref() {
+				let start = Instant::now();
+				let _ = dbs.execute(&run.case.test.source, session, None).await?;
+				sample_duration += start.elapsed().as_secs_f64();
+			} else {
+				let (dbs, session) = match prepare(run, config, &token).await? {
+					Ok(prepared) => prepared,
+					Err(e) => return Ok(BenchRunResult::Import(e)),
+				};
 
-			let session = util::session_from_test_config(
-				&run.case.test.config.parsed,
-				config.new_planner.into(),
-			);
-
-			if let Some(e) = util::run_imports(run, session.clone(), &dbs).await? {
-				return Ok(BenchRunResult::Import(e));
+				let start = Instant::now();
+				let _ = dbs.execute(&run.case.test.source, &session, None).await?;
+				sample_duration += start.elapsed().as_secs_f64();
 			}
-
-			Datastore::index_compaction(dbs.clone(), Duration::from_secs(1), token.clone()).await?;
-
-			let start = Instant::now();
-			let _ = dbs.execute(&run.case.test.source, &session, None).await?;
-			sample_duration += start.elapsed().as_secs_f64();
 		}
 		iterations.push(iterations_per_samples as f64);
 		samples.push(sample_duration);
 	}
+
+	bench_marker("__BENCH_MEASURE_END__");
 
 	let measurement = MeasurementData::from_iteration_times(iterations, samples);
 	let comp = baseline.map(|baseline| ComparisonData::compare(&baseline, &measurement));

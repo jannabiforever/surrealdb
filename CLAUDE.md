@@ -44,6 +44,11 @@ cd language-tests && cargo run run -- --test path/to/test.surql
 # Auto-generate test results
 # Note: The test results must be empty for the auto-generation to work.
 cd language-tests && cargo run run -- --results accept path/to/test.surql
+
+# Benchmark a language-test bench (measures by default; --profile records a flamegraph)
+# Pass the bench filter and flags after `--`. See language-tests/README.md > Benchmarking.
+cargo make bench -- scans/where_integer_in_many_full --save
+cargo make bench -- scans/where_integer_in_many_full --profile --dataset indexed
 ```
 
 ## Testing Conventions

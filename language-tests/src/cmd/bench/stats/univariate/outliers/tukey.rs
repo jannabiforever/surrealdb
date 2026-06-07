@@ -40,11 +40,10 @@
 use std::ops::{Deref, Index};
 use std::slice;
 
-use crate::cmd::bench::stats::univariate::Sample;
-
 use surrealdb_types::SurrealValue;
 
 use self::Label::*;
+use crate::cmd::bench::stats::univariate::Sample;
 
 /// A classified/labeled sample.
 ///

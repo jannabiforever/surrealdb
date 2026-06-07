@@ -4,7 +4,7 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Error, Result};
 use tokio::fs;
 
 use crate::tests::TestLoadError;
@@ -118,6 +118,107 @@ impl CaseSet {
 		self.cases.iter()
 	}
 
+	/// Resolve a list of import paths transitively (imports-of-imports included),
+	/// returning the ordered, de-duplicated list of import cases with each
+	/// dependency placed before the file that imports it.
+	///
+	/// `importing` and `origin` identify the file whose imports are being
+	/// resolved (used for relative-path resolution and error attribution).
+	/// Returns `None` if any import could not be resolved (errors are pushed to
+	/// `errors`).
+	pub fn resolve_imports(
+		&self,
+		import_paths: &[String],
+		importing: CaseId,
+		origin: &Arc<Origin>,
+		errors: &mut Vec<TestLoadError>,
+	) -> Option<Vec<Arc<TestCase>>> {
+		let mut out = Vec::new();
+		let mut visited = Vec::new();
+		if self.resolve_imports_into(
+			import_paths,
+			importing,
+			origin,
+			errors,
+			&mut visited,
+			&mut out,
+		) {
+			Some(out)
+		} else {
+			None
+		}
+	}
+
+	/// Recursive worker for [`resolve_imports`](Self::resolve_imports).
+	///
+	/// Appends each resolved import to `out` with dependencies first — an
+	/// import's own `[env].imports` are resolved before the import itself —
+	/// using `visited` (a list of [`CaseId`] indices) to de-duplicate shared
+	/// imports and guard against cycles. Missing or ambiguous imports push a
+	/// [`TestLoadError`] onto `errors`. Returns `true` only if every import
+	/// resolved.
+	fn resolve_imports_into(
+		&self,
+		import_paths: &[String],
+		importing: CaseId,
+		origin: &Arc<Origin>,
+		errors: &mut Vec<TestLoadError>,
+		visited: &mut Vec<usize>,
+		out: &mut Vec<Arc<TestCase>>,
+	) -> bool {
+		let mut ok = true;
+		for import in import_paths {
+			match self.find_import(import, importing) {
+				Some(x) if x.len() == 1 => {
+					let imp = x[0].clone();
+					// Dedup + cycle guard: skip anything already added or in progress.
+					if visited.contains(&imp.id.0) {
+						continue;
+					}
+					visited.push(imp.id.0);
+					// Resolve this import's own imports first so dependencies run
+					// before the file that depends on them.
+					let nested = &imp.config.parsed.env.imports;
+					if !nested.is_empty()
+						&& !self.resolve_imports_into(
+							nested,
+							imp.id,
+							&imp.origin,
+							errors,
+							visited,
+							out,
+						) {
+						ok = false;
+					}
+					out.push(imp);
+				}
+				Some(_) => {
+					errors.push(TestLoadError {
+						origin: origin.clone(),
+						error: Error::msg(format!(
+							"Import `{import}` refered to a file which contained multiple tests"
+						)),
+					});
+					ok = false;
+				}
+				None => {
+					errors.push(TestLoadError {
+						origin: origin.clone(),
+						error: Error::msg(format!("Could not find import `{import}`")),
+					});
+					ok = false;
+				}
+			}
+		}
+		ok
+	}
+
+	/// Loads every `.surql` file under `root` (recursively) into a [`CaseSet`].
+	///
+	/// Each file's config comment is parsed into a [`TestCase`] keyed by its path
+	/// relative to `root`. Files whose config fails to parse are recorded in
+	/// `errors` (with their [`Origin`]) and skipped rather than aborting the whole
+	/// load, so one bad file doesn't hide the rest. Non-`.surql` files are ignored.
 	pub async fn load_surrealql_files(root: &str, errors: &mut Vec<TestLoadError>) -> Result<Self> {
 		let mut cases = Vec::new();
 		let mut by_path = HashMap::new();

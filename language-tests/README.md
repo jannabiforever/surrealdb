@@ -43,6 +43,194 @@ cargo run --features backend-rocksdb run --backend rocksdb
 cargo run --features backend-tikv run --backend tikv
 ```
 
+## Benchmarking
+
+The same `.surql` corpus doubles as a benchmark suite. The entry point is the
+`cargo make bench` task: it **measures** timing by default, or records a
+**flamegraph** with `--profile`. Pass the bench filter (a path substring) and any
+flags after `--`:
+
+```bash
+# measure one bench — times the statement(s) and compares to the saved baseline
+cargo make bench -- scans/count
+
+# persist this run as the new comparison baseline
+cargo make bench -- scans/count --save
+
+# profile the measured statements with samply (opens an interactive flamegraph)
+cargo make bench -- scans/where_integer_in_many_full --profile
+
+# restrict a matrix scan to a single dataset variant (see "dataset matrix" below)
+cargo make bench -- scans/where_integer_in_many_full --dataset indexed
+```
+
+Benches run **strictly serially** (never in parallel — that would corrupt
+timings). Each bench warms up, then collects `sample_size` samples and reports
+mean / median / std-dev / MAD with confidence intervals, plus a comparison
+against the saved baseline (improved / regressed / within-noise, with a
+p-value).
+
+By default benches run on the in-memory engine. `--backend surrealkv` (always
+available) or `--backend rocksdb` (build with `--features backend-rocksdb`) run
+them on the file-backed engines instead, in a temporary directory that's removed
+afterwards. TiKV is unsupported (it needs an external cluster). Mutating
+(`rebuild = true`) benches only run on `mem` — on a file backend they'd re-import
+the dataset to disk every iteration — and are skipped (with a notice) otherwise:
+
+```bash
+cargo make bench -- scans/count --backend surrealkv
+```
+
+### `[bench]` config
+
+```toml
+[bench]
+run = true               # include this file in `bench run`
+rebuild = false          # see below; defaults to false
+warmup = "2s"            # warmup duration
+sample-size = 50         # number of samples (note: kebab-case keys)
+measurement-time = "20s" # target total measurement window
+```
+
+`rebuild` controls datastore lifecycle:
+
+- `rebuild = false` (default): the datastore is built and imports are run **once**
+  before timing, then every measured iteration executes the bench statement
+  against that same stable, pre-populated dataset. This is what you want for
+  **read-only** benches (scans/selects) — it lets the import populate e.g. 100k
+  rows a single time and then measures only the query.
+- `rebuild = true`: the datastore is rebuilt and imports re-run before **every**
+  iteration. Required for **mutating** benches (CREATE / UPDATE / DELETE) which
+  need a clean slate each time, otherwise state accumulates across iterations and
+  the workload drifts.
+
+The crud-bench ports live under [tests/bench/](tests/bench) in the `scans/`,
+`batches/`, and `util/` folders. The read-only scan ports set `rebuild = false`
+and import a shared dataset from `util/` (100k rows mirroring
+`crud-bench/config/bench.toml`'s `[value]` shape). They also set `[test] run =
+false` so the 100k-row, randomly-generated dataset is exercised only by `bench
+run` and not by the regular `cargo run run` correctness suite (where it would
+blow the timeout and produce non-deterministic results).
+
+Layout (under `tests/bench/`):
+
+```
+util/                                # import-only datasets (never run on their own)
+  records-100000.surql               # 100k rows, NO indexes (the row generation, in one place)
+  records-100000-indexed.surql       # imports records-100000 + adds the standard indexes
+  records-100000-fulltext.surql      # imports records-100000 + adds analyzer + BM25 fulltext index
+  records-seq-100000.surql           # 100k rows with sequential ids (for record-range scans)
+  records-100.surql / records-1000.surql       # small row counts for batch CRUD
+  graph-sparse-5000.surql            # 5k person nodes + ~2 `knows` edges each (sparse)
+  graph-dense-5000.surql             # 5k person nodes + ~10 `knows` edges each (dense)
+  embeddings-hnsw-5000.surql         # 5k 8-d vectors + HNSW index
+  embeddings-diskann-5000.surql      # 5k 8-d vectors + DiskANN index
+  embeddings-flat-5000.surql         # 5k 8-d vectors, no index (brute-force KNN)
+  references-5000.surql              # 5k users (+ `friends` link array) + 15k comments whose `author` is a record REFERENCE
+scans/
+  count / limit / start_limit        # no filter — indexing is irrelevant
+  where_*.surql                      # filter scans — run against BOTH datasets (see below)
+  aggregate_* / subquery_*           # GROUP BY / GROUP ALL stats / uncorrelated subqueries
+  order_by_score_desc / range_scan_* # full sort; contiguous record-id range (± ORDER BY)
+fulltext/                            # BM25 search: single / multi-AND / multi-OR (`@@`)
+graph/                               # 1-/2-hop (+ counts), filtered, mid-path filter, inbound,
+                                     #   bidirectional, recursive, path-collect, shortest-path traversals
+                                     #   (each runs against BOTH the sparse and dense graph)
+vector/                              # KNN: HNSW vs DiskANN vs brute-force
+references/                          # record references: reverse (`<~`) traversal/count/filtered, FETCH single + array
+mutate/                              # UPDATE/DELETE … WHERE, batch UPSERT, explicit transaction
+crud/                                # batch create/read/update/delete (100, 1000)
+```
+
+The derived datasets import the base via `[env] imports = ["./records-100000.surql"]`
+and only add their indexes — the 100k-row generation block lives in exactly one
+file. Imports are resolved transitively, so a scan importing
+`records-100000-indexed` runs `records-100000` first.
+
+Each conditional (`WHERE`) scan is a single file that runs against **both**
+datasets via the dataset matrix — `[bench].datasets` is a name → import map:
+
+```toml
+[bench]
+rebuild = false
+datasets = { unindexed = "../util/records-100000.surql", indexed = "../util/records-100000-indexed.surql" }
+```
+
+The harness expands this into one run per named dataset (labelled `[unindexed]`
+and `[indexed]`), so the identical query is measured both doing a full table scan
+and using the index — from one file, no duplication. Run the whole set or one
+query (both variants run):
+
+```bash
+cargo make bench -- scans
+cargo make bench -- scans/where_integer_eq_full
+```
+
+To run a single matrix variant, add `--dataset <name>` (matched exactly against
+the dataset names):
+
+```bash
+cargo make bench -- scans/where_integer_eq_full --dataset unindexed
+cargo make bench -- scans/where_integer_eq_full --dataset indexed
+```
+
+`--dataset` only affects matrix benches; non-matrix benches (count, limit,
+fulltext, …) are unaffected.
+
+### Profiling & flamegraphs
+
+Add `--profile` to record a flamegraph of the measured statements with
+[`samply`](https://github.com/mstange/samply), built through the `profiling`
+cargo profile (release + `line-tables-only` debug info, unstripped,
+`panic=unwind`, thin-LTO for fast iterative rebuilds):
+
+```bash
+cargo make bench -- scans/where_integer_in_many_full --profile
+# saves target/bench-profile/<slug>.json.gz (+ a <slug>.json.syms.json symbol
+# sidecar next to it), then:
+samply load target/bench-profile/<slug>.json.gz   # interactive flamegraph in the browser
+
+# one variant of a matrix scan (one import, one measured region):
+cargo make bench -- scans/where_integer_in_many_full --profile --dataset indexed
+```
+
+The profiler records with `--unstable-presymbolicate`, which resolves symbols at
+record time (the binary + its `.o` debug-map files are present then) into the
+`.syms.json` sidecar. `samply load` reads it automatically, so frames show
+function names rather than raw hex addresses — keep the sidecar next to the
+profile. (Attach-mode samply otherwise defers symbolication to load time and
+can't find the debug info.)
+
+**The profile covers only the measured statements — not the dataset setup.** For
+a `rebuild = false` scan, the one-time 100k-row import (document generation +
+index build) would otherwise dominate the flamegraph even though it isn't timed.
+To avoid that, the harness prints a `__BENCH_MEASURE_START__` marker on stderr
+(when `BENCH_MARKERS=1`) just before the timed loop; the profiler runs the import
+and warmup un-sampled, waits for that marker, then attaches `samply record -p
+<pid>` for the measured region only.
+
+samply is used instead of `cargo flamegraph` because it samples without `sudo`
+on both macOS and Linux (`cargo flamegraph` relies on `dtrace`, which is
+SIP-restricted on macOS). On macOS the script runs `samply setup --yes` once to
+codesign the sampler.
+
+### Under the hood
+
+`cargo make bench` runs `scripts/bench/bench.sh`, which forwards the filter and
+flags to `scripts/bench/measure.sh` (timing, the default) or, with `--profile`,
+`scripts/bench/profile.sh` (samply). You can call those scripts directly with the
+same arguments, or drive the harness binary yourself:
+
+```bash
+# run every bench (no filter), or one by path substring; --save/--dataset optional
+cargo run --features bench -- bench run [--save] [--dataset NAME] [--backend mem] [<filter>]
+```
+
+`scripts/bench/optimise.workflow.js` is a workflow recipe driving an AI
+optimisation loop: baseline → inspect the profile → propose & apply one engine
+change → re-measure → keep only if the harness reports a significant speedup. See
+the header of that file for how to launch it.
+
 ## SurrealQL Language Test Format
 
 Language test are plain surrealql files that are parse-able by the normal

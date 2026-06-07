@@ -838,12 +838,44 @@ impl Capabilities {
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct BenchDetails {
+	/// Whether to include this file in the benchmark suite (`bench run`). The
+	/// bench equivalent of `[test].run`; set to `false` for files that exist
+	/// only to be imported by other benches. Defaults to `true`.
 	#[serde(default = "t")]
 	pub run: bool,
+	/// Whether to rebuild the datastore (and rerun imports) before every
+	/// measured iteration.
+	///
+	/// Defaults to `false`, which builds the datastore and runs imports once
+	/// before the warmup/measurement loops, so a read-only bench measures only
+	/// the timed statement against a stable, pre-populated dataset. Set to
+	/// `true` for mutating benches (CREATE/UPDATE/DELETE) which require a clean
+	/// slate per iteration.
+	#[serde(default)]
+	pub rebuild: bool,
+	/// Run this bench once per named dataset, each resolved (transitively) as the
+	/// bench's import for that run. Lets a single read-only scan be measured
+	/// against multiple datasets — e.g. one without indexes and one with — from a
+	/// single file. The key is a short variant name (shown in the run label and
+	/// selectable with `--dataset <name>`); the value is the import path. When
+	/// empty (default) the bench runs once using `[env].imports`.
+	///
+	/// ```toml
+	/// datasets = { unindexed = "../_dataset.surql", indexed = "../_dataset_indexed.surql" }
+	/// ```
+	#[serde(default)]
+	pub datasets: BTreeMap<String, String>,
+	/// How long to warm up before measuring — the statement is run in a loop for
+	/// this duration to stabilise caches before timing begins. Defaults to 3s.
 	#[serde(default = "default_duration::<3000>")]
 	pub warmup: TestDuration,
+	/// Number of timed samples to collect; the reported mean / median / std-dev /
+	/// MAD are computed over these. Defaults to 100.
 	#[serde(default = "default_usize::<100>")]
 	pub sample_size: usize,
+	/// Target total time to spend collecting the samples. The harness sizes the
+	/// per-sample iteration count from the warmup estimate so the measurement run
+	/// takes roughly this long. Defaults to 100s.
 	#[serde(default = "default_duration::<100000>")]
 	pub measurement_time: TestDuration,
 

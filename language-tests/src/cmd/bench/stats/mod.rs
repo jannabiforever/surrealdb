@@ -4,7 +4,6 @@
 //! [Criterion]'s statistics library.
 //!
 //! [Criterion]: https://github.com/bheisler/criterion.rs
-//!
 
 //pub mod bivariate;
 pub mod tuple;
@@ -15,11 +14,11 @@ mod rand_util;
 use std::mem;
 use std::ops::Deref;
 
+use surrealdb_types::SurrealValue;
+
 use crate::cmd::bench::stats::univariate::outliers::tukey::{self, Label};
 use crate::cmd::bench::stats::univariate::{Sample, mixed};
 use crate::cmd::bench::{DEFAULT_CONFIDENCE_LEVEL, DEFAULT_RESAMPLES};
-
-use surrealdb_types::SurrealValue;
 
 /// The bootstrap distribution of some parameter
 #[derive(Clone)]
@@ -190,7 +189,8 @@ impl ComparisonData {
 
 		let dist_mean =
 			Estimate::from_point_distribution(mean, &dist_mean, DEFAULT_CONFIDENCE_LEVEL);
-		//let dist_median = Estimate::from_point_distribution(median, &dist_median, DEFAULT_CONFIDENCE_LEVEL);
+		//let dist_median = Estimate::from_point_distribution(median, &dist_median,
+		// DEFAULT_CONFIDENCE_LEVEL);
 
 		let t_stat = avg_times.t(base_avg_times);
 		let (t_dist,) =

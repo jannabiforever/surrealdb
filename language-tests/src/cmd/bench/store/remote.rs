@@ -1,38 +1,26 @@
 #![cfg(feature = "bench-remote-store")]
 
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{SinkExt, StreamExt as _};
-use tokio::{
-	net::TcpStream,
-	select,
-	sync::{mpsc, oneshot},
-	task::JoinHandle,
-};
-use tokio_tungstenite::{
-	MaybeTlsStream, WebSocketStream, connect_async,
-	tungstenite::{
-		Error as WsError, Message,
-		handshake::client::generate_key,
-		http::{
-			Uri,
-			header::{
-				CONNECTION, HOST, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL, SEC_WEBSOCKET_VERSION,
-			},
-		},
-	},
-};
-
 use surrealdb_types::{Object, SurrealValue, Value};
-
-use crate::{
-	cli::Backend,
-	cmd::bench::{
-		stats::MeasurementData,
-		store::{BenchDataStore, StoreConfig},
-	},
+use tokio::net::TcpStream;
+use tokio::select;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::handshake::client::generate_key;
+use tokio_tungstenite::tungstenite::http::Uri;
+use tokio_tungstenite::tungstenite::http::header::{
+	CONNECTION, HOST, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL, SEC_WEBSOCKET_VERSION,
 };
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+
+use crate::cli::Backend;
+use crate::cmd::bench::stats::MeasurementData;
+use crate::cmd::bench::store::{BenchDataStore, StoreConfig};
 
 pub struct RemoteStore {
 	cmd: Option<mpsc::Sender<Cmd>>,
@@ -88,7 +76,8 @@ impl RemoteStore {
 		let (send, recv) = mpsc::channel(32);
 
 		// Run the websocket loop in a seperate task
-		// This is to keep the connection alive by responding to pings even when we are running a benchmark.
+		// This is to keep the connection alive by responding to pings even when we are running a
+		// benchmark.
 		//
 		// TODO: Maybe just create a connection for every request?
 		let ws_task = tokio::spawn(Self::ws_task(recv, ws));

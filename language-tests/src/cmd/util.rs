@@ -1,18 +1,13 @@
 use anyhow::Result;
-
-use crate::tests::{
-	run::RunConfig,
-	schema::{BoolOr, Capabilities as TestCapabilities, SchemaTarget},
-};
-use surrealdb_core::{
-	dbs::{Capabilities, NewPlannerStrategy, Session, capabilities::Targets},
-	kvs::Datastore,
-};
+use surrealdb_core::dbs::capabilities::Targets;
+use surrealdb_core::dbs::{Capabilities, NewPlannerStrategy, Session};
+use surrealdb_core::kvs::Datastore;
 use surrealdb_types::Value as SurValue;
 
-use crate::tests::{
-	TestRun,
-	schema::{AuthLevel, TestAuth, TestConfig},
+use crate::tests::TestRun;
+use crate::tests::run::RunConfig;
+use crate::tests::schema::{
+	AuthLevel, BoolOr, Capabilities as TestCapabilities, SchemaTarget, TestAuth, TestConfig,
 };
 
 /// Builds a `Session` from a test config and a specific planner strategy.
@@ -87,6 +82,18 @@ pub struct ImportFailure {
 
 pub async fn run_imports<T: RunConfig>(
 	run: &TestRun<T>,
+	session: Session,
+	dbs: &Datastore,
+) -> Result<Option<ImportFailure>> {
+	run_imports_list(&run.case.imports, session, dbs).await
+}
+
+/// Runs an explicit list of import cases against the datastore, after defining
+/// the session's namespace/database. Used by [`run_imports`] (which forwards the
+/// test's resolved imports) and by the bench runner, which may substitute a
+/// per-variant import chain (see `[bench].datasets`).
+pub async fn run_imports_list(
+	imports: &[std::sync::Arc<crate::tests::case::TestCase>],
 	mut session: Session,
 	dbs: &Datastore,
 ) -> Result<Option<ImportFailure>> {
@@ -103,7 +110,7 @@ pub async fn run_imports<T: RunConfig>(
 	let mut import_session = Session::owner();
 	dbs.process_use(None, &mut import_session, session.ns.clone(), session.db.clone()).await?;
 
-	for import in run.case.imports.iter() {
+	for import in imports.iter() {
 		match dbs.execute(&import.source, &import_session, None).await {
 			Err(e) => {
 				return Ok(Some(ImportFailure {
