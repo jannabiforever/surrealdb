@@ -127,6 +127,13 @@ util/                                # import-only datasets (never run on their 
   embeddings-diskann-5000.surql      # 5k 8-d vectors + DiskANN index
   embeddings-flat-5000.surql         # 5k 8-d vectors, no index (brute-force KNN)
   references-5000.surql              # 5k users (+ `friends` link array) + 15k comments whose `author` is a record REFERENCE
+  records-100000-perms-full.surql    # imports records-100000 + RECORD access + table PERMISSIONS … FULL (baseline)
+  records-100000-perms-where.surql   # imports records-100000 + RECORD access + row-level PERMISSIONS … WHERE
+  events-timeseries-100000.surql     # 100k events with timestamps spread across one year (bounded, for bucketing)
+  geo-points-100000.surql            # 100k places each with a `location` point spread across the globe
+  recursion-functions.surql          # recursive user functions (fn::fib branching, fn::sum_to linear)
+  recursion-items-dynamic-1000.surql  # imports recursion-functions + 1000 items with a recursive DYNAMIC (VALUE, write-time) field
+  recursion-items-computed-1000.surql # imports recursion-functions + 1000 items with a recursive COMPUTED (read-time) field
 scans/
   count / limit / start_limit        # no filter — indexing is irrelevant
   where_*.surql                      # filter scans — run against BOTH datasets (see below)
@@ -140,6 +147,13 @@ vector/                              # KNN: HNSW vs DiskANN vs brute-force
 references/                          # record references: reverse (`<~`) traversal/count/filtered, FETCH single + array
 mutate/                              # UPDATE/DELETE … WHERE, batch UPSERT, explicit transaction
 crud/                                # batch create/read/update/delete (100, 1000)
+permissions/                         # per-record table permission cost as a RECORD user: SELECT + UPDATE,
+                                     #   each over a row-level `WHERE` vs. `FULL` permission matrix
+timeseries/                          # temporal bucketing: GROUP BY time::group(…) by day / hour (± per-bucket stats)
+geo/                                 # FULL-SCAN geo functions (no spatial index yet, #219): geo::distance
+                                     #   proximity & nearest-N, point-in-polygon containment (INSIDE)
+recursion/                           # recursive USER functions (fn::fib, per-row fn::sum_to) + recursive
+                                     #   DYNAMIC (VALUE, write-time) vs. COMPUTED (read-time) fields
 ```
 
 The derived datasets import the base via `[env] imports = ["./records-100000.surql"]`
@@ -176,6 +190,16 @@ cargo make bench -- scans/where_integer_eq_full --dataset indexed
 
 `--dataset` only affects matrix benches; non-matrix benches (count, limit,
 fulltext, …) are unaffected.
+
+The `permissions/` benches reuse the matrix for a different axis: instead of
+unindexed-vs-indexed they run a `full`-vs-`where` permission pair, and the bench
+file sets `[env].auth` to a **record user** (`Session::for_record`). Per-record
+table permissions are only evaluated for record-level actors — owner/editor/viewer
+sessions take a fast path that skips them entirely (so the existing `scans/` and
+`mutate/` benches, which run as owner, never pay this cost). The `full` variant
+allows every action with no predicate; the `where` variant attaches a row-level
+`WHERE` clause that is satisfied by every row, so both arms return the same data
+and the delta isolates the per-record predicate-evaluation cost.
 
 ### Profiling & flamegraphs
 
