@@ -1669,6 +1669,11 @@ impl Transaction {
 	///
 	/// This function should be called immediately before calling the commit function
 	/// to ensure the timestamp reflects the actual commit time.
+	///
+	/// The changefeed versionstamp is taken from [`Self::timestamp`] (the backend timestamp
+	/// oracle). It is process-local-monotonic on mem/rocksdb/surrealkv and globally monotonic
+	/// only on backends with a coordinated oracle (TiKV TSO) — so cross-node changefeed ordering
+	/// is a property of the backend, not of this engine.
 	pub(crate) async fn store_changes(&self) -> Result<()> {
 		// If no changefeed writer, there are no changes
 		let Some(changefeed) = self.changefeed.get() else {
