@@ -1233,8 +1233,16 @@ impl<'ctx> Planner<'ctx> {
 		// resolve_access_path() to populate KnnContext correctly.
 		if let Expr::Table(ref table_name) = expr
 			&& !cond.is_some_and(|c| has_knn_operator(&c.0))
-			&& let Some(rid_expr) = cond.and_then(|c| extract_record_id_point_lookup(c, table_name))
-		{
+			&& let Some(rid_expr) = cond.and_then(|c| {
+				// Normalize projection-function field references like
+				// `type::field("id")` to plain idioms so the record-id point
+				// lookup recognizes them, mirroring the index-analyzer rewrite
+				// in `resolve_access_path`. Done on a clone so the residual
+				// `scan_predicate` retains the original expression.
+				let mut normalized = c.clone();
+				resolve_projection_field_idioms(&mut normalized, self.function_registry());
+				extract_record_id_point_lookup(&normalized, table_name)
+			}) {
 			let filter_action = filter_action_for_predicate(&scan_predicate);
 			let record_id_expr = self.physical_expr(rid_expr).await?;
 			let resolved_table_ctx: Option<ResolvedTableContext> =
