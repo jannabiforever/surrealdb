@@ -898,13 +898,22 @@ pub(crate) async fn filter_fields_by_permission(
 			PhysicalPermission::Allow => continue,
 			PhysicalPermission::Deny => {
 				let original = snapshot.get_or_insert_with(|| value.clone());
-				for path in original.each(&idiom.0) {
+				// SECURITY: iterate in reverse. `each` yields ascending
+				// array indices and `Value::cut` removes via `Vec::remove`
+				// (shifting later indices down), so a forward pass would
+				// let each removal invalidate the pending indices and leak
+				// the odd-indexed elements (issue #7356). Removing higher
+				// indices first keeps the pending lower indices valid.
+				for path in original.each(&idiom.0).into_iter().rev() {
 					value.cut(&path.0);
 				}
 			}
 			PhysicalPermission::Conditional(_) => {
 				let original = snapshot.get_or_insert_with(|| value.clone());
-				for path in original.each(&idiom.0) {
+				// SECURITY: iterate in reverse (see the Deny arm above and
+				// issue #7356). Predicates read from `original` (immutable),
+				// so evaluation order is irrelevant.
+				for path in original.each(&idiom.0).into_iter().rev() {
 					let field_value = original.pick(&path.0);
 					let allowed =
 						check_permission_for_value(perm, original, Some(&field_value), ctx)
