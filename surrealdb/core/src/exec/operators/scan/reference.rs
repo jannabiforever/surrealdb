@@ -211,27 +211,37 @@ impl ExecOperator for ReferenceScan {
 						.await
 						.context("Failed to open reference cursor")?;
 					loop {
-						let batch = cursor
-							.next_batch(crate::kvs::ScanLimit::Count(
+						// Decode each ref key straight from the cursor's borrowed
+						// bytes into an owned `RecordId` — no per-key buffer copy.
+						let mut decode_err: Option<anyhow::Error> = None;
+						let stats = cursor
+							.for_each(
 								crate::kvs::NORMAL_BATCH_SIZE,
-							))
+								&mut |key| match crate::key::r#ref::Ref::decode_key(key) {
+									Ok(decoded) => {
+										rid_batch.push(RecordId {
+											table: decoded.ft.into_owned(),
+											key: decoded.fk.into_owned(),
+										});
+										Ok(std::ops::ControlFlow::Continue(()))
+									}
+									Err(e) => {
+										decode_err = Some(e);
+										Ok(std::ops::ControlFlow::Break(()))
+									}
+								},
+							)
 							.await
 							.context("Failed to scan reference")?;
-						if batch.is_empty() {
+						if let Some(e) = decode_err {
+							return Err(e).context("Failed to decode ref key")?;
+						}
+						if stats.rows == 0 {
 							break;
 						}
-						for key in &batch {
-							let decoded = crate::key::r#ref::Ref::decode_key(key)
-								.context("Failed to decode ref key")?;
-
-							rid_batch.push(RecordId {
-								table: decoded.ft.into_owned(),
-								key: decoded.fk.into_owned(),
-							});
-						}
-						// Resolve full batches before fetching the next batch
-						// from the cursor — keeps the cursor's reusable
-						// buffer free for the next call and bounds memory.
+						// Resolve full batches before fetching the next chunk
+						// from the cursor — keeps the cursor's reusable buffer
+						// free for the next call and bounds memory.
 						if rid_batch.len() >= scan_batch_size {
 							let values = resolve_record_batch(
 								&ctx, &txn, ns_id, db_id, &rid_batch, fetch_full, check_perms,

@@ -21,6 +21,7 @@ mod api;
 mod batch;
 mod clock;
 mod consts;
+mod cursor;
 mod direction;
 mod ds;
 mod err;
@@ -49,7 +50,7 @@ pub(crate) mod tasklease;
 pub(crate) mod version;
 
 pub use api::{
-	GetMultiResult, KeysResult, ScanCursorKeys, ScanCursorVals, ScanLimit, ScanResult, Transactable,
+	GetMultiResult, KeysResult, ScanCursorKeys, ScanCursorVals, ScanResult, Transactable,
 };
 pub use consts::{
 	COUNT_BATCH_SIZE, ESTIMATED_BYTES_PER_KEY, ESTIMATED_BYTES_PER_KV, INDEXING_BATCH_SIZE,

@@ -308,7 +308,7 @@ impl ExecOperator for GraphEdgeScan {
 											break;
 										}
 										let batch = cursor
-											.next_batch(crate::kvs::ScanLimit::Count(batch_size))
+											.next_batch(batch_size)
 											.await
 											.context("Failed to scan graph edge")?;
 										if batch.is_empty() {
@@ -444,9 +444,7 @@ impl ExecOperator for GraphEdgeScan {
 												)?;
 											loop {
 												let inner_batch = inner_cursor
-													.next_batch(crate::kvs::ScanLimit::Count(
-														crate::kvs::NORMAL_BATCH_SIZE,
-													))
+													.next_batch(crate::kvs::NORMAL_BATCH_SIZE)
 													.await
 													.context(
 														"Failed to scan edge adjacency for legacy graph fallback",

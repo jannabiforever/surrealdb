@@ -361,9 +361,7 @@ impl HnswIndex {
 		let rng = ikb.new_hp_range()?;
 		let mut cursor = tx.open_vals_cursor(rng, ScanDirection::Forward, 0, None).await?;
 		loop {
-			let batch = cursor
-				.next_batch(crate::kvs::ScanLimit::Count(crate::kvs::NORMAL_BATCH_SIZE))
-				.await?;
+			let batch = cursor.next_batch(crate::kvs::NORMAL_BATCH_SIZE).await?;
 			if batch.is_empty() {
 				break;
 			}
@@ -401,9 +399,7 @@ impl HnswIndex {
 		let rng = ikb.new_hr_range()?;
 		let mut cursor = tx.open_vals_cursor(rng, ScanDirection::Forward, 0, None).await?;
 		loop {
-			let batch = cursor
-				.next_batch(crate::kvs::ScanLimit::Count(crate::kvs::NORMAL_BATCH_SIZE))
-				.await?;
+			let batch = cursor.next_batch(crate::kvs::NORMAL_BATCH_SIZE).await?;
 			if batch.is_empty() {
 				break;
 			}
@@ -763,9 +759,7 @@ impl HnswIndex {
 		let mut cursor = tx.open_vals_cursor(rng, ScanDirection::Forward, 0, None).await?;
 		let mut count = 0;
 		loop {
-			let batch = cursor
-				.next_batch(crate::kvs::ScanLimit::Count(crate::kvs::NORMAL_BATCH_SIZE))
-				.await?;
+			let batch = cursor.next_batch(crate::kvs::NORMAL_BATCH_SIZE).await?;
 			if batch.is_empty() {
 				break;
 			}
@@ -783,9 +777,7 @@ impl HnswIndex {
 		let rng = self.ikb.new_hr_range()?;
 		let mut cursor = tx.open_vals_cursor(rng, ScanDirection::Forward, 0, None).await?;
 		loop {
-			let batch = cursor
-				.next_batch(crate::kvs::ScanLimit::Count(crate::kvs::NORMAL_BATCH_SIZE))
-				.await?;
+			let batch = cursor.next_batch(crate::kvs::NORMAL_BATCH_SIZE).await?;
 			if batch.is_empty() {
 				break;
 			}

@@ -26,7 +26,9 @@ use tracing::Instrument;
 use uuid::Uuid;
 use web_time::Instant;
 
-use super::api::{KeysBatch, ScanCursorKeys, ScanCursorVals, ScanLimit, ValsBatch};
+use super::api::{
+	KeyVisitor, KeysBatch, ScanChunkStats, ScanCursorKeys, ScanCursorVals, ValVisitor, ValsBatch,
+};
 use super::batch::Batch;
 use super::{Key, LockType, TransactionFactory, TransactionType, Val, util};
 use crate::catalog::providers::{
@@ -440,16 +442,7 @@ impl IndexBuildReservationRelease {
 				return Ok(());
 			}
 
-			match tx
-				.tr
-				.keys(
-					bg_range_start.clone()..bg_range_end.clone(),
-					crate::kvs::ScanLimit::Count(1),
-					0,
-					None,
-				)
-				.await
-			{
+			match tx.tr.keys(bg_range_start.clone()..bg_range_end.clone(), 1, 0, None).await {
 				Ok(res) if !res.keys.is_empty() => {
 					let _ = tx.tr.cancel().await;
 					return Ok(());
@@ -631,10 +624,20 @@ impl<'a> MeteredKeysCursor<'a> {
 	/// The returned `KeysBatch` borrows from the cursor; the borrow
 	/// checker forbids calling `next_batch` again while the previous
 	/// batch is still in scope.
-	pub async fn next_batch<'s>(&'s mut self, limit: ScanLimit) -> Result<KeysBatch<'s>> {
+	pub async fn next_batch<'s>(&'s mut self, limit: u32) -> Result<KeysBatch<'s>> {
 		let batch = self.inner.next_batch(limit).await.map_err(Error::from)?;
 		self.metrics.record_scan(batch.len() as u64, batch.key_bytes, 0);
 		Ok(batch)
+	}
+
+	/// Drive the cursor, invoking `f` per key borrowed directly from the
+	/// cursor (zero-copy on backends that override `for_each`). Records this
+	/// chunk's keys/bytes against the transaction's scan metrics in a single
+	/// `record_scan` call, matching `next_batch`'s metric granularity.
+	pub async fn for_each(&mut self, limit: u32, f: &mut dyn KeyVisitor) -> Result<ScanChunkStats> {
+		let stats = self.inner.for_each(limit, f).await.map_err(Error::from)?;
+		self.metrics.record_scan(stats.rows, stats.key_bytes, 0);
+		Ok(stats)
 	}
 }
 
@@ -650,10 +653,20 @@ pub struct MeteredValsCursor<'a> {
 impl<'a> MeteredValsCursor<'a> {
 	/// Advance the cursor and return up to `limit` `(key, value)` pairs
 	/// borrowed from the cursor's internal buffer.
-	pub async fn next_batch<'s>(&'s mut self, limit: ScanLimit) -> Result<ValsBatch<'s>> {
+	pub async fn next_batch<'s>(&'s mut self, limit: u32) -> Result<ValsBatch<'s>> {
 		let batch = self.inner.next_batch(limit).await.map_err(Error::from)?;
 		self.metrics.record_scan(batch.len() as u64, batch.key_bytes, batch.value_bytes);
 		Ok(batch)
+	}
+
+	/// Drive the cursor, invoking `f` per `(key, value)` borrowed directly from
+	/// the cursor (zero-copy on backends that override `for_each`). Records this
+	/// chunk's keys/bytes against the transaction's scan metrics in a single
+	/// `record_scan` call, matching `next_batch`'s metric granularity.
+	pub async fn for_each(&mut self, limit: u32, f: &mut dyn ValVisitor) -> Result<ScanChunkStats> {
+		let stats = self.inner.for_each(limit, f).await.map_err(Error::from)?;
+		self.metrics.record_scan(stats.rows, stats.key_bytes, stats.value_bytes);
+		Ok(stats)
 	}
 }
 
@@ -1380,7 +1393,6 @@ impl Transaction {
 	{
 		let beg = rng.start.encode_key()?;
 		let end = rng.end.encode_key()?;
-		let limit = limit.into();
 		let res = self.tr.keys(beg..end, limit, skip, version).await.map_err(Error::from)?;
 		self.metrics.record_scan(res.keys.len() as u64, res.key_bytes, 0);
 		Ok(res.keys)
@@ -1403,7 +1415,6 @@ impl Transaction {
 	{
 		let beg = rng.start.encode_key()?;
 		let end = rng.end.encode_key()?;
-		let limit = limit.into();
 		let res = self.tr.keysr(beg..end, limit, skip, version).await.map_err(Error::from)?;
 		self.metrics.record_scan(res.keys.len() as u64, res.key_bytes, 0);
 		Ok(res.keys)
@@ -1426,7 +1437,6 @@ impl Transaction {
 	{
 		let beg = rng.start.encode_key()?;
 		let end = rng.end.encode_key()?;
-		let limit = limit.into();
 		let res = self.tr.scan(beg..end, limit, skip, version).await.map_err(Error::from)?;
 		self.metrics.record_scan(res.values.len() as u64, res.key_bytes, res.value_bytes);
 		Ok(res.values)
@@ -1449,7 +1459,6 @@ impl Transaction {
 	{
 		let beg = rng.start.encode_key()?;
 		let end = rng.end.encode_key()?;
-		let limit = limit.into();
 		let res = self.tr.scanr(beg..end, limit, skip, version).await.map_err(Error::from)?;
 		self.metrics.record_scan(res.values.len() as u64, res.key_bytes, res.value_bytes);
 		Ok(res.values)

@@ -20,7 +20,7 @@ use crate::expr::{AssignOperator, Data, Expr, FlowResultExt as _, Idiom, Literal
 use crate::idx::planner::ScanDirection;
 use crate::key::graph;
 use crate::key::r#ref::Ref;
-use crate::kvs::{NORMAL_BATCH_SIZE, ScanLimit};
+use crate::kvs::NORMAL_BATCH_SIZE;
 use crate::val::{RecordId, TableName, Value};
 
 impl Document {
@@ -189,7 +189,7 @@ impl Document {
 		let mut cursor =
 			txn.open_keys_cursor(prefix..suffix, ScanDirection::Forward, 0, None).await?;
 		// Check if there are any edges to purge by fetching at most one key.
-		let batch = cursor.next_batch(ScanLimit::Count(1)).await?;
+		let batch = cursor.next_batch(1).await?;
 		// Only proceed if there are edges for this record.
 		if !batch.is_empty() {
 			// Create a `DELETE FROM record:id<->` statement. `Part::Lookup`
@@ -263,7 +263,7 @@ impl Document {
 		// Loop until no more entries
 		loop {
 			// Pull the next batch of reference keys from the cursor.
-			let batch = cursor.next_batch(ScanLimit::Count(NORMAL_BATCH_SIZE)).await?;
+			let batch = cursor.next_batch(NORMAL_BATCH_SIZE).await?;
 			// Stop once the cursor is drained.
 			if batch.is_empty() {
 				break;

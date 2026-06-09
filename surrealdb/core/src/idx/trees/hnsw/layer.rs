@@ -541,9 +541,7 @@ where
 		let mut count = 0;
 		let mut cursor = tx.open_vals_cursor(range, ScanDirection::Forward, 0, None).await?;
 		loop {
-			let batch = cursor
-				.next_batch(crate::kvs::ScanLimit::Count(crate::kvs::NORMAL_BATCH_SIZE))
-				.await?;
+			let batch = cursor.next_batch(crate::kvs::NORMAL_BATCH_SIZE).await?;
 			if batch.is_empty() {
 				break;
 			}

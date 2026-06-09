@@ -368,7 +368,7 @@ impl DiskAnnProvider {
 		let cache_misses = !context.tx.writeable();
 		loop {
 			let batch = cursor
-				.next_batch(crate::kvs::ScanLimit::Count(crate::kvs::NORMAL_BATCH_SIZE))
+				.next_batch(crate::kvs::NORMAL_BATCH_SIZE)
 				.await
 				.map_err(|e| ANNError::log_index_error(e.to_string()))?;
 			if batch.is_empty() {

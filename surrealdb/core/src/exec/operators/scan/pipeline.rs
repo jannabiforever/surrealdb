@@ -207,7 +207,7 @@ pub(crate) fn determine_scan_direction(
 /// `START` without a pushdown predicate).
 ///
 /// When `limit_hint` is provided, the first batch is capped to that count so
-/// small-limit queries (e.g. `LIMIT 10`) don't fetch 500 records from
+/// small-limit queries (e.g. `LIMIT 10`) don't fetch a full batch from
 /// storage. Subsequent batches use [`crate::kvs::NORMAL_BATCH_SIZE`].
 ///
 /// Iterates the cursor's borrowed `&[u8]` slices directly — record decode
@@ -253,35 +253,52 @@ pub(crate) fn kv_scan_stream(
 			if batch_size == 0 {
 				break;
 			}
-			let batch = cursor
-				.next_batch(crate::kvs::ScanLimit::Count(batch_size))
+			// Drive the cursor one borrowed row at a time. The visitor runs the
+			// pre-decode filter and decodes survivors straight from the engine's
+			// borrowed bytes; `decode_record` yields a fully owned `Value`, so
+			// the raw bytes are never retained and the engine hands them over
+			// with no per-row copy.
+			let mut decoded: Vec<Value> = Vec::with_capacity(batch_size as usize);
+			// `decode_record`'s error is a `ControlFlow`, which can't travel
+			// through the visitor's storage-error channel — stash it and
+			// re-raise it below, outside the cursor borrow.
+			let mut decode_err: Option<ControlFlow> = None;
+			let pdf = pre_decode_filter.as_ref();
+			let stats = cursor
+				.for_each(batch_size, &mut |key, val| {
+					if let Some(pdf) = pdf
+						&& pdf.apply(key, val) == PreDecodeFilterOutcome::Reject
+					{
+						// Rejected rows are still counted as scanned (the cursor
+						// read them), so `stats.rows` matches the old batch len.
+						return Ok(std::ops::ControlFlow::Continue(()));
+					}
+					match decode_record(key, val) {
+						Ok(v) => {
+							decoded.push(v);
+							Ok(std::ops::ControlFlow::Continue(()))
+						}
+						Err(cf) => {
+							decode_err = Some(cf);
+							Ok(std::ops::ControlFlow::Break(()))
+						}
+					}
+				})
 				.await
 				.context("Failed to scan record")?;
-			if batch.is_empty() {
-				break;
-			}
-			let mut decoded = Vec::with_capacity(batch.len());
-			// Hoist the pre-decode-filter branch out of the per-item loop:
-			// `pre_decode_filter` is `Option<Arc<…>>` and doesn't change
-			// across iterations, so we pay the `Option`-check once per
-			// batch instead of per row.
-			match &pre_decode_filter {
-				Some(pdf) => {
-					for (key, val) in &batch {
-						if pdf.apply(key, val) == PreDecodeFilterOutcome::Reject {
-							continue;
-						}
-						decoded.push(decode_record(key, val)?);
-					}
-				}
-				None => {
-					for (key, val) in &batch {
-						decoded.push(decode_record(key, val)?);
-					}
-				}
+			// Re-raise a stashed decode error as the stream's terminal error,
+			// now that the cursor borrow has ended. `?` on an `Err` already
+			// ends the stream, so no explicit `return` is needed.
+			if let Some(cf) = decode_err {
+				Err(cf)?;
 			}
 			first = false;
-			yielded += batch.len();
+			// `stats.rows` counts every row the cursor advanced over (including
+			// pre-decode-filter rejects), matching the previous `batch.len()`.
+			yielded += stats.rows as usize;
+			if stats.rows == 0 {
+				break;
+			}
 			if !decoded.is_empty() {
 				yield ValueBatch { values: decoded };
 			}

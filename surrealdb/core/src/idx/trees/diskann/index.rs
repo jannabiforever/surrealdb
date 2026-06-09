@@ -625,7 +625,7 @@ impl DiskAnnIndex {
 		let mut cursor = tx.open_vals_cursor(rng, ScanDirection::Forward, 0, None).await?;
 		// The first non-empty batch is conclusive; we just need to know
 		// whether *any* entry exists in the range.
-		let batch = cursor.next_batch(crate::kvs::ScanLimit::Count(1)).await?;
+		let batch = cursor.next_batch(1).await?;
 		if !batch.is_empty() {
 			return Ok(false);
 		}
@@ -713,9 +713,7 @@ impl DiskAnnIndex {
 		let mut cursor = tx.open_vals_cursor(rng, ScanDirection::Forward, 0, None).await?;
 		let mut count = 0;
 		loop {
-			let batch = cursor
-				.next_batch(crate::kvs::ScanLimit::Count(crate::kvs::NORMAL_BATCH_SIZE))
-				.await?;
+			let batch = cursor.next_batch(crate::kvs::NORMAL_BATCH_SIZE).await?;
 			if batch.is_empty() {
 				break;
 			}
@@ -1091,9 +1089,7 @@ impl DiskAnnIndex {
 		let mut cursor = tx.open_vals_cursor(rng, ScanDirection::Forward, 0, None).await?;
 		let mut count = 0;
 		loop {
-			let batch = cursor
-				.next_batch(crate::kvs::ScanLimit::Count(crate::kvs::NORMAL_BATCH_SIZE))
-				.await?;
+			let batch = cursor.next_batch(crate::kvs::NORMAL_BATCH_SIZE).await?;
 			if batch.is_empty() {
 				break;
 			}
