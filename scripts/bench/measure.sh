@@ -64,10 +64,12 @@ cargo run --profile profiling --features "$FEATURES" -- bench run --backend "$BA
 echo ""
 echo "---- summary ----"
 # Pull the verdict + the time/median/change lines straight from the harness output.
-verdict="$(grep -E 'Performance has|No change in performance|within noise threshold' "$LOG" | tail -1 | sed 's/^[[:space:]]*//')"
-time_line="$(grep -E '^[[:space:]]+time[[:space:]]+:' "$LOG" | tail -1 | sed 's/^[[:space:]]*//')"
-median_line="$(grep -E '^[[:space:]]+median[[:space:]]+:' "$LOG" | tail -1 | sed 's/^[[:space:]]*//')"
-change_line="$(grep -E '^[[:space:]]+change[[:space:]]+:' "$LOG" | tail -1 | sed 's/^[[:space:]]*//')"
+# Each grep may legitimately find nothing (e.g. no baseline yet on a first
+# `--save` run); `|| true` stops set -e from killing the script on no match.
+verdict="$(grep -E 'Performance has|No change in performance|within noise threshold' "$LOG" | tail -1 | sed 's/^[[:space:]]*//' || true)"
+time_line="$(grep -E '^[[:space:]]+time[[:space:]]+:' "$LOG" | tail -1 | sed 's/^[[:space:]]*//' || true)"
+median_line="$(grep -E '^[[:space:]]+median[[:space:]]+:' "$LOG" | tail -1 | sed 's/^[[:space:]]*//' || true)"
+change_line="$(grep -E '^[[:space:]]+change[[:space:]]+:' "$LOG" | tail -1 | sed 's/^[[:space:]]*//' || true)"
 
 printf '%s\n' "${verdict:-<no baseline to compare against>}"
 printf '%s\n' "${time_line:-time: <none>}"
