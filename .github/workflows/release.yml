@@ -138,9 +138,22 @@ jobs:
           fetch-depth: 0
           ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
+      # This orchestration job runs against a different branch than the code it
+      # checks out, so its CI tooling comes from the workflow ref, not git-ref.
+      - name: Checkout CI tooling from the workflow ref
+        if: ${{ inputs.update-main == true && inputs.release-type == 'versioned' }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: |
+            .github/actions
+            .github/scripts
+          sparse-checkout-cone-mode: false
+          path: .ci
+
       - name: Setup environment
         if: ${{ inputs.update-main == true && inputs.release-type == 'versioned' }}
-        uses: ./.github/actions/setup-environment
+        uses: ./.ci/.github/actions/setup-environment
 
       - name: Install cargo-edit
         if: ${{ inputs.update-main == true && inputs.release-type == 'versioned' }}
@@ -150,7 +163,7 @@ jobs:
         if: ${{ inputs.update-main == true && inputs.release-type == 'versioned' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: .github/scripts/bump-nightly-version.sh "${{ inputs.publish }}" "${{ inputs.main-version }}"
+        run: .ci/.github/scripts/bump-nightly-version.sh "${{ inputs.publish }}" "${{ inputs.main-version }}"
 
   # ----------------------------------------
   # Prepare release variables
@@ -620,8 +633,20 @@ jobs:
           fetch-depth: 0
           ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
+      # This orchestration job runs against a different branch than the code it
+      # checks out, so its CI tooling comes from the workflow ref, not git-ref.
+      - name: Checkout CI tooling from the workflow ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: |
+            .github/actions
+            .github/scripts
+          sparse-checkout-cone-mode: false
+          path: .ci
+
       - name: Setup environment
-        uses: ./.github/actions/setup-environment
+        uses: ./.ci/.github/actions/setup-environment
 
       - name: Install cargo-edit
         run: cargo install cargo-edit
@@ -629,4 +654,4 @@ jobs:
       - name: Create PR to bump release branch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: .github/scripts/bump-release-version.sh "${{ inputs.git-ref }}" "${{ inputs.publish }}"
+        run: .ci/.github/scripts/bump-release-version.sh "${{ inputs.git-ref }}" "${{ inputs.publish }}"
