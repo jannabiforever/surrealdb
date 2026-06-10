@@ -22,6 +22,7 @@ use crate::exec::permission::{
 	PhysicalPermission, check_permission_for_value, convert_permission_to_physical,
 };
 use crate::exec::pre_decode_filter::{PreDecodeFilter, PreDecodeFilterOutcome};
+use crate::exec::topk_pushdown::TopKThresholdProbe;
 use crate::exec::{EvalContext, ExecutionContext, PhysicalExpr, ValueBatch, ValueBatchStream};
 use crate::expr::{ControlFlow, ControlFlowExt};
 use crate::idx::planner::ScanDirection;
@@ -223,6 +224,7 @@ pub(crate) fn kv_scan_stream(
 	pre_skip: usize,
 	limit_hint: Option<u32>,
 	pre_decode_filter: Option<Arc<PreDecodeFilter>>,
+	topk_probe: Option<Arc<TopKThresholdProbe>>,
 ) -> ValueBatchStream {
 	let skip = pre_skip.min(u32::MAX as usize) as u32;
 	let stream = async_stream::try_stream! {
@@ -264,6 +266,13 @@ pub(crate) fn kv_scan_stream(
 			// re-raise it below, outside the cursor borrow.
 			let mut decode_err: Option<ControlFlow> = None;
 			let pdf = pre_decode_filter.as_ref();
+			// Snapshot the TopK rejection threshold once per cursor batch.
+			// The sort publishes monotonically-tightening values, so a stale
+			// snapshot only under-rejects (bounded by one batch) — sound, and
+			// it keeps the lock off the per-row path. `None` until the
+			// downstream heap fills (or when no publisher was installed).
+			let topk_threshold = topk_probe.as_ref().and_then(|p| p.snapshot());
+			let mut topk_skipped: u64 = 0;
 			let stats = cursor
 				.for_each(batch_size, &mut |key, val| {
 					if let Some(pdf) = pdf
@@ -271,6 +280,16 @@ pub(crate) fn kv_scan_stream(
 					{
 						// Rejected rows are still counted as scanned (the cursor
 						// read them), so `stats.rows` matches the old batch len.
+						return Ok(std::ops::ControlFlow::Continue(()));
+					}
+					// After the (cheaper, more selective) WHERE probe: skip
+					// decode when the row's ORDER BY key provably cannot beat
+					// the downstream top-K heap's worst entry.
+					if let (Some(probe), Some(threshold)) =
+						(topk_probe.as_ref(), topk_threshold.as_deref())
+						&& probe.rejects(threshold, val)
+					{
+						topk_skipped += 1;
 						return Ok(std::ops::ControlFlow::Continue(()));
 					}
 					match decode_record(key, val) {
@@ -286,6 +305,11 @@ pub(crate) fn kv_scan_stream(
 				})
 				.await
 				.context("Failed to scan record")?;
+			if topk_skipped > 0
+				&& let Some(m) = topk_probe.as_ref().and_then(|p| p.metrics())
+			{
+				m.add_skipped_rows(topk_skipped);
+			}
 			// Re-raise a stashed decode error as the stream's terminal error,
 			// now that the cursor borrow has ended. `?` on an `Err` already
 			// ends the stream, so no explicit `return` is needed.
@@ -576,6 +600,17 @@ impl ComputedFieldDef {
 	/// Root field name this computed-field definition is attached to.
 	pub(crate) fn field_name(&self) -> &str {
 		&self.field_name
+	}
+
+	/// Test-only constructor: production definitions are built exclusively by
+	/// [`build_field_state_raw`] from catalog field definitions.
+	#[cfg(test)]
+	pub(crate) fn for_test(field_name: impl Into<String>) -> Self {
+		Self {
+			field_name: field_name.into(),
+			expr: Arc::new(crate::exec::physical_expr::Literal(Value::None)),
+			kind: None,
+		}
 	}
 }
 

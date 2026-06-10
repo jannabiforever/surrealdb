@@ -219,6 +219,9 @@ pub struct CommonConfig {
 	/// The maximum size of the priority queue triggering usage of the priority
 	/// queue for the result collector.
 	pub max_order_limit_priority_queue_size: u32,
+	/// Whether eligible `ORDER BY … LIMIT` table scans may skip record decode
+	/// for rows that cannot beat the current top-K threshold (default: true)
+	pub topk_threshold_pushdown_enabled: bool,
 	/// The maximum stack size of the JavaScript function runtime (default: 256 KiB)
 	pub scripting_max_stack_size: usize,
 	/// The maximum memory limit of the JavaScript function runtime (default: 2 MiB)
@@ -316,6 +319,7 @@ impl Default for CommonConfig {
 			operator_buffer_size: 2,
 			scan_batch_size: crate::exec::operators::scan::common::DEFAULT_SCAN_BATCH_SIZE,
 			max_order_limit_priority_queue_size: 1000,
+			topk_threshold_pushdown_enabled: true,
 			scripting_max_stack_size: 256 * 1024,
 			scripting_max_memory_limit: 2 << 20,
 			scripting_max_time_limit: Duration::from_secs(5),
@@ -368,6 +372,7 @@ impl Config for CommonConfig {
 			"max_order_limit_priority_queue_size",
 			&mut self.max_order_limit_priority_queue_size,
 		)
+		.parse_key("topk_threshold_pushdown_enabled", &mut self.topk_threshold_pushdown_enabled)
 		.parse_key("scripting_max_stack_size", &mut self.scripting_max_stack_size)
 		.parse_key("scripting_max_memory_limit", &mut self.scripting_max_memory_limit)
 		.parse_key_with("scripting_max_time_limit", &mut self.scripting_max_time_limit, |x| {
@@ -520,3 +525,22 @@ pub static KVS_THREADPOOL_SIZE: LazyLock<usize> = LazyLock::new(|| {
 		},
 	}
 });
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The TopK threshold pushdown kill switch must default on and parse off
+	/// from the config map (`SURREAL_TOPK_THRESHOLD_PUSHDOWN_ENABLED=false`).
+	/// Disabling it routes planning through the same code path as "no ORDER
+	/// BY opportunity" (TopKPushdownRequest::NotApplicable), which the
+	/// topk_pushdown language tests cover.
+	#[test]
+	fn topk_threshold_pushdown_kill_switch_parses() {
+		let mut config = CommonConfig::default();
+		assert!(config.topk_threshold_pushdown_enabled, "feature defaults on");
+		let map = ConfigMap::empty().with_key_value("topk_threshold_pushdown_enabled", "false");
+		config.parse(&map);
+		assert!(!config.topk_threshold_pushdown_enabled, "config map disables the feature");
+	}
+}

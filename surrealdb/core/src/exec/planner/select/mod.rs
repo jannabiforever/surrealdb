@@ -19,8 +19,8 @@ mod projection;
 use std::sync::Arc;
 
 pub(crate) use pipeline::{
-	FilterAction, PlannedSource, SelectPipelineConfig, WhereClauseState,
-	filter_action_for_predicate,
+	FilterAction, PlannedSource, SelectPipelineConfig, TopKPushdownRequest, WhereClauseState,
+	compute_topk_pushdown_request, filter_action_for_predicate,
 };
 
 use super::Planner;
@@ -1049,6 +1049,25 @@ impl<'ctx> Planner<'ctx> {
 			self.ctx.config.max_order_limit_priority_queue_size as usize,
 		);
 
+		// TopK threshold pushdown analysis: when the downstream sort will be
+		// a bounded heap on a raw first key, a table scan can reject rows
+		// against the heap's worst entry before record decode. SPLIT, GROUP
+		// BY, and brute-force KNN duplicate, regroup, or rank rows between
+		// scan and sort, so they disqualify the request outright.
+		let topk_request = if self.ctx.config.topk_threshold_pushdown_enabled {
+			compute_topk_pushdown_request(
+				order.as_ref(),
+				&start,
+				&limit,
+				&fields,
+				tempfiles,
+				split.is_some() || group.is_some() || brute_force_knn.is_some(),
+				self.ctx.config.max_order_limit_priority_queue_size as usize,
+			)
+		} else {
+			TopKPushdownRequest::NotApplicable
+		};
+
 		// Source resolution with plan-time index analysis.
 		// The result tracks whether the predicate and limit/start were
 		// consumed by the source operator, so we can avoid duplicating
@@ -1065,12 +1084,17 @@ impl<'ctx> Planner<'ctx> {
 				scan_limit,
 				scan_start,
 				downstream_topk,
+				&topk_request,
 			)
 			.await?;
 
 		if can_soft_push_limit {
 			planned.limit_pushed = false;
 		}
+
+		// Detach the TopK pushdown handle before `planned.operator` moves into
+		// the pipeline below; `plan_pipeline` hands it to sort planning.
+		let topk_handle = planned.topk_pushdown.take();
 
 		// Resolve the pipeline's WHERE state from the source's filter action.
 		// - FullyConsumed: source handles the entire predicate, no Filter.
@@ -1139,6 +1163,7 @@ impl<'ctx> Planner<'ctx> {
 			},
 			omit,
 			tempfiles,
+			topk_pushdown: topk_handle,
 		};
 
 		let projected = pp.plan_pipeline(source, Some(fields), config).await?;
@@ -1160,12 +1185,23 @@ impl<'ctx> Planner<'ctx> {
 		scan_limit: Option<Arc<dyn crate::exec::PhysicalExpr>>,
 		scan_start: Option<Arc<dyn crate::exec::PhysicalExpr>>,
 		downstream_topk: bool,
+		topk_request: &TopKPushdownRequest,
 	) -> Result<PlannedSource, Error> {
 		if what.is_empty() {
 			return Err(Error::Query {
 				message: "SELECT requires at least one source".to_string(),
 			});
 		}
+		// Multi-source FROM combines via Union: rows from one scan compete in
+		// the sort heap with rows from the others, so a per-scan threshold
+		// probe would be misleading in EXPLAIN (its cell can never be
+		// installed — sort planning receives a single handle). Drop the
+		// request before fanning out.
+		let topk_request = if what.len() > 1 {
+			&TopKPushdownRequest::NotApplicable
+		} else {
+			topk_request
+		};
 		let mut plans = Vec::with_capacity(what.len());
 		for expr in what {
 			let p = self
@@ -1180,6 +1216,7 @@ impl<'ctx> Planner<'ctx> {
 					scan_limit.clone(),
 					scan_start.clone(),
 					downstream_topk,
+					topk_request,
 				)
 				.await?;
 			plans.push(p);
@@ -1195,6 +1232,7 @@ impl<'ctx> Planner<'ctx> {
 				operator: Arc::new(Union::new(operators)),
 				filter_action: FilterAction::UseOriginal,
 				limit_pushed: false,
+				topk_pushdown: None,
 			})
 		}
 	}
@@ -1222,6 +1260,7 @@ impl<'ctx> Planner<'ctx> {
 		scan_limit: Option<Arc<dyn crate::exec::PhysicalExpr>>,
 		scan_start: Option<Arc<dyn crate::exec::PhysicalExpr>>,
 		downstream_topk: bool,
+		topk_request: &TopKPushdownRequest,
 	) -> Result<PlannedSource, Error> {
 		// Optimisation: WHERE id = <RecordId> -> point lookup.
 		// Detects `id = <RecordId literal>` in the top-level AND chain and
@@ -1262,6 +1301,7 @@ impl<'ctx> Planner<'ctx> {
 				operator: Arc::new(scan) as Arc<dyn ExecOperator>,
 				filter_action,
 				limit_pushed: false,
+				topk_pushdown: None,
 			});
 		}
 
@@ -1354,6 +1394,7 @@ impl<'ctx> Planner<'ctx> {
 								needed_fields,
 								version,
 								table_ctx,
+								topk_request,
 							)
 							.await;
 					}
@@ -1401,6 +1442,7 @@ impl<'ctx> Planner<'ctx> {
 					)) as Arc<dyn ExecOperator>,
 					filter_action: FilterAction::UseOriginal,
 					limit_pushed: false,
+					topk_pushdown: None,
 				})
 			}
 			Expr::Select(inner_select) => {
@@ -1415,6 +1457,7 @@ impl<'ctx> Planner<'ctx> {
 					operator: self.plan_select_statement(*inner_select).await?,
 					filter_action: FilterAction::UseOriginal,
 					limit_pushed: false,
+					topk_pushdown: None,
 				})
 			}
 			// Params that could be resolved were already rewritten to
@@ -1426,6 +1469,7 @@ impl<'ctx> Planner<'ctx> {
 					operator: Arc::new(SourceExpr::new(phys_expr)) as Arc<dyn ExecOperator>,
 					filter_action: FilterAction::UseOriginal,
 					limit_pushed: false,
+					topk_pushdown: None,
 				})
 			}
 			Expr::Table(_)
@@ -1453,6 +1497,7 @@ impl<'ctx> Planner<'ctx> {
 					operator: Arc::new(SourceExpr::new(phys_expr)) as Arc<dyn ExecOperator>,
 					filter_action: FilterAction::UseOriginal,
 					limit_pushed: false,
+					topk_pushdown: None,
 				})
 			}
 		}
@@ -1549,6 +1594,7 @@ impl<'ctx> Planner<'ctx> {
 			operator: Arc::new(scan) as Arc<dyn ExecOperator>,
 			filter_action,
 			limit_pushed,
+			topk_pushdown: None,
 		})
 	}
 
@@ -1586,6 +1632,7 @@ impl<'ctx> Planner<'ctx> {
 			operator: Arc::new(scan) as Arc<dyn ExecOperator>,
 			filter_action,
 			limit_pushed: false,
+			topk_pushdown: None,
 		})
 	}
 
@@ -1628,6 +1675,7 @@ impl<'ctx> Planner<'ctx> {
 			operator: Arc::new(scan) as Arc<dyn ExecOperator>,
 			filter_action: FilterAction::UseOriginal,
 			limit_pushed: false,
+			topk_pushdown: None,
 		})
 	}
 
@@ -1642,6 +1690,7 @@ impl<'ctx> Planner<'ctx> {
 			operator: Arc::new(EmptyScan::new()) as Arc<dyn ExecOperator>,
 			filter_action: FilterAction::FullyConsumed,
 			limit_pushed: true,
+			topk_pushdown: None,
 		}
 	}
 
@@ -1661,7 +1710,13 @@ impl<'ctx> Planner<'ctx> {
 		needed_fields: Option<std::collections::HashSet<String>>,
 		version: Option<Arc<dyn crate::exec::PhysicalExpr>>,
 		table_ctx: Option<ResolvedTableContext>,
+		topk_request: &TopKPushdownRequest,
 	) -> Result<PlannedSource, Error> {
+		use crate::exec::topk_pushdown::{
+			TopKPushdownHandle, TopKPushdownReason, TopKPushdownStatus, TopKThresholdCell,
+			TopKThresholdProbe, field_path_wire_segments, topk_pushdown_status_at_plan_time,
+		};
+
 		let filter_action = filter_action_for_predicate(&scan_predicate);
 		let push = scan_limit.is_some() && order_is_scan_compatible(order);
 		let (tbl_limit, tbl_start, limit_pushed) = if push {
@@ -1674,6 +1729,52 @@ impl<'ctx> Planner<'ctx> {
 			scan_predicate.as_ref(),
 			needed_fields.as_ref(),
 		);
+		// TopK threshold pushdown: build the shared cell and the scan-side
+		// probe for an eligible request. The field eligibility check runs
+		// against the FULL plan-time field state (not the projection-filtered
+		// view) so a computed ORDER BY field can't slip through when the
+		// projection drops its definition. The handle travels to
+		// `plan_sort_consolidated`, which installs the publish side only if
+		// the sort plan it builds matches `expected_first_key`.
+		let (topk_status, topk_handle) = match topk_request {
+			TopKPushdownRequest::NotApplicable => (TopKPushdownStatus::NotApplicable, None),
+			TopKPushdownRequest::Ineligible(reason) => {
+				(TopKPushdownStatus::Ineligible(*reason), None)
+			}
+			TopKPushdownRequest::Eligible(spec) => {
+				match field_path_wire_segments(&spec.first_key.path) {
+					// The request analysis already vets the path; this re-check
+					// keeps the probe constructor's invariant local.
+					None => {
+						(TopKPushdownStatus::Ineligible(TopKPushdownReason::UnsupportedOrder), None)
+					}
+					Some(segments) => {
+						let cell = Arc::new(TopKThresholdCell::default());
+						let probe = Arc::new(TopKThresholdProbe::new(
+							segments,
+							spec.first_key.direction,
+							spec.key_count == 1,
+							Arc::clone(&cell),
+							self.ctx.config.idiom_recursion_limit,
+						));
+						let status = topk_pushdown_status_at_plan_time(
+							probe,
+							table_ctx.as_ref().map(|tc| tc.field_state.as_ref()),
+						);
+						let handle = matches!(
+							status,
+							TopKPushdownStatus::Active(_) | TopKPushdownStatus::Deferred(_)
+						)
+						.then(|| TopKPushdownHandle {
+							cell,
+							expected_first_key: spec.first_key.clone(),
+							expected_key_count: spec.key_count,
+						});
+						(status, handle)
+					}
+				}
+			}
+		};
 		let mut scan = TableScan::new(
 			table,
 			direction,
@@ -1687,10 +1788,12 @@ impl<'ctx> Planner<'ctx> {
 			scan = scan.with_resolved(tc);
 		}
 		scan = scan.with_pre_decode_filter(pdf);
+		scan = scan.with_topk_pushdown(topk_status);
 		Ok(PlannedSource {
 			operator: Arc::new(scan) as Arc<dyn ExecOperator>,
 			filter_action,
 			limit_pushed,
+			topk_pushdown: topk_handle,
 		})
 	}
 
@@ -1871,6 +1974,7 @@ impl<'ctx> Planner<'ctx> {
 			operator: Arc::new(union_scan) as Arc<dyn ExecOperator>,
 			filter_action,
 			limit_pushed: false,
+			topk_pushdown: None,
 		})
 	}
 
@@ -2035,6 +2139,7 @@ impl<'ctx> Planner<'ctx> {
 			) as Arc<dyn ExecOperator>,
 			filter_action,
 			limit_pushed,
+			topk_pushdown: None,
 		})
 	}
 

@@ -59,6 +59,7 @@ pub use sleep::SleepPlan;
 pub use sort::{ExternalSort, ExternalSortByKey};
 pub use sort::{
 	OrderByField, RandomShuffle, Sort, SortByKey, SortDirection, SortKey, SortTopK, SortTopKByKey,
+	compare_values,
 };
 pub use source_expr::SourceExpr;
 pub use split::Split;

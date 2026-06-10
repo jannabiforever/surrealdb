@@ -16,6 +16,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 
 use super::common::{OrderByField, SortDirection, SortKey, compare_keys, compare_keys_by_sort_key};
+use crate::exec::topk_pushdown::TopKThresholdCell;
 use crate::exec::{
 	AccessMode, CardinalityHint, CombineAccessModes, ContextLevel, EvalContext, ExecOperator,
 	ExecutionContext, FlowResult, OperatorMetrics, PhysicalExpr, ValueBatch, ValueBatchStream,
@@ -318,6 +319,111 @@ impl Ord for TopKByKeyEntry {
 	}
 }
 
+/// Bounded "keep the best k" heap with an optional TopK threshold publisher.
+///
+/// Factored out of [`SortTopKByKey::execute`] so the admission and publish
+/// logic is unit-testable without an [`ExecutionContext`]. Admission requires
+/// a strict [`Ordering::Less`] against the current worst entry — equal keys
+/// never displace earlier rows (insertion-stable via `seq`), which is the
+/// invariant the scan-side threshold probe's tie rejection relies on.
+struct TopKByKeyAccumulator {
+	heap: BinaryHeap<Reverse<TopKByKeyEntry>>,
+	sort_keys: Arc<Vec<SortKey>>,
+	limit: usize,
+	seq: u64,
+	/// TopK threshold pushdown publish side (see
+	/// [`crate::exec::topk_pushdown`]). The heap-worst's first sort key is
+	/// already cached on its entry, so publishing is a single clone — no
+	/// re-extraction. `None` (the common case) makes every publish site a
+	/// no-op.
+	threshold_cell: Option<Arc<TopKThresholdCell>>,
+}
+
+impl TopKByKeyAccumulator {
+	fn new(
+		sort_keys: Arc<Vec<SortKey>>,
+		limit: usize,
+		threshold_cell: Option<Arc<TopKThresholdCell>>,
+	) -> Self {
+		Self {
+			heap: BinaryHeap::with_capacity(limit + 1),
+			sort_keys,
+			limit,
+			seq: 0,
+			threshold_cell,
+		}
+	}
+
+	/// Publish the heap's worst entry's first sort key as the scan-side
+	/// rejection threshold. Only called when the heap is full, so the scan
+	/// never rejects against a threshold the heap could still admit
+	/// unconditionally.
+	fn publish_threshold(&self) {
+		if let Some(cell) = self.threshold_cell.as_ref()
+			&& let Some(worst) = self.heap.peek()
+			&& let Some(first_key) = worst.0.keys.first()
+		{
+			cell.publish(first_key.clone());
+		}
+	}
+
+	fn insert(&mut self, value: Value) {
+		// Extract this row's sort keys once, as borrowed views — no clone
+		// unless the row is actually kept.
+		let keys: Vec<std::borrow::Cow<Value>> =
+			self.sort_keys.iter().map(|k| k.path.extract(&value)).collect();
+
+		if self.heap.len() >= self.limit {
+			// Heap is full — compare against the worst entry's cached keys
+			// before materialising anything.
+			if let Some(worst) = self.heap.peek() {
+				let cmp = compare_keys_by_sort_key(&keys, &worst.0.keys, &self.sort_keys);
+				if cmp == Ordering::Less {
+					let keys: Vec<Value> = keys.into_iter().map(|k| k.into_owned()).collect();
+					self.heap.push(Reverse(TopKByKeyEntry {
+						keys,
+						value,
+						sort_keys: Arc::clone(&self.sort_keys),
+						seq: self.seq,
+					}));
+					self.seq += 1;
+					self.heap.pop();
+					// The admission replaced the worst entry with a strictly
+					// better one — the threshold tightened.
+					self.publish_threshold();
+				}
+				// Otherwise skip — the value is worse than everything
+				// already in the heap.
+			}
+		} else {
+			// Heap not full yet — always push.
+			let keys: Vec<Value> = keys.into_iter().map(|k| k.into_owned()).collect();
+			self.heap.push(Reverse(TopKByKeyEntry {
+				keys,
+				value,
+				sort_keys: Arc::clone(&self.sort_keys),
+				seq: self.seq,
+			}));
+			self.seq += 1;
+			if self.heap.len() == self.limit {
+				// Fill transition: the first complete top-K exists, so a
+				// rejection threshold is now meaningful.
+				self.publish_threshold();
+			}
+		}
+	}
+
+	/// Extract sorted values from the heap (pop gives worst-first, so reverse).
+	fn into_sorted(mut self) -> Vec<Value> {
+		let mut sorted: Vec<Value> = Vec::with_capacity(self.heap.len());
+		while let Some(Reverse(entry)) = self.heap.pop() {
+			sorted.push(entry.value);
+		}
+		sorted.reverse();
+		sorted
+	}
+}
+
 /// Heap-based top-k selection using field-path extraction.
 ///
 /// This is the consolidated-sort counterpart of [`SortTopK`]. Instead of
@@ -334,6 +440,15 @@ pub struct SortTopKByKey {
 	pub(crate) sort_keys: Vec<SortKey>,
 	/// The effective limit (start + limit from query)
 	pub(crate) limit: usize,
+	/// TopK threshold pushdown publish side (see [`crate::exec::topk_pushdown`]).
+	///
+	/// When installed by the planner, the heap publishes its worst entry's
+	/// **first** sort key whenever the heap is full — on the fill transition
+	/// and after every admission — so the upstream KV scan can reject rows
+	/// that cannot beat it without decoding them. Publishing only ever
+	/// tightens the threshold: admissions replace the worst entry with a
+	/// strictly better one, so the new worst is at least as good as the old.
+	pub(crate) threshold_cell: Option<Arc<TopKThresholdCell>>,
 	pub(crate) metrics: Arc<OperatorMetrics>,
 }
 
@@ -344,8 +459,17 @@ impl SortTopKByKey {
 			input,
 			sort_keys,
 			limit,
+			threshold_cell: None,
 			metrics: Arc::new(OperatorMetrics::new()),
 		}
+	}
+
+	/// Install the TopK threshold pushdown publish side. Only the planner's
+	/// `plan_sort_consolidated` calls this, after verifying the built
+	/// `sort_keys` match the probe the scan was compiled against.
+	pub(crate) fn with_threshold_cell(mut self, cell: Arc<TopKThresholdCell>) -> Self {
+		self.threshold_cell = Some(cell);
+		self
 	}
 }
 impl ExecOperator for SortTopKByKey {
@@ -417,11 +541,10 @@ impl ExecOperator for SortTopKByKey {
 		let sort_keys = Arc::new(self.sort_keys.clone());
 		let limit = self.limit;
 		let cancellation = ctx.cancellation().clone();
+		let threshold_cell = self.threshold_cell.clone();
 
 		let sorted_stream = futures::stream::once(async move {
-			let mut heap: BinaryHeap<Reverse<TopKByKeyEntry>> =
-				BinaryHeap::with_capacity(limit + 1);
-			let mut seq: u64 = 0;
+			let mut acc = TopKByKeyAccumulator::new(sort_keys, limit, threshold_cell);
 
 			futures::pin_mut!(input_stream);
 			while let Some(batch_result) = input_stream.next().await {
@@ -436,54 +559,12 @@ impl ExecOperator for SortTopKByKey {
 				};
 
 				for value in batch.values {
-					// Extract this row's sort keys once, as borrowed views —
-					// no clone unless the row is actually kept.
-					let keys: Vec<std::borrow::Cow<Value>> =
-						sort_keys.iter().map(|k| k.path.extract(&value)).collect();
-
-					if heap.len() >= limit {
-						// Heap is full — compare against the worst entry's
-						// cached keys before materialising anything.
-						if let Some(worst) = heap.peek() {
-							let cmp = compare_keys_by_sort_key(&keys, &worst.0.keys, &sort_keys);
-							if cmp == Ordering::Less {
-								let keys: Vec<Value> =
-									keys.into_iter().map(|k| k.into_owned()).collect();
-								heap.push(Reverse(TopKByKeyEntry {
-									keys,
-									value,
-									sort_keys: Arc::clone(&sort_keys),
-									seq,
-								}));
-								seq += 1;
-								heap.pop();
-							}
-							// Otherwise skip — the value is worse than everything
-							// already in the heap.
-						}
-					} else {
-						// Heap not full yet — always push.
-						let keys: Vec<Value> = keys.into_iter().map(|k| k.into_owned()).collect();
-						heap.push(Reverse(TopKByKeyEntry {
-							keys,
-							value,
-							sort_keys: Arc::clone(&sort_keys),
-							seq,
-						}));
-						seq += 1;
-					}
+					acc.insert(value);
 				}
 			}
 
-			// Extract sorted values from heap (pop gives worst-first, so reverse).
-			let mut sorted: Vec<Value> = Vec::with_capacity(heap.len());
-			while let Some(Reverse(entry)) = heap.pop() {
-				sorted.push(entry.value);
-			}
-			sorted.reverse();
-
 			Ok(ValueBatch {
-				values: sorted,
+				values: acc.into_sorted(),
 			})
 		});
 
@@ -495,5 +576,99 @@ impl ExecOperator for SortTopKByKey {
 		});
 
 		Ok(monitor_stream(Box::pin(filtered), "SortTopKByKey", &self.metrics))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::BTreeMap;
+
+	use surrealdb_strand::Strand;
+
+	use super::*;
+	use crate::exec::field_path::FieldPath;
+	use crate::val::{Number, Object};
+
+	fn row(n: i64) -> Value {
+		Value::Object(Object::from(BTreeMap::from([(
+			Strand::from("a"),
+			Value::Number(Number::Int(n)),
+		)])))
+	}
+
+	fn desc_keys() -> Arc<Vec<SortKey>> {
+		let mut key = SortKey::new(FieldPath::field("a"));
+		key.direction = SortDirection::Desc;
+		Arc::new(vec![key])
+	}
+
+	fn acc_with_cell(limit: usize) -> (TopKByKeyAccumulator, Arc<TopKThresholdCell>) {
+		let cell = Arc::new(TopKThresholdCell::default());
+		let acc = TopKByKeyAccumulator::new(desc_keys(), limit, Some(Arc::clone(&cell)));
+		(acc, cell)
+	}
+
+	#[test]
+	fn publishes_on_fill_transition_only() {
+		let (mut acc, cell) = acc_with_cell(2);
+		acc.insert(row(10));
+		assert!(cell.snapshot().is_none(), "no threshold before the heap fills");
+		acc.insert(row(20));
+		// Heap full: the worst of {10, 20} under DESC is 10.
+		assert_eq!(cell.snapshot().as_deref(), Some(&Value::Number(Number::Int(10))));
+	}
+
+	#[test]
+	fn tightens_on_admission_and_ignores_rejects() {
+		let (mut acc, cell) = acc_with_cell(2);
+		acc.insert(row(10));
+		acc.insert(row(20));
+		// 5 is worse than the worst (10) under DESC — rejected, threshold unchanged.
+		acc.insert(row(5));
+		assert_eq!(cell.snapshot().as_deref(), Some(&Value::Number(Number::Int(10))));
+		// 30 displaces 10 — the new worst (and threshold) is 20.
+		acc.insert(row(30));
+		assert_eq!(cell.snapshot().as_deref(), Some(&Value::Number(Number::Int(20))));
+	}
+
+	#[test]
+	fn equal_keys_do_not_displace_or_tighten() {
+		let (mut acc, cell) = acc_with_cell(2);
+		acc.insert(row(10));
+		acc.insert(row(20));
+		// Ties with the worst entry are not admitted (insertion-stable), so
+		// the threshold stays put — matching the scan probe's tie rejection.
+		acc.insert(row(10));
+		assert_eq!(cell.snapshot().as_deref(), Some(&Value::Number(Number::Int(10))));
+		assert_eq!(acc.into_sorted(), vec![row(20), row(10)]);
+	}
+
+	#[test]
+	fn never_publishes_when_heap_never_fills() {
+		let (mut acc, cell) = acc_with_cell(5);
+		acc.insert(row(1));
+		acc.insert(row(2));
+		assert!(cell.snapshot().is_none());
+		assert_eq!(acc.into_sorted(), vec![row(2), row(1)]);
+	}
+
+	#[test]
+	fn zero_limit_never_publishes() {
+		let (mut acc, cell) = acc_with_cell(0);
+		acc.insert(row(1));
+		assert!(cell.snapshot().is_none());
+		assert!(acc.into_sorted().is_empty());
+	}
+
+	#[test]
+	fn output_identical_with_and_without_publisher() {
+		let values = [5i64, 3, 9, 1, 7, 9, 2, 8];
+		let (mut with_cell, _cell) = acc_with_cell(3);
+		let mut without_cell = TopKByKeyAccumulator::new(desc_keys(), 3, None);
+		for v in values {
+			with_cell.insert(row(v));
+			without_cell.insert(row(v));
+		}
+		assert_eq!(with_cell.into_sorted(), without_cell.into_sorted());
 	}
 }

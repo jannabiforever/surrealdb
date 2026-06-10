@@ -45,7 +45,11 @@ pub struct OrderByField {
 /// - No duplicate expression evaluation
 /// - Cleaner separation of concerns
 /// - Type-safe field path extraction (no execution required)
-#[derive(Debug, Clone)]
+///
+/// `PartialEq`/`Eq` compare the full specification (path, direction, collate,
+/// numeric); the TopK threshold pushdown install guard relies on this to
+/// verify the sort plan matches the probe built at scan-planning time.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SortKey {
 	/// Path to extract for sorting
 	pub path: FieldPath,

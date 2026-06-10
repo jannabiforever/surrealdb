@@ -44,7 +44,10 @@ pub(crate) mod wire_literal;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-pub(crate) use compile::{pre_decode_filter_for_execute, pre_decode_filter_status_at_plan_time};
+pub(crate) use compile::{
+	field_state_blocks_raw_read, pre_decode_filter_for_execute,
+	pre_decode_filter_status_at_plan_time,
+};
 use revision::WalkRevisioned;
 pub(crate) use streaming::StreamingLeafEvaluator;
 use wire_literal::{LiteralSet, LiteralWire};

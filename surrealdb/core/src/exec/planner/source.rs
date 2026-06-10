@@ -352,6 +352,7 @@ impl<'ctx> Planner<'ctx> {
 				start,
 				omit: vec![],
 				tempfiles: false,
+				topk_pushdown: None,
 			};
 			self.plan_pipeline(base_scan, expr, config).await
 		} else {

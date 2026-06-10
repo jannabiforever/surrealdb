@@ -752,6 +752,9 @@ async fn resolve_table_scan_stream(
 				cfg.pre_skip,
 				cfg.limit_hint,
 				cfg.pre_decode_filter.clone(),
+				// TopK threshold pushdown is plan-time-only (TableScan);
+				// DynamicScan resolves its access path at runtime.
+				None,
 			);
 			Ok((stream, cfg.pre_skip))
 		}

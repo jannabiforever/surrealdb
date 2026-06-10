@@ -344,7 +344,19 @@ fn format_metrics_text(metrics: &OperatorMetrics, redact_volatile_explain_attrs:
 		format!("{}ns", elapsed)
 	};
 
-	format!("rows: {}, batches: {}, elapsed: {}", rows, batches, elapsed_str)
+	// Rows skipped before decode (TopK threshold pushdown). The count
+	// depends on how quickly the sort task publishes its threshold relative
+	// to the scan's progress, so it is volatile like batches/elapsed and
+	// only rendered when non-zero.
+	let skipped = metrics.skipped_rows();
+	if skipped > 0 {
+		format!(
+			"rows: {}, batches: {}, elapsed: {}, skipped: {}",
+			rows, batches, elapsed_str, skipped
+		)
+	} else {
+		format!("rows: {}, batches: {}, elapsed: {}", rows, batches, elapsed_str)
+	}
 }
 
 /// Format an execution plan node as a text tree with metrics.
@@ -440,6 +452,11 @@ fn format_analyze_plan_json(
 		if !redact_volatile_explain_attrs {
 			metrics_obj.insert("output_batches", Value::from(metrics.output_batches() as i64));
 			metrics_obj.insert("elapsed_ns", Value::from(metrics.elapsed_ns() as i64));
+			// Volatile (publish-timing dependent); rendered only when non-zero.
+			let skipped = metrics.skipped_rows();
+			if skipped > 0 {
+				metrics_obj.insert("skipped_rows", Value::from(skipped as i64));
+			}
 		}
 		obj.insert("metrics", Value::Object(metrics_obj));
 	}
