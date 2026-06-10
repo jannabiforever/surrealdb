@@ -4,10 +4,10 @@
 //!
 //! - [`SortTopK`]: Expression-evaluation variant that pre-computes sort keys. Used by the
 //!   non-consolidated sort path (`plan_sort`).
-//! - [`SortTopKByKey`]: Field-path extraction variant that compares values inline. Used by the
-//!   consolidated sort path (`plan_sort_consolidated`). This is the preferred variant because it
-//!   avoids pre-computing sort keys for every row and instead extracts fields only during
-//!   comparison -- matching the old executor's `MemoryOrderedLimit` strategy.
+//! - [`SortTopKByKey`]: Field-path extraction variant used by the consolidated sort path
+//!   (`plan_sort_consolidated`). This is the preferred variant because it extracts each row's keys
+//!   once as cheap borrowed views (no expression evaluation), materialising them only for rows that
+//!   actually enter the heap, where they are cached for all later comparisons.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 
-use super::common::{OrderByField, SortDirection, SortKey, compare_keys, compare_records_by_keys};
+use super::common::{OrderByField, SortDirection, SortKey, compare_keys, compare_keys_by_sort_key};
 use crate::exec::{
 	AccessMode, CardinalityHint, CombineAccessModes, ContextLevel, EvalContext, ExecOperator,
 	ExecutionContext, FlowResult, OperatorMetrics, PhysicalExpr, ValueBatch, ValueBatchStream,
@@ -271,12 +271,19 @@ impl ExecOperator for SortTopK {
 // SortTopKByKey - Field-path extraction variant (consolidated approach)
 // ============================================================================
 
-/// A heap entry that stores the value and a shared reference to the sort keys.
+/// A heap entry that stores the value with its pre-extracted sort keys.
+///
+/// Keys are extracted exactly once when the entry is created, so heap
+/// comparisons are pure value comparisons — no repeated `FieldPath::extract`
+/// walks against the record (the heap's worst entry is compared against
+/// every candidate, so re-extracting it per candidate is O(n) extra walks).
 ///
 /// Uses `Arc<Vec<SortKey>>` per entry so that `BinaryHeap` can use the `Ord`
 /// trait for comparison. The Arc clone is ~1ns and this mirrors the proven
 /// pattern from the old executor's `MemoryOrderedLimit` (`Arc<OrderList>`).
 struct TopKByKeyEntry {
+	/// Sort keys extracted from the value, one per `SortKey`.
+	keys: Vec<Value>,
 	/// The original record value.
 	value: Value,
 	/// Shared reference to the sort key specification.
@@ -306,21 +313,19 @@ impl Ord for TopKByKeyEntry {
 		//
 		// The seq tiebreaker ensures stability: for equal keys, earlier entries
 		// (lower seq) are considered "better" and remain in the heap.
-		compare_records_by_keys(&other.value, &self.value, &self.sort_keys)
+		compare_keys_by_sort_key(&other.keys, &self.keys, &self.sort_keys)
 			.then_with(|| other.seq.cmp(&self.seq))
 	}
 }
 
-/// Heap-based top-k selection using field-path extraction for comparison.
+/// Heap-based top-k selection using field-path extraction.
 ///
 /// This is the consolidated-sort counterpart of [`SortTopK`]. Instead of
-/// pre-computing sort keys for every row through expression evaluation, it
-/// extracts field values inline during comparison via [`FieldPath::extract`].
-///
-/// This is significantly faster for ORDER BY + small LIMIT because:
-/// - No per-row `Vec<Value>` allocation for sort keys
-/// - No expression evaluation for rows that will be immediately rejected
-/// - Field extraction is a cheap O(1) path lookup on the `Value` object
+/// evaluating order-by expressions, it extracts each row's sort keys via
+/// [`FieldPath::extract`] — once per row, as borrowed views. A rejected row
+/// (worse than everything in the full heap) never has its keys cloned; keys
+/// are materialised only when a row actually enters the heap, where they are
+/// cached so heap comparisons never re-extract from the record.
 ///
 /// Use when `limit <= MAX_ORDER_LIMIT_PRIORITY_QUEUE_SIZE` (default 1000).
 #[derive(Debug, Clone)]
@@ -431,12 +436,21 @@ impl ExecOperator for SortTopKByKey {
 				};
 
 				for value in batch.values {
+					// Extract this row's sort keys once, as borrowed views —
+					// no clone unless the row is actually kept.
+					let keys: Vec<std::borrow::Cow<Value>> =
+						sort_keys.iter().map(|k| k.path.extract(&value)).collect();
+
 					if heap.len() >= limit {
-						// Heap is full — compare inline before allocating anything.
+						// Heap is full — compare against the worst entry's
+						// cached keys before materialising anything.
 						if let Some(worst) = heap.peek() {
-							let cmp = compare_records_by_keys(&value, &worst.0.value, &sort_keys);
+							let cmp = compare_keys_by_sort_key(&keys, &worst.0.keys, &sort_keys);
 							if cmp == Ordering::Less {
+								let keys: Vec<Value> =
+									keys.into_iter().map(|k| k.into_owned()).collect();
 								heap.push(Reverse(TopKByKeyEntry {
+									keys,
 									value,
 									sort_keys: Arc::clone(&sort_keys),
 									seq,
@@ -449,7 +463,9 @@ impl ExecOperator for SortTopKByKey {
 						}
 					} else {
 						// Heap not full yet — always push.
+						let keys: Vec<Value> = keys.into_iter().map(|k| k.into_owned()).collect();
 						heap.push(Reverse(TopKByKeyEntry {
+							keys,
 							value,
 							sort_keys: Arc::clone(&sort_keys),
 							seq,
