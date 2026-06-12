@@ -43,6 +43,37 @@ cargo run --features backend-rocksdb run --backend rocksdb
 cargo run --features backend-tikv run --backend tikv
 ```
 
+## GraphQL tests
+
+Besides `.surql` files the test directory can also contain `.graphql` files.
+These are executed against the dynamic GraphQL schema which surrealdb-core
+generates from the database catalog — the same code path as the server's
+`/graphql` endpoint — instead of the SurrealQL parser. A GraphQL test produces
+a single result: the response `data` on success, or the response errors joined
+into an error string, so `[[test.results]]` has exactly one entry (`value` or
+`error`).
+
+Because GraphQL requires a configured database, a `.graphql` test imports a
+`.surql` file (see `tests/graphql/_schema.surql`) which defines
+`DEFINE CONFIG GRAPHQL`, the tables, and the data. Imports must always be
+`.surql` files. The `/** ... */` config comment is not valid GraphQL syntax,
+so the harness blanks it out (preserving line numbers) before execution.
+
+A `.graphql` test can additionally set request options in a `[graphql]`
+config section:
+
+```toml
+[graphql]
+# GraphQL request variables for the operation.
+variables = { personId = "bob", minViews = 10 }
+# The operation to execute when the document defines multiple named operations.
+operation = "FetchData"
+```
+
+The suite lives under `tests/graphql/`. GraphQL benches work too — see
+`tests/bench/graphql/` — with the schema generated once up front so the timed
+iterations measure query execution only.
+
 ## Benchmarking
 
 The same `.surql` corpus doubles as a benchmark suite. The entry point is the

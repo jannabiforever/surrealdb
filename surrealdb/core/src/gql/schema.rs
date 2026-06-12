@@ -1012,6 +1012,13 @@ pub(crate) fn gql_to_sql_kind_with_scope(
 				}
 			}
 			GqlValue::String(s) => {
+				// Decimal values serialize to GraphQL as plain decimal strings
+				// (see `sql_value_to_gql_value`), so accept that format
+				// directly before falling back to a SurrealQL decimal literal
+				// such as `"1.5dec"`.
+				if let Ok(d) = s.parse::<Decimal>() {
+					return Ok(SurValue::Number(SurNumber::Decimal(d)));
+				}
 				let decimal_expr: Expr = syn::expr(s)?.into();
 
 				match decimal_expr {
@@ -1709,5 +1716,21 @@ mod tests {
 
 		let val = GqlValue::Number(Number::from(42));
 		assert_eq!(gql_to_sql_kind(&val, kind).unwrap(), SurValue::from(42i64));
+	}
+
+	#[test]
+	fn decimal_string_round_trips() {
+		// `sql_value_to_gql_value` serializes decimals as plain decimal
+		// strings, so `gql_to_sql_kind` must accept that exact format back —
+		// the debug-build scalar validator rejects every decimal field
+		// response otherwise. The SurrealQL literal form keeps working.
+		let decimal = SurValue::Number(SurNumber::Decimal("19.99".parse().unwrap()));
+
+		let serialized = sql_value_to_gql_value(decimal.clone()).unwrap();
+		assert_eq!(serialized, GqlValue::String("19.99".to_owned()));
+		assert_eq!(gql_to_sql_kind(&serialized, Kind::Decimal).unwrap(), decimal);
+
+		let literal = GqlValue::String("19.99dec".to_owned());
+		assert_eq!(gql_to_sql_kind(&literal, Kind::Decimal).unwrap(), decimal);
 	}
 }

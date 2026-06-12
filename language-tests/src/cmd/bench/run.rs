@@ -18,8 +18,9 @@ use crate::cli::{Backend, ColorMode};
 use crate::cmd::bench::stats::{ComparisonData, MeasurementData};
 use crate::cmd::bench::store::{BenchMarkRun, StoreConfig, get_store};
 use crate::cmd::bench::{DEFAULT_NOISE_THRESHOLD, DEFAULT_SIGNIFICANCE_THRESHOLD};
-use crate::cmd::util;
 use crate::cmd::util::ImportFailure;
+use crate::cmd::{graphql, util};
+use crate::tests::case::Dialect;
 use crate::tests::run::{CaseImports, RunConfig, TestRunId};
 use crate::tests::schema::{BoolOr, NewPlannerStrategyConfig, TestConfig};
 use crate::tests::{CaseSet, RunSetBuilder, TestRun};
@@ -505,6 +506,84 @@ enum BenchRunResult {
 	Ok(MeasurementData, Option<ComparisonData>),
 }
 
+/// The executable form of a bench case: raw SurrealQL source, or a GraphQL
+/// request executed against the schema generated for the prepared datastore.
+enum BenchStatement {
+	SurrealQl,
+	GraphQl {
+		schema: async_graphql::dynamic::Schema,
+		/// The case source with the config comment blanked out, computed once.
+		source: String,
+		session: Arc<Session>,
+		variables: async_graphql::Variables,
+		operation: Option<String>,
+	},
+}
+
+impl BenchStatement {
+	/// Builds the statement for a freshly prepared datastore. For GraphQL this
+	/// generates the schema and request parts up front — mirroring the
+	/// server's schema cache — so the timed iterations measure query execution
+	/// only.
+	async fn prepare(
+		run: &TestRun<BenchRunConfig>,
+		dbs: &Arc<Datastore>,
+		session: &Session,
+	) -> Result<Self> {
+		match run.case.test.dialect {
+			Dialect::SurrealQl => Ok(Self::SurrealQl),
+			Dialect::GraphQl => {
+				let schema = graphql::generate_schema(dbs, session)
+					.await
+					.map_err(|e| anyhow!("Failed to generate GraphQL schema: {e}"))?;
+				Ok(Self::GraphQl {
+					schema,
+					source: graphql::case_source(&run.case.test),
+					session: Arc::new(session.clone()),
+					variables: graphql::request_variables(&run.case.test)?,
+					operation: run.case.test.config.parsed.graphql.operation.clone(),
+				})
+			}
+		}
+	}
+
+	/// Executes the bench statement once. GraphQL responses carry their
+	/// errors in-band, so they are checked here — a bench that errors every
+	/// iteration would otherwise silently measure nothing.
+	async fn execute(
+		&self,
+		run: &TestRun<BenchRunConfig>,
+		dbs: &Arc<Datastore>,
+		session: &Session,
+	) -> Result<()> {
+		match self {
+			Self::SurrealQl => {
+				let _ = dbs.execute(&run.case.test.source, session, None).await?;
+			}
+			Self::GraphQl {
+				schema,
+				source,
+				session,
+				variables,
+				operation,
+			} => {
+				let mut request = async_graphql::Request::new(source.clone())
+					.data(Arc::clone(dbs))
+					.data(Arc::clone(session));
+				request.variables = variables.clone();
+				if let Some(operation) = operation {
+					request = request.operation_name(operation);
+				}
+				let response = schema.execute(request).await;
+				if let Some(error) = response.errors.first() {
+					bail!("GraphQL bench statement returned an error: {}", error.message);
+				}
+			}
+		}
+		Ok(())
+	}
+}
+
 /// Builds a fresh in-memory datastore, runs the bench's imports, and performs
 /// index compaction so the datastore is ready to execute the timed statement.
 ///
@@ -567,7 +646,10 @@ async fn run_bench(
 		None
 	} else {
 		match prepare(run, config, &token).await? {
-			Ok(prepared) => Some(prepared),
+			Ok((dbs, session)) => {
+				let statement = BenchStatement::prepare(run, &dbs, &session).await?;
+				Some((dbs, session, statement))
+			}
 			Err(e) => return Ok(BenchRunResult::Import(e)),
 		}
 	};
@@ -575,14 +657,15 @@ async fn run_bench(
 	let before_warmup = Instant::now();
 	let mut count = 0usize;
 	loop {
-		if let Some((dbs, session)) = shared.as_ref() {
-			let _ = dbs.execute(&run.case.test.source, session, None).await?;
+		if let Some((dbs, session, statement)) = shared.as_ref() {
+			statement.execute(run, dbs, session).await?;
 		} else {
 			let (dbs, session) = match prepare(run, config, &token).await? {
 				Ok(prepared) => prepared,
 				Err(e) => return Ok(BenchRunResult::Import(e)),
 			};
-			let _ = dbs.execute(&run.case.test.source, &session, None).await?;
+			let statement = BenchStatement::prepare(run, &dbs, &session).await?;
+			statement.execute(run, &dbs, &session).await?;
 		}
 
 		count += 1;
@@ -625,18 +708,19 @@ async fn run_bench(
 	for _ in 0..bench_config.sample_size {
 		let mut sample_duration = 0.0;
 		for _ in 0..iterations_per_samples {
-			if let Some((dbs, session)) = shared.as_ref() {
+			if let Some((dbs, session, statement)) = shared.as_ref() {
 				let start = Instant::now();
-				let _ = dbs.execute(&run.case.test.source, session, None).await?;
+				statement.execute(run, dbs, session).await?;
 				sample_duration += start.elapsed().as_secs_f64();
 			} else {
 				let (dbs, session) = match prepare(run, config, &token).await? {
 					Ok(prepared) => prepared,
 					Err(e) => return Ok(BenchRunResult::Import(e)),
 				};
+				let statement = BenchStatement::prepare(run, &dbs, &session).await?;
 
 				let start = Instant::now();
-				let _ = dbs.execute(&run.case.test.source, &session, None).await?;
+				statement.execute(run, &dbs, &session).await?;
 				sample_duration += start.elapsed().as_secs_f64();
 			}
 		}

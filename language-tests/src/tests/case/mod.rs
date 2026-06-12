@@ -30,19 +30,34 @@ pub struct Origin {
 	pub line_offset: Option<usize>,
 }
 
+/// The query language a test case is written in, derived from the file
+/// extension: `.surql` is SurrealQL, `.graphql` is GraphQL.
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub enum Dialect {
+	SurrealQl,
+	GraphQl,
+}
+
 /// A single test case, which might produce multiple test runs depending on configuration.
 #[derive(Debug)]
 pub struct TestCase {
 	pub id: CaseId,
 	pub origin: Arc<Origin>,
 	pub config: CaseConfig,
-	/// The surrealql source for the test.
+	/// The query language the test source is written in.
+	pub dialect: Dialect,
+	/// The query source for the test, in the language given by `dialect`.
 	/// Includes the config.
 	pub source: String,
 }
 
 impl TestCase {
-	pub fn from_source_origin_id(id: CaseId, origin: Arc<Origin>, source: String) -> Result<Self> {
+	pub fn from_source_origin_id(
+		id: CaseId,
+		origin: Arc<Origin>,
+		source: String,
+		dialect: Dialect,
+	) -> Result<Self> {
 		let config = CaseConfig::parse(&source).with_context(|| {
 			if let Some(line) = origin.line_offset {
 				format!("Could not parse config for test file `{}` at line {line}", origin.path)
@@ -55,6 +70,7 @@ impl TestCase {
 			id,
 			origin,
 			config,
+			dialect,
 			source,
 		})
 	}
@@ -171,6 +187,18 @@ impl CaseSet {
 			match self.find_import(import, importing) {
 				Some(x) if x.len() == 1 => {
 					let imp = x[0].clone();
+					// Imports are executed as SurrealQL (`Datastore::execute` on
+					// the raw source), so GraphQL files cannot be imported.
+					if imp.dialect != Dialect::SurrealQl {
+						errors.push(TestLoadError {
+							origin: origin.clone(),
+							error: Error::msg(format!(
+								"Import `{import}` is a GraphQL (.graphql) file; imports must be SurrealQL (.surql) files"
+							)),
+						});
+						ok = false;
+						continue;
+					}
 					// Dedup + cycle guard: skip anything already added or in progress.
 					if visited.contains(&imp.id.0) {
 						continue;
@@ -213,12 +241,14 @@ impl CaseSet {
 		ok
 	}
 
-	/// Loads every `.surql` file under `root` (recursively) into a [`CaseSet`].
+	/// Loads every `.surql` (SurrealQL) and `.graphql` (GraphQL) file under
+	/// `root` (recursively) into a [`CaseSet`].
 	///
 	/// Each file's config comment is parsed into a [`TestCase`] keyed by its path
 	/// relative to `root`. Files whose config fails to parse are recorded in
 	/// `errors` (with their [`Origin`]) and skipped rather than aborting the whole
-	/// load, so one bad file doesn't hide the rest. Non-`.surql` files are ignored.
+	/// load, so one bad file doesn't hide the rest. Files with other extensions
+	/// are ignored.
 	pub async fn load_surrealql_files(root: &str, errors: &mut Vec<TestLoadError>) -> Result<Self> {
 		let mut cases = Vec::new();
 		let mut by_path = HashMap::new();
@@ -229,9 +259,13 @@ impl CaseSet {
 		}
 
 		walk_directory(&root, &mut async |path: &str| {
-			if !path.ends_with(".surql") {
+			let dialect = if path.ends_with(".surql") {
+				Dialect::SurrealQl
+			} else if path.ends_with(".graphql") {
+				Dialect::GraphQl
+			} else {
 				return Ok(());
-			}
+			};
 
 			let metadata = fs::metadata(path).await.context("Could not read file metadata")?;
 
@@ -253,7 +287,7 @@ impl CaseSet {
 
 			let id = CaseId(cases.len());
 
-			match TestCase::from_source_origin_id(id, origin.clone(), source) {
+			match TestCase::from_source_origin_id(id, origin.clone(), source, dialect) {
 				Ok(x) => {
 					let case = Arc::new(x);
 					by_path.entry(path.to_string()).or_insert_with(Vec::new).push(case.clone());

@@ -53,6 +53,8 @@ pub struct TestConfig {
 	pub test: TestDetails,
 	#[serde(default)]
 	pub bench: BenchDetails,
+	#[serde(default)]
+	pub graphql: GraphQlDetails,
 	#[serde(skip_serializing)]
 	#[serde(flatten)]
 	_unused_keys: BTreeMap<String, toml::Value>,
@@ -65,8 +67,29 @@ impl TestConfig {
 		res.append(&mut self.env.unused_keys());
 		res.append(&mut self.test.unused_keys());
 		res.extend(self.bench._unused_keys.keys().cloned());
+		res.extend(self.graphql._unused_keys.keys().map(|x| format!("graphql.{x}")));
 		res
 	}
+}
+
+/// Request options for GraphQL (`.graphql`) test cases.
+///
+/// Only consulted when the test's dialect is GraphQL; for SurrealQL tests the
+/// section is unused (and flagged by the unused-key warning if present).
+#[derive(Default, Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct GraphQlDetails {
+	/// Variables sent with the GraphQL request, e.g.
+	/// `variables = { id = "person:1", min = 2 }`.
+	#[serde(default)]
+	pub variables: Option<toml::Table>,
+	/// The operation to execute when the document defines multiple named
+	/// operations (the GraphQL `operationName` request field).
+	#[serde(default)]
+	pub operation: Option<String>,
+	#[serde(skip_serializing)]
+	#[serde(flatten)]
+	_unused_keys: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

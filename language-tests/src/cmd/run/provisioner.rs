@@ -124,7 +124,7 @@ impl CreateInfo {
 		ds.bootstrap().await?;
 
 		Ok(Ds {
-			store: Box::new(ds),
+			store: Arc::new(ds),
 			path,
 		})
 	}
@@ -140,8 +140,9 @@ impl CreateInfo {
 }
 
 pub struct Ds {
-	/// The store itself
-	store: Box<Datastore>,
+	/// The store itself. Held in an `Arc` because GraphQL schema generation
+	/// (and the resolvers it produces) capture a clone of the datastore.
+	store: Arc<Datastore>,
 	/// The path where you can find the store, none if the store is in-memory
 	path: Option<String>,
 }
@@ -180,13 +181,13 @@ pub struct Permit {
 }
 
 impl Permit {
-	pub async fn with<F: AsyncFnOnce(&mut Box<Datastore>, &Box<Datastore>) -> (CanReuse, R), R>(
+	pub async fn with<F: AsyncFnOnce(&Arc<Datastore>, &Box<Datastore>) -> (CanReuse, R), R>(
 		self,
 		f: F,
 	) -> Result<R> {
 		let mut sender = None;
 
-		let mut store = match self.inner {
+		let store = match self.inner {
 			PermitInner::Reuse {
 				ds,
 				channel,
@@ -200,7 +201,7 @@ impl Permit {
 			} => self.info.produce_ds(versioned, *capabilities).await?,
 		};
 
-		let (can_reuse, res) = f(&mut store.store, &self.grade_ds).await;
+		let (can_reuse, res) = f(&store.store, &self.grade_ds).await;
 
 		if let CanReuse::Reset = can_reuse {
 			if let Err(e) = self.grade_ds.shutdown().await {

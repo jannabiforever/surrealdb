@@ -1,6 +1,7 @@
 use std::fmt::Write;
 use std::io::IsTerminal;
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,9 +19,10 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::cli::{Backend, ColorMode, ResultsMode};
 use crate::cmd::run::provisioner::CanReuse;
-use crate::cmd::util;
+use crate::cmd::{graphql, util};
 use crate::format::{IndentFormatter, Progress, ansi};
 use crate::runner::Schedular;
+use crate::tests::case::Dialect;
 use crate::tests::report::{TestGrade, TestReport, TestTaskResult};
 use crate::tests::run::{CaseImports, RunConfig};
 use crate::tests::schema::{ENV_DEFAULT_TIMEOUT, NewPlannerStrategyConfig};
@@ -359,7 +361,7 @@ async fn check_retained_keys(dbs: &Datastore) -> Result<Vec<Vec<u8>>> {
 
 async fn run_test_with_dbs(
 	run: &TestRun<TestRunConfig>,
-	dbs: &Datastore,
+	dbs: &Arc<Datastore>,
 ) -> Result<TestTaskResult> {
 	let config = &run.case.test.config.parsed;
 
@@ -388,31 +390,56 @@ async fn run_test_with_dbs(
 		return Ok(TestTaskResult::SigninError(e));
 	}
 
-	let settings = syn::parser::ParserSettings {
-		files_enabled: dbs.get_capabilities().allows_experimental(&ExperimentalTarget::Files),
-		surrealism_enabled: dbs
-			.get_capabilities()
-			.allows_experimental(&ExperimentalTarget::Surrealism),
-		..Default::default()
-	};
+	let (did_timeout, result) = match run.case.test.dialect {
+		Dialect::SurrealQl => {
+			let settings = syn::parser::ParserSettings {
+				files_enabled: dbs
+					.get_capabilities()
+					.allows_experimental(&ExperimentalTarget::Files),
+				surrealism_enabled: dbs
+					.get_capabilities()
+					.allows_experimental(&ExperimentalTarget::Surrealism),
+				..Default::default()
+			};
 
-	let source = &run.case.test.source.as_bytes();
-	let mut parser = syn::parser::Parser::new_with_settings(source, settings);
-	let mut stack = reblessive::Stack::new();
+			let source = &run.case.test.source.as_bytes();
+			let mut parser = syn::parser::Parser::new_with_settings(source, settings);
+			let mut stack = reblessive::Stack::new();
 
-	let query = match stack.enter(|stk| parser.parse_query(stk)).finish() {
-		Ok(x) => {
-			if let Err(e) = parser.assert_finished() {
-				return Ok(TestTaskResult::ParserError(e.render_on_bytes(source)));
-			}
-			x
+			let query = match stack.enter(|stk| parser.parse_query(stk)).finish() {
+				Ok(x) => {
+					if let Err(e) = parser.assert_finished() {
+						return Ok(TestTaskResult::ParserError(e.render_on_bytes(source)));
+					}
+					x
+				}
+				Err(e) => return Ok(TestTaskResult::ParserError(e.render_on_bytes(source))),
+			};
+
+			let start = Instant::now();
+			let result = dbs.process(query, &session, None).await;
+			let did_timeout = start.elapsed() > timeout_duration;
+			let result = result
+				.map(|x| x.into_iter().map(|x| x.result.map_err(|e| e.to_string())).collect());
+			(did_timeout, result)
 		}
-		Err(e) => return Ok(TestTaskResult::ParserError(e.render_on_bytes(source))),
+		Dialect::GraphQl => {
+			// Schema generation reads the catalog like the server does on a
+			// cache miss; it is setup, not the query under test, so it stays
+			// outside the timed window. Failures (e.g. GraphQL not configured)
+			// are part of the testable surface and become the single result.
+			match graphql::generate_schema(dbs, &session).await {
+				Ok(schema) => {
+					let request = graphql::build_request(&run.case.test, dbs, &session)?;
+					let start = Instant::now();
+					let response = schema.execute(request).await;
+					let did_timeout = start.elapsed() > timeout_duration;
+					(did_timeout, Ok(vec![graphql::response_to_result(response)]))
+				}
+				Err(e) => (false, Ok(vec![Err(e)])),
+			}
+		}
 	};
-
-	let start = Instant::now();
-	let result = dbs.process(query, &session, None).await;
-	let did_timeout = start.elapsed() > timeout_duration;
 
 	if let Some(ref ns) = session.ns {
 		if let Some(ref db) = session.db {
@@ -450,13 +477,10 @@ async fn run_test_with_dbs(
 	}
 
 	match result {
-		Ok(x) => {
-			let x = x.into_iter().map(|x| x.result.map_err(|e| e.to_string())).collect();
-			Ok(TestTaskResult::Results {
-				did_timeout,
-				res: x,
-			})
-		}
+		Ok(res) => Ok(TestTaskResult::Results {
+			did_timeout,
+			res,
+		}),
 		Err(e) => Ok(TestTaskResult::RunningError(anyhow::anyhow!(e))),
 	}
 }
