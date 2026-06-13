@@ -17,6 +17,15 @@ mod config;
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub struct CaseId(usize);
 
+impl CaseId {
+	/// Construct a [`CaseId`] directly. Only used by the harness's own unit tests,
+	/// which build [`TestCase`]s by hand rather than loading them from disk.
+	#[cfg(test)]
+	pub fn new(id: usize) -> Self {
+		CaseId(id)
+	}
+}
+
 /// A origin of a test, which is some path + possibly an offset within the file at that path.
 #[derive(Debug, Eq, PartialEq, Hash)]
 pub struct Origin {
