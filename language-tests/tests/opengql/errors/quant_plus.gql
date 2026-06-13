@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: one-or-more quantifiers are unbounded."
+
+[test.results]
+parsing-error = '''
+The `+` quantifier is not supported yet
+  --> [15:28]
+   |
+15 | MATCH (a:person)-[:knows]->+(b:person) RETURN a
+   |                            ^ use a bounded quantifier: `{1,n}`
+'''
+*/
+
+MATCH (a:person)-[:knows]->+(b:person) RETURN a

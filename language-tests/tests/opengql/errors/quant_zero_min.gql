@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: a zero minimum includes the zero-hop case, which the recursion lowering cannot express."
+
+[test.results]
+parsing-error = '''
+Variable-length quantifiers must have a minimum of at least one
+  --> [15:28]
+   |
+15 | MATCH (a:person)-[:knows]->{0,3}(b:person) RETURN a
+   |                            ^^^^^ use `{1,n}` instead of `{0,n}`
+'''
+*/
+
+MATCH (a:person)-[:knows]->{0,3}(b:person) RETURN a

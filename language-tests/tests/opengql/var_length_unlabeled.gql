@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["opengql/_schema.surql"]
+
+[test]
+reason = "Variable-length hop with an unlabeled far node: the recursion nest ends in ? so city:1 is reachable too; 11 distinct (anchor, node) pairs at depths 1..2."
+
+[[test.results]]
+value = "[{ name: 'A' }, { name: 'A' }, { name: 'A' }, { name: 'B' }, { name: 'B' }, { name: 'B' }, { name: 'C' }, { name: 'C' }, { name: 'London' }, { name: 'London' }, { name: 'London' }]"
+*/
+
+MATCH (a:person)-[:knows]->{1,2}(b) RETURN b.name AS name ORDER BY name

@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["opengql/_schema.surql"]
+
+[test]
+reason = "Fixed-depth {1}: distinct person nodes at exactly depth one (the far label keeps city:1 out). Minima above one are rejected until the engine's collect BFS stops dropping nodes first discovered below the minimum depth."
+
+[[test.results]]
+value = "[{ an: 'A', bn: 'B' }, { an: 'B', bn: 'A' }, { an: 'B', bn: 'C' }, { an: 'C', bn: 'A' }]"
+*/
+
+MATCH (a:person)-[:knows]->{1}(b:person) RETURN a.name AS an, b.name AS bn ORDER BY an, bn

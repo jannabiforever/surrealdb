@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: the recursion lowering has no per-edge binding to address an edge variable with."
+
+[test.results]
+parsing-error = '''
+Variable-length edge patterns cannot declare an edge variable
+  --> [15:19]
+   |
+15 | MATCH (a:person)-[k:knows]->{1,2}(b:person) RETURN a
+   |                   ^ remove the variable or the quantifier
+'''
+*/
+
+MATCH (a:person)-[k:knows]->{1,2}(b:person) RETURN a

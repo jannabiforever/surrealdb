@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: aggregates require GROUP semantics v1 does not lower."
+
+[test.results]
+parsing-error = '''
+Aggregate functions are not supported yet
+  --> [15:25]
+   |
+15 | MATCH (n:person) RETURN count(n)
+   |                         ^^^^^^^^
+'''
+*/
+
+MATCH (n:person) RETURN count(n)

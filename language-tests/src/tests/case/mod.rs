@@ -31,10 +31,11 @@ pub struct Origin {
 }
 
 /// The query language a test case is written in, derived from the file
-/// extension: `.surql` is SurrealQL, `.graphql` is GraphQL.
+/// extension: `.surql` is SurrealQL, `.gql` is OpenGQL, `.graphql` is GraphQL.
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum Dialect {
 	SurrealQl,
+	OpenGql,
 	GraphQl,
 }
 
@@ -188,12 +189,12 @@ impl CaseSet {
 				Some(x) if x.len() == 1 => {
 					let imp = x[0].clone();
 					// Imports are executed as SurrealQL (`Datastore::execute` on
-					// the raw source), so GraphQL files cannot be imported.
+					// the raw source), so non-SurrealQL files cannot be imported.
 					if imp.dialect != Dialect::SurrealQl {
 						errors.push(TestLoadError {
 							origin: origin.clone(),
 							error: Error::msg(format!(
-								"Import `{import}` is a GraphQL (.graphql) file; imports must be SurrealQL (.surql) files"
+								"Import `{import}` is not a SurrealQL file; imports must be SurrealQL (.surql) files"
 							)),
 						});
 						ok = false;
@@ -241,8 +242,8 @@ impl CaseSet {
 		ok
 	}
 
-	/// Loads every `.surql` (SurrealQL) and `.graphql` (GraphQL) file under
-	/// `root` (recursively) into a [`CaseSet`].
+	/// Loads every `.surql` (SurrealQL), `.gql` (OpenGQL) and `.graphql`
+	/// (GraphQL) file under `root` (recursively) into a [`CaseSet`].
 	///
 	/// Each file's config comment is parsed into a [`TestCase`] keyed by its path
 	/// relative to `root`. Files whose config fails to parse are recorded in
@@ -261,6 +262,8 @@ impl CaseSet {
 		walk_directory(&root, &mut async |path: &str| {
 			let dialect = if path.ends_with(".surql") {
 				Dialect::SurrealQl
+			} else if path.ends_with(".gql") {
+				Dialect::OpenGql
 			} else if path.ends_with(".graphql") {
 				Dialect::GraphQl
 			} else {

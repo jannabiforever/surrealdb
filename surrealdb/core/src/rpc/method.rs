@@ -26,6 +26,7 @@ pub enum Method {
 	Delete,
 	Version,
 	Query,
+	Gql,
 	Relate,
 	Run,
 	InsertRelation,
@@ -84,6 +85,7 @@ impl Method {
 			"delete" => Self::Delete,
 			"version" => Self::Version,
 			"query" => Self::Query,
+			"gql" => Self::Gql,
 			"relate" => Self::Relate,
 			"run" => Self::Run,
 			"insert_relation" => Self::InsertRelation,
@@ -129,6 +131,7 @@ impl Method {
 			Self::Delete => "delete",
 			Self::Version => "version",
 			Self::Query => "query",
+			Self::Gql => "gql",
 			Self::Relate => "relate",
 			Self::Run => "run",
 			Self::InsertRelation => "insert_relation",
@@ -152,5 +155,18 @@ impl Method {
 	/// Checks if the provided method is a valid and supported RPC method
 	pub fn is_valid(&self) -> bool {
 		!matches!(self, Self::Unknown)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn gql_method_round_trips() {
+		assert_eq!(Method::parse_case_sensitive("gql"), Method::Gql);
+		assert_eq!(Method::parse_case_insensitive("GQL"), Method::Gql);
+		assert_eq!(Method::Gql.to_str(), "gql");
+		assert!(Method::Gql.is_valid());
 	}
 }

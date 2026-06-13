@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: under RETURN DISTINCT (and in general) ORDER BY may only reference RETURN items."
+
+[test.results]
+parsing-error = '''
+ORDER BY may only reference RETURN items
+  --> [15:80]
+   |
+15 | ... ORDER BY k.since
+   |              ^^^^^^^ return the sort expression under an alias and order by the alias
+'''
+*/
+
+MATCH (a:person)-[k:knows]->(b:person) RETURN DISTINCT b.name AS name ORDER BY k.since

@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: a MATCH clause must contain a single path pattern in v1."
+
+[test.results]
+parsing-error = '''
+Comma-separated graph patterns are not supported yet
+  --> [15:19]
+   |
+15 | MATCH (n:person), (m:city) RETURN n
+   |                   ^^^^^^^^ match a single path pattern
+'''
+*/
+
+MATCH (n:person), (m:city) RETURN n

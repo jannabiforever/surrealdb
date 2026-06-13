@@ -26,6 +26,7 @@ default = [
     "http",
     "surrealism",
     "graphql",
+    "opengql",
     "cli",
 ]
 http = ["surrealdb-core/http"]
@@ -55,6 +56,8 @@ graphql = [
     "dep:async-graphql",
     "dep:async-graphql-axum",
 ]
+# OpenGQL (ISO GQL) API support
+opengql = ["surrealdb-core/opengql"]
 # MCP (Model Context Protocol) server support
 mcp = ["dep:surrealdb-mcp", "surrealdb-mcp/server-http", "surrealdb-mcp/transport-io"]
 # Interactive CLI support (SQL shell)

@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: only a single MATCH clause lowers in v1; the span points at the second clause."
+
+[test.results]
+parsing-error = '''
+Multiple MATCH clauses are not supported yet
+  --> [15:18]
+   |
+15 | MATCH (n:person) MATCH (m:city) RETURN n
+   |                  ^^^^^^^^^^^^^^
+'''
+*/
+
+MATCH (n:person) MATCH (m:city) RETURN n

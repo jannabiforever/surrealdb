@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: zero-or-more quantifiers are unbounded and include the zero-hop case."
+
+[test.results]
+parsing-error = '''
+The `*` quantifier is not supported yet
+  --> [15:28]
+   |
+15 | MATCH (a:person)-[:knows]->*(b:person) RETURN a
+   |                            ^ use a bounded quantifier with a minimum of one: `{1,n}`
+'''
+*/
+
+MATCH (a:person)-[:knows]->*(b:person) RETURN a

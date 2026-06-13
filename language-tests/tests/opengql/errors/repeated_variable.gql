@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: a repeated pattern variable is an equality join, which v1 does not lower."
+
+[test.results]
+parsing-error = '''
+Variable `n` is declared more than once in the pattern
+  --> [15:19]
+   |
+15 | MATCH (n:person)-[n:knows]->(b:person) RETURN n
+   |                   ^ joins on a repeated variable are not supported yet
+'''
+*/
+
+MATCH (n:person)-[n:knows]->(b:person) RETURN n

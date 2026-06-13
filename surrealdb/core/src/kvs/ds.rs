@@ -3015,6 +3015,41 @@ impl Datastore {
 		self.process(ast, sess, vars).await
 	}
 
+	/// Parse a GQL query into a SurrealQL AST, checking that the `opengql`
+	/// experimental capability is enabled.
+	#[cfg(feature = "opengql")]
+	pub(crate) fn parse_opengql(&self, txt: &str) -> std::result::Result<Ast, TypesError> {
+		// Check if the experimental OpenGQL capability is enabled. The
+		// wording deliberately matches the existing experimental-gate errors
+		// (`surrealism`, `files`) rather than naming the server's
+		// `--allow-experimental` flag: core is also used embedded, where the
+		// capability is enabled programmatically and no CLI flag exists.
+		if !self.capabilities.allows_experimental(&ExperimentalTarget::OpenGql) {
+			return Err(TypesError::not_allowed(
+				"Experimental capability `opengql` is not enabled".to_string(),
+				None,
+			));
+		}
+		// Parse the GQL query text
+		crate::opengql::parse_with_capabilities(txt, &self.capabilities, &self.config)
+			.map_err(|e| TypesError::validation(e.to_string(), None))
+	}
+
+	/// Parse and execute a GQL query
+	#[cfg(feature = "opengql")]
+	#[instrument(level = "debug", target = "surrealdb::core::kvs::ds", skip_all)]
+	pub async fn execute_opengql(
+		&self,
+		txt: &str,
+		sess: &Session,
+		vars: Option<PublicVariables>,
+	) -> std::result::Result<Vec<QueryResult>, TypesError> {
+		// Parse the GQL query text
+		let ast = self.parse_opengql(txt)?;
+		// Process the AST
+		self.process(ast, sess, vars).await
+	}
+
 	/// Execute a SurrealQL query with an externally-owned cancellation
 	/// handle. See [`Self::process_with_transaction_and_cancel`] for the
 	/// cancellation semantics.
@@ -3943,6 +3978,46 @@ mod test {
 		for result in ds.execute(sql, session, None).await? {
 			result.result?;
 		}
+		Ok(())
+	}
+
+	#[cfg(feature = "opengql")]
+	#[tokio::test]
+	async fn execute_opengql_requires_experimental_capability() -> Result<()> {
+		let ds = Datastore::new("memory").await?;
+		let ses = Session::owner().with_ns("test").with_db("test");
+		let err = ds.execute_opengql("MATCH (n:person) RETURN n", &ses, None).await.unwrap_err();
+		assert!(
+			err.to_string().contains("Experimental capability `opengql` is not enabled"),
+			"unexpected error: {err}"
+		);
+		Ok(())
+	}
+
+	#[cfg(feature = "opengql")]
+	#[tokio::test]
+	async fn execute_opengql_parses_lowers_and_executes() -> Result<()> {
+		use crate::dbs::capabilities::Targets;
+		let ds = Datastore::builder()
+			.with_capabilities(Capabilities::all().with_experimental(Targets::All))
+			.build_with_path("memory")
+			.await?;
+		let ses = Session::owner().with_ns("test").with_db("test");
+		let txn = ds.transaction(Write, Pessimistic).await?;
+		txn.ensure_ns_db(None, "test", "test").await?;
+		txn.commit().await?;
+		execute_all(&ds, &ses, "CREATE person:tobie SET name = 'Tobie';").await?;
+		// A valid GQL query parses, lowers, and executes through the
+		// SurrealQL pipeline
+		let mut res =
+			ds.execute_opengql("MATCH (n:person) RETURN n.name AS name", &ses, None).await?;
+		assert_eq!(res.len(), 1);
+		let val = res.remove(0).result?;
+		assert_eq!(val, PublicValue::Array(surrealdb_types::array![object! { name: "Tobie" }]));
+		// An invalid GQL query reports a parse error rather than a
+		// capability error
+		let err = ds.execute_opengql("MATCH RETURN", &ses, None).await.unwrap_err();
+		assert!(!err.to_string().contains("experimental"), "unexpected error: {err}");
 		Ok(())
 	}
 

@@ -307,6 +307,8 @@ Flag when changes touch:
 - WebSocket upgrade handlers, buffer-size or message-limit config
 - `client_ip` module (header sources, proxy validation)
 - GraphQL service, schema construction, or executor configuration
+- The `/gql` OpenGQL endpoint (`ntw/opengql.rs`: route, body-size limit, and the
+  `RouteTarget::Gql` / `ExperimentalTarget::OpenGql` capability gates)
 - Error formatting or `ResponseError` implementation
 - Authentication middleware (which endpoints are gated)
 - Body-size limit constants or `RequestBodyLimitLayer` application
@@ -349,6 +351,8 @@ Flag when changes touch:
 - CBOR deserialization path, JSON parsing, or FlatBuffers decoding
 - WebSocket serve/read/handle_message functions
 - RPC dispatch table (new methods, modified signatures)
+- The `gql` RPC method (OpenGQL: must keep `allows_query_by_subject` and the
+  `ExperimentalTarget::OpenGql` gate in `Datastore::parse_opengql`)
 - Transaction methods (begin/commit/cancel) or transaction map
 - Notification routing or LiveQueries map structure
 - HTTP RPC handler session management
@@ -634,7 +638,7 @@ Flag when changes touch:
 
 ## 15. Query Parser
 
-**Files**: `syn/`, `sql/`, parser entry points, expression construction
+**Files**: `syn/`, `sql/`, `opengql/`, parser entry points, expression construction
 
 ### Invariants
 
@@ -659,6 +663,8 @@ Flag when changes touch:
 - Parser buffer management or allocation strategy
 - Entry points that accept untrusted input strings
 - AST node construction for security-relevant statements (DEFINE, OPTION, USE)
+- The OpenGQL front-end (`opengql/` parsing and lowering, the `gql` RPC method,
+  the `/gql` HTTP route)
 
 ---
 

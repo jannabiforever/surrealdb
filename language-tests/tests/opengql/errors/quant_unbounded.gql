@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: quantifiers without an upper bound are rejected, consistent with the `+` rejection."
+
+[test.results]
+parsing-error = '''
+Unbounded variable-length quantifiers are not supported yet
+  --> [15:28]
+   |
+15 | MATCH (a:person)-[:knows]->{1,}(b:person) RETURN a
+   |                            ^^^^ give the quantifier an upper bound: `{1,n}`
+'''
+*/
+
+MATCH (a:person)-[:knows]->{1,}(b:person) RETURN a

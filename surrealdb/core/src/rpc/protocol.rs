@@ -287,6 +287,7 @@ pub trait RpcProtocol {
 				Method::Set => self.set(session, params).await,
 				Method::Unset => self.unset(session, params).await,
 				Method::Query => self.query(txn, session, params).await,
+				Method::Gql => self.gql(txn, session, params).await,
 				Method::Version => self.version(txn, params).await,
 				Method::Begin => self.begin(txn, session).await,
 				Method::Commit => self.commit(txn, session, params).await,
@@ -1580,6 +1581,62 @@ pub trait RpcProtocol {
 				.await
 				.map_err(types_error_from_anyhow)?,
 		))
+	}
+
+	async fn gql(
+		&self,
+		txn: Option<Uuid>,
+		session_id: Uuid,
+		params: PublicArray,
+	) -> Result<DbResult, surrealdb_types::Error> {
+		#[cfg(not(feature = "opengql"))]
+		{
+			let _ = (txn, session_id, params);
+			Err(method_not_found(Method::Gql.to_string()))
+		}
+		#[cfg(feature = "opengql")]
+		{
+			let session_lock = self.get_session(&session_id)?;
+			let session = session_lock.read().await;
+			// Check if the user is allowed to query
+			if !self.kvs().allows_query_by_subject(session.au.as_ref()) {
+				return Err(method_not_allowed(Method::Gql.to_string()));
+			}
+			// Process the method arguments
+			let (query, vars) =
+				extract_args::<(PublicValue, Option<PublicValue>)>(params.into_vec())
+					.ok_or(invalid_params("Expected (query:string, vars:object)".to_string()))?;
+
+			let PublicValue::String(query) = query else {
+				return Err(invalid_params("Expected query to be string".to_string()));
+			};
+
+			// Specify the query variables
+			let vars = match vars {
+				Some(PublicValue::Object(v)) => {
+					let mut merged = session.variables.clone();
+					merged.extend(v.into());
+					Some(merged)
+				}
+				None | Some(PublicValue::None | PublicValue::Null) => {
+					Some(session.variables.clone())
+				}
+				unexpected => {
+					return Err(invalid_params(format!(
+						"Expected vars to be object, got {unexpected:?}"
+					)));
+				}
+			};
+
+			// Parse the GQL query into a SurrealQL AST
+			let ast = self.kvs().parse_opengql(&query)?;
+
+			Ok(DbResult::Query(
+				run_query(self, txn, session_id, QueryForm::Parsed(ast), vars)
+					.await
+					.map_err(types_error_from_anyhow)?,
+			))
+		}
 	}
 
 	// ------------------------------

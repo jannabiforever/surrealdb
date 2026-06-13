@@ -14,7 +14,7 @@ use surrealdb_core::dbs::Session;
 use surrealdb_core::dbs::capabilities::ExperimentalTarget;
 use surrealdb_core::env::VERSION;
 use surrealdb_core::kvs::Datastore;
-use surrealdb_core::syn;
+use surrealdb_core::{opengql, syn};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::cli::{Backend, ColorMode, ResultsMode};
@@ -413,6 +413,23 @@ async fn run_test_with_dbs(
 					}
 					x
 				}
+				Err(e) => return Ok(TestTaskResult::ParserError(e.render_on_bytes(source))),
+			};
+
+			let start = Instant::now();
+			let result = dbs.process(query, &session, None).await;
+			let did_timeout = start.elapsed() > timeout_duration;
+			let result = result
+				.map(|x| x.into_iter().map(|x| x.result.map_err(|e| e.to_string())).collect());
+			(did_timeout, result)
+		}
+		Dialect::OpenGql => {
+			// OpenGQL has no capability-gated syntax; the default recursion
+			// limit matches `syn::parser::ParserSettings::default()` above.
+			let settings = opengql::GqlParserSettings::default();
+			let source = &run.case.test.source.as_bytes();
+			let query = match opengql::parse_to_ast_with_settings(&run.case.test.source, settings) {
+				Ok(x) => x,
 				Err(e) => return Ok(TestTaskResult::ParserError(e.render_on_bytes(source))),
 			};
 

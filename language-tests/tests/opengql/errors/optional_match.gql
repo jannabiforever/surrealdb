@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: OPTIONAL MATCH parses but is not lowerable in v1."
+
+[test.results]
+parsing-error = '''
+OPTIONAL MATCH is not supported yet
+  --> [15:1]
+   |
+15 | OPTIONAL MATCH (n:person) RETURN n
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^
+'''
+*/
+
+OPTIONAL MATCH (n:person) RETURN n

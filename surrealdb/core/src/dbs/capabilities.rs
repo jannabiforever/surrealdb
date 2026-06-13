@@ -123,6 +123,7 @@ impl std::str::FromStr for FuncTarget {
 pub enum ExperimentalTarget {
 	Files,
 	Surrealism,
+	OpenGql,
 }
 
 impl fmt::Display for ExperimentalTarget {
@@ -130,6 +131,7 @@ impl fmt::Display for ExperimentalTarget {
 		match self {
 			Self::Files => write!(f, "files"),
 			Self::Surrealism => write!(f, "surrealism"),
+			Self::OpenGql => write!(f, "opengql"),
 		}
 	}
 }
@@ -145,6 +147,7 @@ impl Target<str> for ExperimentalTarget {
 		match self {
 			Self::Files => elem.eq_ignore_ascii_case("files"),
 			Self::Surrealism => elem.eq_ignore_ascii_case("surrealism"),
+			Self::OpenGql => elem.eq_ignore_ascii_case("opengql"),
 		}
 	}
 }
@@ -172,6 +175,7 @@ impl std::str::FromStr for ExperimentalTarget {
 		match s.trim().to_ascii_lowercase().as_str() {
 			"files" => Ok(ExperimentalTarget::Files),
 			"surrealism" => Ok(ExperimentalTarget::Surrealism),
+			"opengql" => Ok(ExperimentalTarget::OpenGql),
 			_ => Err(ParseExperimentalTargetError::InvalidName),
 		}
 	}
@@ -379,6 +383,7 @@ pub enum RouteTarget {
 	GraphQL,
 	Api,
 	Mcp,
+	Gql,
 }
 
 // impl display
@@ -399,6 +404,7 @@ impl fmt::Display for RouteTarget {
 			RouteTarget::GraphQL => write!(f, "graphql"),
 			RouteTarget::Api => write!(f, "api"),
 			RouteTarget::Mcp => write!(f, "mcp"),
+			RouteTarget::Gql => write!(f, "gql"),
 		}
 	}
 }
@@ -438,6 +444,7 @@ impl std::str::FromStr for RouteTarget {
 			"graphql" => Ok(RouteTarget::GraphQL),
 			"api" => Ok(RouteTarget::Api),
 			"mcp" => Ok(RouteTarget::Mcp),
+			"gql" => Ok(RouteTarget::Gql),
 			_ => Err(ParseRouteTargetError),
 		}
 	}
@@ -955,6 +962,30 @@ mod tests {
 
 		assert!(FuncTarget::from_str("test::name").unwrap().matches("test::name"));
 		assert!(!FuncTarget::from_str("test::name").unwrap().matches("test::name2"));
+	}
+
+	#[test]
+	fn test_experimental_target() {
+		assert_eq!(ExperimentalTarget::from_str("files").unwrap(), ExperimentalTarget::Files);
+		assert_eq!(
+			ExperimentalTarget::from_str("surrealism").unwrap(),
+			ExperimentalTarget::Surrealism
+		);
+		assert_eq!(ExperimentalTarget::from_str("opengql").unwrap(), ExperimentalTarget::OpenGql);
+		assert_eq!(ExperimentalTarget::from_str("OpenGQL").unwrap(), ExperimentalTarget::OpenGql);
+		ExperimentalTarget::from_str("open_gql").unwrap_err();
+		ExperimentalTarget::from_str("").unwrap_err();
+
+		assert_eq!(ExperimentalTarget::OpenGql.to_string(), "opengql");
+		assert_eq!(
+			ExperimentalTarget::from_str(&ExperimentalTarget::OpenGql.to_string()).unwrap(),
+			ExperimentalTarget::OpenGql
+		);
+
+		assert!(ExperimentalTarget::OpenGql.matches("opengql"));
+		assert!(ExperimentalTarget::OpenGql.matches("OPENGQL"));
+		assert!(!ExperimentalTarget::OpenGql.matches("files"));
+		assert!(!ExperimentalTarget::Files.matches("opengql"));
 	}
 
 	#[test]

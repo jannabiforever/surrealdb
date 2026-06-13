@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: v1 lowers at most one edge step; the span points at the second edge."
+
+[test.results]
+parsing-error = '''
+Multi-hop path patterns (more than one edge step) are not supported yet
+  --> [15:38]
+   |
+15 | MATCH (a:person)-[:knows]->(b:person)-[:knows]->(c:person) RETURN a
+   |                                      ^^^^^^^^^^^
+'''
+*/
+
+MATCH (a:person)-[:knows]->(b:person)-[:knows]->(c:person) RETURN a

@@ -60,6 +60,8 @@ pub mod kvs;
 pub mod mem;
 pub mod obs;
 pub mod observe;
+#[cfg(feature = "opengql")]
+pub mod opengql;
 pub mod options;
 pub mod rpc;
 pub mod sql;

@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: the anchor node supplies the FROM table, so it must be labeled."
+
+[test.results]
+parsing-error = '''
+The anchor (leftmost) node of a path pattern must have a label
+  --> [15:7]
+   |
+15 | MATCH (n) RETURN n
+   |       ^^^ add a label: `(n:label)`
+'''
+*/
+
+MATCH (n) RETURN n

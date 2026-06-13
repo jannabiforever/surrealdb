@@ -13,6 +13,8 @@ pub mod key;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod ml;
+#[cfg(feature = "opengql")]
+pub mod opengql;
 pub(crate) mod output;
 mod params;
 pub mod rpc;
@@ -145,6 +147,9 @@ impl RouterFactory for CommunityComposer {
 
 		#[cfg(feature = "graphql")]
 		let router = router.merge(gql::router());
+
+		#[cfg(feature = "opengql")]
+		let router = router.merge(opengql::router());
 
 		#[cfg(feature = "mcp")]
 		let router = router.merge(mcp::router());

@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: the engine's collect BFS drops nodes first discovered below the minimum depth, and the planner strategies disagree on the result, so minima above one are rejected."
+
+[test.results]
+parsing-error = """
+Variable-length quantifiers with a minimum greater than one are not supported yet
+  --> [15:28]
+   |
+15 | MATCH (a:person)-[:knows]->{2}(b:person) RETURN a
+   |                            ^^^ only `{1}` and `{1,n}` quantifiers are supported
+"""
+*/
+
+MATCH (a:person)-[:knows]->{2}(b:person) RETURN a
