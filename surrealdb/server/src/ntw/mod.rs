@@ -36,7 +36,8 @@ use axum::response::Redirect;
 use axum::routing::get;
 use axum::{Extension, Router, middleware};
 use axum_server::Handle;
-use axum_server::tls_rustls::RustlsConfig;
+use axum_server::accept::NoDelayAcceptor;
+use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use http::header;
 use surrealdb::headers::{AUTH_DB, AUTH_NS, DB, ID, NS};
 use surrealdb_core::CommunityComposer;
@@ -626,8 +627,10 @@ pub async fn init_with_metrics<F: RouterFactory>(
 	let res = if let (Some(cert), Some(key)) = (&opt.crt, &opt.key) {
 		// Configure certificate and private key used by https
 		let tls = RustlsConfig::from_pem_file(cert, key).await?;
+		// Disable Nagle's algorithm on the raw TCP stream before the TLS handshake
+		let acceptor = RustlsAcceptor::new(tls).acceptor(NoDelayAcceptor::new());
 		// Setup the Axum server with TLS
-		let server = axum_server::bind_rustls(opt.bind, tls);
+		let server = axum_server::bind(opt.bind).acceptor(acceptor);
 		// Log the server startup to the CLI
 		info!(target: LOG, "Started web server on {}", &opt.bind);
 		// Start the server and listen for connections
@@ -636,8 +639,8 @@ pub async fn init_with_metrics<F: RouterFactory>(
 			.serve(axum_app.into_make_service_with_connect_info::<SocketAddr>())
 			.await
 	} else {
-		// Setup the Axum server
-		let server = axum_server::bind(opt.bind);
+		// Setup the Axum server, disabling Nagle's algorithm on accepted connections
+		let server = axum_server::bind(opt.bind).acceptor(NoDelayAcceptor::new());
 		// Log the server startup to the CLI
 		info!(target: LOG, "Started web server on {}", &opt.bind);
 		// Start the server and listen for connections
