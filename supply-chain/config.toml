@@ -505,14 +505,6 @@ criteria = "safe-to-deploy"
 version = "0.3.6"
 criteria = "safe-to-deploy"
 
-[[exemptions.endian-type]]
-version = "0.1.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.endian-type]]
-version = "0.2.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.equator]]
 version = "0.4.2"
 criteria = "safe-to-deploy"
@@ -547,10 +539,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.fastrand]]
 version = "2.4.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.ferntree]]
-version = "0.7.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.ff]]
@@ -635,7 +623,7 @@ criteria = "safe-to-deploy"
 
 [[exemptions.futures-timer]]
 version = "3.0.3"
-criteria = "safe-to-deploy"
+criteria = "safe-to-run"
 
 [[exemptions.futures-util]]
 version = "0.3.32"
@@ -1001,10 +989,6 @@ criteria = "safe-to-deploy"
 version = "1.0.6"
 criteria = "safe-to-deploy"
 
-[[exemptions.nibble_vec]]
-version = "0.1.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.nix]]
 version = "0.15.0"
 criteria = "safe-to-deploy"
@@ -1275,14 +1259,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.radium]]
 version = "0.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.radix_trie]]
-version = "0.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.radix_trie]]
-version = "0.3.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.rand_core]]
@@ -1603,10 +1579,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.sysinfo]]
 version = "0.37.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.tar]]
-version = "0.4.46"
 criteria = "safe-to-deploy"
 
 [[exemptions.temp-dir]]
