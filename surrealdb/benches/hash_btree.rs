@@ -6,12 +6,11 @@ use std::time::Duration;
 
 use criterion::measurement::WallTime;
 use criterion::{BenchmarkGroup, Criterion, Throughput, criterion_group, criterion_main};
-use radix_trie::{Trie, TrieCommon, TrieKey};
 use surrealdb_core::syn;
 use surrealdb_types::{Array, RecordId};
 
 // Common use case: VectorSearch
-fn bench_hash_trie_btree_large_vector(c: &mut Criterion) {
+fn bench_hash_btree_large_vector(c: &mut Criterion) {
 	const N: usize = 10_000;
 	let mut samples = Vec::with_capacity(N);
 	for i in 0..N {
@@ -19,14 +18,13 @@ fn bench_hash_trie_btree_large_vector(c: &mut Criterion) {
 		samples.push((key, i));
 	}
 
-	let mut g = new_group(c, "bench_hash_trie_btree_large_vector", N);
+	let mut g = new_group(c, "bench_hash_btree_large_vector", N);
 	bench_hash(&mut g, &samples);
-	bench_trie(&mut g, &samples);
 	bench_btree(&mut g, &samples);
 	g.finish();
 }
 
-fn bench_hash_trie_btree_ix_key(c: &mut Criterion) {
+fn bench_hash_btree_ix_key(c: &mut Criterion) {
 	const N: usize = 100_000;
 	let mut samples = Vec::with_capacity(N);
 	for i in 0..N {
@@ -35,14 +33,13 @@ fn bench_hash_trie_btree_ix_key(c: &mut Criterion) {
 		samples.push((key.clone(), i));
 	}
 
-	let mut g = new_group(c, "bench_hash_trie_btree_ix_key", N);
+	let mut g = new_group(c, "bench_hash_btree_ix_key", N);
 	bench_hash(&mut g, &samples);
-	bench_trie(&mut g, &samples);
 	bench_btree(&mut g, &samples);
 	g.finish();
 }
 
-fn bench_hash_trie_btree_small_string(c: &mut Criterion) {
+fn bench_hash_btree_small_string(c: &mut Criterion) {
 	const N: usize = 100_000;
 	let mut samples = Vec::with_capacity(N);
 	for i in 0..N {
@@ -50,14 +47,13 @@ fn bench_hash_trie_btree_small_string(c: &mut Criterion) {
 		samples.push((key, i));
 	}
 
-	let mut g = new_group(c, "bench_hash_trie_btree_string", N);
+	let mut g = new_group(c, "bench_hash_btree_string", N);
 	bench_hash(&mut g, &samples);
-	bench_trie(&mut g, &samples);
 	bench_btree(&mut g, &samples);
 	g.finish();
 }
 
-fn bench_hash_trie_btree_value(c: &mut Criterion) {
+fn bench_hash_btree_value(c: &mut Criterion) {
 	const N: usize = 100_000;
 	let mut samples = Vec::with_capacity(N);
 	for i in 0..N {
@@ -68,13 +64,13 @@ fn bench_hash_trie_btree_value(c: &mut Criterion) {
 		samples.push((key, i));
 	}
 
-	let mut g = new_group(c, "bench_hash_trie_btree_value", N);
+	let mut g = new_group(c, "bench_hash_btree_value", N);
 	bench_hash(&mut g, &samples);
 	bench_btree(&mut g, &samples);
 	g.finish();
 }
 
-fn bench_hash_trie_btree_thing(c: &mut Criterion) {
+fn bench_hash_btree_thing(c: &mut Criterion) {
 	const N: usize = 50_000;
 	let mut samples = Vec::with_capacity(N);
 	for i in 0..N {
@@ -82,7 +78,7 @@ fn bench_hash_trie_btree_thing(c: &mut Criterion) {
 		samples.push((key, i));
 	}
 
-	let mut g = new_group(c, "bench_hash_trie_btree_thing", N);
+	let mut g = new_group(c, "bench_hash_btree_thing", N);
 	bench_hash(&mut g, &samples);
 	bench_btree(&mut g, &samples);
 	g.finish();
@@ -106,20 +102,6 @@ fn bench_hash<K: Hash + Eq + Clone, V: Clone>(
 	group.bench_function("hash_get", |b| {
 		let map = build_hash(samples);
 		b.iter(|| bench_hash_get(samples, &map));
-	});
-}
-
-fn bench_trie<K: TrieKey + Clone, V: Clone>(
-	group: &mut BenchmarkGroup<WallTime>,
-	samples: &[(K, V)],
-) {
-	group.bench_function("trie_insert", |b| {
-		b.iter(|| bench_trie_insert(samples));
-	});
-
-	group.bench_function("trie_get", |b| {
-		let map = build_trie(samples);
-		b.iter(|| bench_trie_get(samples, &map));
 	});
 }
 
@@ -156,26 +138,6 @@ fn bench_hash_get<K: Hash + Eq, V>(samples: &[(K, V)], map: &HashMap<K, V>) {
 	assert_eq!(map.len(), samples.len());
 }
 
-fn build_trie<K: TrieKey + Clone, V: Clone>(samples: &[(K, V)]) -> Trie<K, V> {
-	let mut map = Trie::default();
-	for (key, val) in samples {
-		map.insert(key.clone(), val.clone());
-	}
-	map
-}
-
-fn bench_trie_insert<K: TrieKey + Clone, V: Clone>(samples: &[(K, V)]) {
-	let map = build_trie(samples);
-	assert_eq!(map.len(), samples.len());
-}
-
-fn bench_trie_get<K: TrieKey, V>(samples: &[(K, V)], map: &Trie<K, V>) {
-	for (key, _) in samples {
-		assert!(map.get(key).is_some());
-	}
-	assert_eq!(map.len(), samples.len());
-}
-
 fn build_btree<K: Ord + Clone, V: Clone>(samples: &[(K, V)]) -> BTreeMap<K, V> {
 	let mut map = BTreeMap::default();
 	for (key, val) in samples {
@@ -198,10 +160,10 @@ fn bench_btree_get<K: Ord, V>(samples: &[(K, V)], map: &BTreeMap<K, V>) {
 
 criterion_group!(
 	benches,
-	bench_hash_trie_btree_large_vector,
-	bench_hash_trie_btree_ix_key,
-	bench_hash_trie_btree_small_string,
-	bench_hash_trie_btree_thing,
-	bench_hash_trie_btree_value
+	bench_hash_btree_large_vector,
+	bench_hash_btree_ix_key,
+	bench_hash_btree_small_string,
+	bench_hash_btree_thing,
+	bench_hash_btree_value
 );
 criterion_main!(benches);

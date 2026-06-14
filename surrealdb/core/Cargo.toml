@@ -145,7 +145,6 @@ pbkdf2 = { workspace = true, features = ["simple"] }
 phf = { workspace = true, features = ["macros", "unicase"] }
 pin-project-lite.workspace = true
 quick_cache.workspace = true
-radix_trie = { workspace = true, features = ["serde"] }
 rand.workspace = true
 rand_core.workspace = true
 rayon.workspace = true
