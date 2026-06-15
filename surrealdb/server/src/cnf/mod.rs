@@ -274,14 +274,8 @@ pub static PKG_VERSION: LazyLock<String> = LazyLock::new(|| {
 	}
 });
 
-/// Whether to enable Tokio Console
+/// Whether to enable Tokio Console. Read unconditionally (not feature-gated) so
+/// the server can warn when it is requested on a build compiled without the
+/// `tokio-console` feature.
 pub static ENABLE_TOKIO_CONSOLE: LazyLock<bool> =
 	lazy_env_parse!("SURREAL_TOKIO_CONSOLE_ENABLED", bool, false);
-
-/// The socket address that Tokio Console will bind on
-pub static TOKIO_CONSOLE_SOCKET_ADDR: LazyLock<Option<String>> =
-	lazy_env_parse!("SURREAL_TOKIO_CONSOLE_SOCKET_ADDR", Option<String>);
-
-/// How long, in seconds, to retain data for completed events (default: 60)
-pub static TOKIO_CONSOLE_RETENTION: LazyLock<u64> =
-	lazy_env_parse!("SURREAL_TOKIO_CONSOLE_RETENTION", u64, 60);
