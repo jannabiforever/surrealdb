@@ -45,9 +45,31 @@ pub fn encode(value: &Value) -> anyhow::Result<Vec<u8>> {
 	Ok(data)
 }
 
+/// Build verifier options sized to the payload.
+///
+/// Every [`Value`] (and its inner union payload) is its own flatbuffers table,
+/// so large or deeply-nested results blow straight past the verifier defaults
+/// (`max_tables` = 1,000,000, `max_depth` = 64) and decoding fails with
+/// "Failed to decode fb value" — see
+/// <https://github.com/surrealdb/surrealdb/issues/7037>.
+///
+/// A table (and likewise each nesting level) occupies at least its 4-byte
+/// offset in the buffer, so the payload length is a safe upper bound for both
+/// counts: it can never reject a structurally valid buffer, yet stays finite
+/// and proportional to the (transport-bounded) input rather than disabling the
+/// limits outright.
+fn verifier_options(len: usize) -> flatbuffers::VerifierOptions {
+	flatbuffers::VerifierOptions {
+		max_tables: len,
+		max_depth: len,
+		..Default::default()
+	}
+}
+
 /// Decode a flatbuffers vector to a public value.
 pub fn decode<T: SurrealValue>(value: &[u8]) -> anyhow::Result<T> {
-	let value_fb = flatbuffers::root::<surrealdb_protocol::fb::v1::Value>(value)
+	let opts = verifier_options(value.len());
+	let value_fb = flatbuffers::root_with_opts::<surrealdb_protocol::fb::v1::Value>(&opts, value)
 		.context("Failed to decode fb value")?;
 	let value = Value::from_fb(value_fb).context("Failed to decode value from fb value")?;
 	T::from_value(value).context("Failed to decode T from value")
@@ -64,7 +86,8 @@ pub fn encode_kind(kind: &Kind) -> anyhow::Result<Vec<u8>> {
 
 /// Decode a flatbuffers vector to a public kind.
 pub fn decode_kind(value: &[u8]) -> anyhow::Result<Kind> {
-	let value_fb = flatbuffers::root::<surrealdb_protocol::fb::v1::Kind>(value)
+	let opts = verifier_options(value.len());
+	let value_fb = flatbuffers::root_with_opts::<surrealdb_protocol::fb::v1::Kind>(&opts, value)
 		.context("Failed to decode fb kind")?;
 	let kind = Kind::from_fb(value_fb).context("Failed to decode kind from fb kind")?;
 	Ok(kind)
@@ -147,6 +170,22 @@ mod tests {
 	fn test_encode_decode(#[case] input: Value) {
 		let encoded = encode(&input).expect("Failed to encode");
 		let decoded = decode::<Value>(&encoded).expect("Failed to decode");
+		assert_eq!(input, decoded);
+	}
+
+	/// A large result set produces more than the verifier's default
+	/// `max_tables` (1,000,000) flatbuffers tables — every element is a table,
+	/// and so is its inner union payload — which used to fail decoding with
+	/// "Failed to decode fb value". Regression test for
+	/// <https://github.com/surrealdb/surrealdb/issues/7037>.
+	#[test]
+	fn decode_large_array_exceeding_default_max_tables() {
+		// > 500k elements => > 1,000,000 tables once inner payloads are counted.
+		let input = Value::Array(Array::from(
+			(0..600_000).map(|i| Value::Number(Number::Int(i))).collect::<Vec<_>>(),
+		));
+		let encoded = encode(&input).expect("Failed to encode");
+		let decoded = decode::<Value>(&encoded).expect("Failed to decode large array");
 		assert_eq!(input, decoded);
 	}
 }
