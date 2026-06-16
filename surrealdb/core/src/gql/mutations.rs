@@ -922,6 +922,7 @@ async fn execute_relate_create(
 
 	let stmt = RelateStatement {
 		only: true,
+		or_update: false,
 		through,
 		from: Value::RecordId(from_rid).into_literal(),
 		to: Value::RecordId(to_rid).into_literal(),

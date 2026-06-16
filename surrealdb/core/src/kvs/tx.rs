@@ -3555,7 +3555,7 @@ impl TableProvider for Transaction {
 
 	/// Fetch a specific record value.
 	///
-	/// This function will return a new default initialized record if non exists.
+	/// This function will return a new default initialized record if it does not exist.
 	fn get_record<'a>(
 		&'a self,
 		ns: NamespaceId,

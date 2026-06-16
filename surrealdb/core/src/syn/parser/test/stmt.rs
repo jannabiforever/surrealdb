@@ -2495,6 +2495,7 @@ fn parse_relate() {
 		res,
 		Expr::Relate(Box::new(RelateStatement {
 			only: true,
+			or_update: false,
 			through: Expr::Literal(Literal::RecordId(RecordIdLit {
 				table: "a".into(),
 				key: RecordIdKeyLit::String("b".into()),
@@ -2519,6 +2520,36 @@ fn parse_relate() {
 			timeout: Expr::Literal(Literal::None),
 		})),
 	)
+}
+
+#[test]
+fn parse_relate_or_update() {
+	let res = syn::parse_with(
+		r#"RELATE OR UPDATE person:one->likes:[person:one, post:one]->post:one SET note = 'x'"#
+			.as_bytes(),
+		async |parser, stk| parser.parse_expr_inherit(stk).await,
+	)
+	.unwrap();
+	let Expr::Relate(stmt) = res else {
+		panic!("expected RELATE statement");
+	};
+	assert!(stmt.or_update);
+	assert!(!stmt.only);
+	assert!(matches!(stmt.data, Some(Data::SetExpression(_))));
+}
+
+#[test]
+fn parse_relate_only_or_update() {
+	let res = syn::parse_with(
+		r#"RELATE ONLY OR UPDATE a:1->edge:1->a:2 SET name = 'A'"#.as_bytes(),
+		async |parser, stk| parser.parse_expr_inherit(stk).await,
+	)
+	.unwrap();
+	let Expr::Relate(stmt) = res else {
+		panic!("expected RELATE statement");
+	};
+	assert!(stmt.or_update);
+	assert!(stmt.only);
 }
 
 #[test]

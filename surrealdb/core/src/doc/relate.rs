@@ -1,4 +1,5 @@
 use reblessive::tree::Stk;
+use surrealdb_types::ToSql;
 
 use super::IgnoreError;
 use crate::ctx::FrozenContext;
@@ -74,6 +75,17 @@ impl Document {
 		opt: &Options,
 		stm: &Statement<'_>,
 	) -> Result<Value, IgnoreError> {
+		if matches!(stm, Statement::Relate(relate) if !relate.or_update)
+			&& let Some(rid) = self.current.rid.as_ref().or(self.id.as_ref())
+		{
+			tracing::warn!(
+				target = "surrealdb::core::dbs",
+				record = %rid.to_sql(),
+				"RELATE updated an existing record instead of creating a new edge; \
+				 use `RELATE OR UPDATE` to opt in to update semantics explicitly, or \
+				 define a UNIQUE index for an immediate error. This behaviour will change in a future version.",
+			);
+		}
 		// Ensure the record actually exists
 		self.check_record_exists()?;
 		// Check if table has correct relation status

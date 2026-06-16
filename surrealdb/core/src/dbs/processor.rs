@@ -327,6 +327,16 @@ impl Collectable {
 				ir: None,
 				val: Operable::Value(Default::default()),
 			},
+			(false, RelateThrough::RecordId(v)) if o.is_some() => Processable {
+				doc_ctx,
+				record_strategy: RecordStrategy::KeysAndValues,
+				generate: None,
+				rid: Some(v.into()),
+				ir: None,
+				// INSERT RELATION with an explicit edge id must be create-only so a
+				// duplicate returns RecordExists unless ON DUPLICATE KEY UPDATE is set.
+				val: Operable::Relate(Default::default(), f, w, o.map(|v| v.into())),
+			},
 			(false, RelateThrough::RecordId(v)) => {
 				let val = txn
 					.get_record(

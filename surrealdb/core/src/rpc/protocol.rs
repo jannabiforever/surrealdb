@@ -1464,6 +1464,7 @@ pub trait RpcProtocol {
 		// Specify the SQL query string
 		let expr = Expr::Relate(Box::new(RelateStatement {
 			only,
+			or_update: false,
 			from: Expr::from_public_value(from),
 			through: value_to_table(kind),
 			to: Expr::from_public_value(with),
