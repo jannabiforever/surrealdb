@@ -611,11 +611,24 @@ impl DefineFieldStatement {
 			// Ensure no `COMPUTED` clause is specified
 			ensure!(self.computed.is_none(), Error::IdFieldKeywordConflict("COMPUTED".into()));
 
-			// Ensure no `DEFAULT` clause is specified
+			// A `DEFAULT` clause is allowed on the `id` field (it supplies the
+			// record id when none is given), but `DEFAULT ALWAYS` is not: the
+			// id is immutable, so recomputing it on every update is nonsensical.
 			ensure!(
-				matches!(self.default, DefineDefault::None),
-				Error::IdFieldKeywordConflict("DEFAULT".into())
+				!matches!(self.default, DefineDefault::Always(_)),
+				Error::IdFieldKeywordConflict("DEFAULT ALWAYS".into())
 			);
+
+			// Ensure no `ASSERT` clause is specified. The id is constrained by
+			// its TYPE at key-generation time; an ASSERT here would bind
+			// `$value` to the whole record id rather than the key, so its
+			// behaviour would be misleading. Forbid it for clarity.
+			ensure!(self.assert.is_none(), Error::IdFieldKeywordConflict("ASSERT".into()));
+
+			// Ensure the field is neither `READONLY` (the id is implicitly
+			// immutable) nor `FLEXIBLE` (meaningless on a record id key).
+			ensure!(!self.readonly, Error::IdFieldKeywordConflict("READONLY".into()));
+			ensure!(!self.flexible, Error::IdFieldKeywordConflict("FLEXIBLE".into()));
 
 			// Ensure the field is not a record type
 			if let Some(ref kind) = self.field_kind {

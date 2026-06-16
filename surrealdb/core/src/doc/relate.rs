@@ -38,7 +38,7 @@ impl Document {
 		// Set the specified record content
 		self.process_record_data(stk, ctx, opt).await?;
 		// Generate a record id
-		self.generate_record_id()?;
+		self.generate_record_id(stk, ctx, opt).await?;
 		// Ensure we can store this type of record
 		self.check_table_type_relate()?;
 		// Ensure all special fields are valid

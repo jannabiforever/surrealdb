@@ -414,13 +414,6 @@ impl RecordId {
 		}
 	}
 
-	pub fn random_for_table(table: TableName) -> Self {
-		RecordId {
-			table,
-			key: RecordIdKey::rand(),
-		}
-	}
-
 	/// Turns the record id into a literal which resolves to the same value.
 	pub(crate) fn into_literal(self) -> expr::RecordIdLit {
 		expr::RecordIdLit {

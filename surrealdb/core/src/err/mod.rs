@@ -1231,6 +1231,15 @@ pub(crate) enum Error {
 	#[error("Cannot use the `{0}` type on the `id` field, as that's not a valid record id key.")]
 	IdFieldUnsupportedKind(String),
 
+	/// A record id could not be auto-generated for the table's declared `id` type
+	#[error(
+		"Cannot generate a record id of type `{kind}` for the `{table}` table; specify an explicit record id, or declare the `id` field as `uuid` or `string` to auto-generate one."
+	)]
+	IdFieldGenerateUnsupported {
+		table: String,
+		kind: String,
+	},
+
 	#[error(
 		"Error with the event {0}. The ID of the namespace `{1}` does not match the namespace this event has been generated from."
 	)]
