@@ -348,7 +348,6 @@ args = [
     "ml_integration",
     "--",
     "ml_integration",
-    "--nocapture",
 ]
 
 [tasks.ci-graphql-integration]
@@ -368,7 +367,6 @@ args = [
     "graphql_integration",
     "--",
     "graphql_integration",
-    "--nocapture",
 ]
 
 [tasks.ci-opengql-integration]
@@ -388,7 +386,6 @@ args = [
     "opengql_integration",
     "--",
     "opengql_integration",
-    "--nocapture",
 ]
 
 [tasks.ci-integration-all]
@@ -404,7 +401,6 @@ args = [
     "--no-default-features",
     "--features",
     "storage-mem,storage-surrealkv,http,scripting,jwks,cli,ml,graphql,opengql",
-    "--nocapture",
     "--test",
     "cli_integration",
     "--test",
