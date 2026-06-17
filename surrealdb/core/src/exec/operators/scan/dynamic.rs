@@ -396,11 +396,6 @@ impl ExecOperator for DynamicScan {
 				None => 0,
 			};
 
-			// Early exit if limit is 0
-			if limit_val == Some(0) {
-				return;
-			}
-
 			// VERSION stamp for metadata lookups (same evaluation as `resolve_table_scan_stream`).
 			let version_stamp: Option<u64> = match &version {
 				Some(expr) => {
@@ -441,6 +436,10 @@ impl ExecOperator for DynamicScan {
 
 			// Early exit if denied
 			if matches!(select_permission, PhysicalPermission::Deny) {
+				return;
+			}
+
+			if limit_val == Some(0) {
 				return;
 			}
 

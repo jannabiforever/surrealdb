@@ -203,10 +203,6 @@ impl ExecOperator for TableScan {
 			// `VersionScope` over re-evaluating `version_expr` here.
 			let version: Option<u64> = resolve_version_stamp(&ctx, version_expr.as_ref()).await?;
 
-			if limit_val == Some(0) {
-				return;
-			}
-
 			// Resolve table metadata: plan-time fast path or runtime fallback
 			let (select_permission, field_state) = if let Some(ref res) = resolved {
 				// Plan-time resolved: use pre-fetched table def + field state.
@@ -247,6 +243,10 @@ impl ExecOperator for TableScan {
 			};
 
 			if matches!(select_permission, PhysicalPermission::Deny) {
+				return;
+			}
+
+			if limit_val == Some(0) {
 				return;
 			}
 
