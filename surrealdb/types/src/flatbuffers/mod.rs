@@ -45,23 +45,36 @@ pub fn encode(value: &Value) -> anyhow::Result<Vec<u8>> {
 	Ok(data)
 }
 
+/// Maximum nesting depth accepted by the flatbuffers verifier.
+///
+/// Unlike `max_tables`, this bounds *recursion* in both the verifier and our
+/// own recursive `from_fb` decode, so it must stay a small constant: tying it
+/// to the payload length would let a deeply-nested message (still within the
+/// transport size limit) recurse until the thread stack overflows, crashing
+/// the process. Legitimate values never nest this deeply — the server caps
+/// object/expression parsing and computation depth at ~100-128 — and each
+/// logical level maps to a couple of flatbuffers tables, so 512 leaves ample
+/// headroom above the default of 64 (too low — see issue #7037) while staying
+/// far below any stack-overflow threshold.
+const MAX_VERIFIER_DEPTH: usize = 512;
+
 /// Build verifier options sized to the payload.
 ///
 /// Every [`Value`] (and its inner union payload) is its own flatbuffers table,
-/// so large or deeply-nested results blow straight past the verifier defaults
-/// (`max_tables` = 1,000,000, `max_depth` = 64) and decoding fails with
-/// "Failed to decode fb value" — see
+/// so large results blow straight past the verifier default `max_tables` of
+/// 1,000,000 and decoding fails with "Failed to decode fb value" — see
 /// <https://github.com/surrealdb/surrealdb/issues/7037>.
 ///
-/// A table (and likewise each nesting level) occupies at least its 4-byte
-/// offset in the buffer, so the payload length is a safe upper bound for both
-/// counts: it can never reject a structurally valid buffer, yet stays finite
-/// and proportional to the (transport-bounded) input rather than disabling the
-/// limits outright.
+/// A table occupies at least its 4-byte offset in the buffer, so the payload
+/// length is a safe upper bound for the table count: it can never reject a
+/// structurally valid buffer, yet stays finite and proportional to the
+/// (transport-bounded) input rather than disabling the limit outright. The
+/// nesting depth is bounded separately by [`MAX_VERIFIER_DEPTH`] — it must not
+/// scale with the payload, or deep nesting becomes a stack-overflow DoS.
 fn verifier_options(len: usize) -> flatbuffers::VerifierOptions {
 	flatbuffers::VerifierOptions {
 		max_tables: len,
-		max_depth: len,
+		max_depth: MAX_VERIFIER_DEPTH,
 		..Default::default()
 	}
 }
@@ -187,5 +200,35 @@ mod tests {
 		let encoded = encode(&input).expect("Failed to encode");
 		let decoded = decode::<Value>(&encoded).expect("Failed to decode large array");
 		assert_eq!(input, decoded);
+	}
+
+	/// Build a value nested `depth` arrays deep around an integer leaf.
+	fn nested_array(depth: usize) -> Value {
+		let mut value = Value::Number(Number::Int(1));
+		for _ in 0..depth {
+			value = Value::Array(Array::from(vec![value]));
+		}
+		value
+	}
+
+	/// The verifier's nesting-depth limit must stay a fixed constant rather than
+	/// scale with the payload length: otherwise a deeply-nested message that is
+	/// still within the transport size limit would recurse (in the verifier and
+	/// in `from_fb`) until the thread stack overflows — a denial-of-service.
+	/// Values nested within [`MAX_VERIFIER_DEPTH`] decode; deeper ones are
+	/// rejected rather than crashing the process.
+	#[test]
+	fn decode_rejects_excessive_nesting_depth() {
+		// Comfortably nested values round-trip — well above the old default
+		// `max_depth` of 64 that used to reject legitimate nested records.
+		let ok = nested_array(100);
+		let encoded = encode(&ok).expect("Failed to encode nested value");
+		let decoded = decode::<Value>(&encoded).expect("Failed to decode nested value");
+		assert_eq!(ok, decoded);
+
+		// Excessively nested values are rejected by the verifier.
+		let deep = nested_array(600);
+		let encoded = encode(&deep).expect("Failed to encode deeply-nested value");
+		assert!(decode::<Value>(&encoded).is_err(), "expected deep nesting to be rejected");
 	}
 }
