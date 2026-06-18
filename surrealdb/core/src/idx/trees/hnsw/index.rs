@@ -717,6 +717,13 @@ impl HnswIndex {
 		if all_existing_docs.is_empty() && non_deleted_docs.is_empty() {
 			return Ok(None);
 		}
+		// Warm the transaction record cache for the pending candidates in one
+		// batch, so the per-doc truthy checks below hit the cache instead of
+		// fetching each record individually.
+		if let Some(filter) = filter.as_mut() {
+			let ids: Vec<VectorId> = non_deleted_docs.keys().cloned().collect();
+			filter.prefetch_records(ctx, &ids).await?;
+		}
 		// Second pass, we build the KNN result for non-deleted documents
 		for (id, vectors) in non_deleted_docs {
 			// If there is a filter, we need to check if the record is truthy

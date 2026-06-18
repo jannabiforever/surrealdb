@@ -441,6 +441,47 @@ pub static MEMORY_THRESHOLD: LazyLock<usize> = LazyLock::new(|| {
 	}
 });
 
+/// Optional fixed seed for the HNSW level-assignment RNG.
+///
+/// Unset (the default) seeds the RNG from entropy, so every index build produces
+/// a different graph. Set `SURREAL_HNSW_BUILD_SEED=<u64>` to build a
+/// *deterministic* graph (the structure then depends only on insertion order and
+/// the vectors), which makes HNSW search benchmarks reproducible across runs — a
+/// prerequisite for a clean before/after comparison of search-path changes. It
+/// only affects graph construction, never search behaviour, results, or recall.
+///
+/// Read once at first use, like the other knobs here: the benchmark harness sets
+/// the variable out-of-process before launch, so a read-once `LazyLock` is
+/// sufficient and avoids any in-process `set_var`.
+pub static HNSW_BUILD_SEED: LazyLock<Option<u64>> = LazyLock::new(|| {
+	std::env::var("SURREAL_HNSW_BUILD_SEED").ok().and_then(|s| s.parse::<u64>().ok())
+});
+
+/// Initial (and minimum) window size for the DiskANN filtered-KNN record
+/// prefetch. The committed-graph search prefetches candidate records in
+/// distance-ascending windows that grow geometrically (doubling, capped by
+/// [`DISKANN_FILTER_PREFETCH_MAX_CHUNK`]); this is the first window's size and
+/// the floor. A smaller value bounds the over-fetch tighter when the result
+/// builder fills early (non-selective filters); a larger value amortises each
+/// window's multi-get over more candidates. Read once at first use.
+pub static DISKANN_FILTER_PREFETCH_MIN_CHUNK: LazyLock<usize> = LazyLock::new(|| {
+	std::env::var("SURREAL_DISKANN_FILTER_PREFETCH_MIN_CHUNK")
+		.ok()
+		.and_then(|s| s.parse::<usize>().ok())
+		.filter(|n| *n > 0)
+		.unwrap_or(64)
+});
+
+/// Upper bound on the DiskANN filtered-KNN record-prefetch window (the geometric
+/// growth is capped here). Read once at first use.
+pub static DISKANN_FILTER_PREFETCH_MAX_CHUNK: LazyLock<usize> = LazyLock::new(|| {
+	std::env::var("SURREAL_DISKANN_FILTER_PREFETCH_MAX_CHUNK")
+		.ok()
+		.and_then(|s| s.parse::<usize>().ok())
+		.filter(|n| *n > 0)
+		.unwrap_or(4096)
+});
+
 // Used in a lot of surrealql functions which randomly access this limit as well as casting
 // functions Both of which cannot be changed without massive restructuring.
 

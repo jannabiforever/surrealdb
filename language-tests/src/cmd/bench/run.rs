@@ -532,6 +532,11 @@ impl BenchStatement {
 	) -> Result<Self> {
 		match run.case.test.dialect {
 			Dialect::SurrealQl => Ok(Self::SurrealQl),
+			// OpenGQL benches are not supported: there is no `.gql` file under
+			// `tests/bench`, and the bench statement model only covers SurrealQL
+			// and GraphQL. Reject explicitly so the match stays exhaustive (and
+			// the harness compiles) rather than silently mishandling the dialect.
+			Dialect::OpenGql => Err(anyhow!("OpenGQL benches are not supported")),
 			Dialect::GraphQl => {
 				let schema = graphql::generate_schema(dbs, session)
 					.await
