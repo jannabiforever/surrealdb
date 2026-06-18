@@ -577,6 +577,32 @@ async fn cleanup_environment(dbs: &Datastore, session: &Session) -> Result<()> {
 	.await
 	.context("failed to remove root config")?;
 
+	// Remove any root-level users and accesses the test (or its imports) defined.
+	// Unlike namespaces and configs, these carry test-chosen names, so enumerate
+	// them via `INFO FOR ROOT` and remove each. This matters on shared physical
+	// backends (e.g. TiKV) where every datastore aliases one cluster: a `clean`
+	// test that runs `DEFINE USER ... ON ROOT` would otherwise leave the key
+	// behind for the next test, which the retained-key check then flags.
+	let mut info = dbs
+		.execute("INFO FOR ROOT;", &session, None)
+		.await
+		.context("failed to read root info during cleanup")?;
+	if let Some(SurValue::Object(info)) = info.pop().and_then(|r| r.result.ok()) {
+		for (field, kind) in [("users", "USER"), ("accesses", "ACCESS")] {
+			if let Some(SurValue::Object(entries)) = info.get(field) {
+				for name in entries.keys() {
+					dbs.execute(
+						&format!("REMOVE {kind} IF EXISTS `{name}` ON ROOT;"),
+						&session,
+						None,
+					)
+					.await
+					.with_context(|| format!("failed to remove root {field} during cleanup"))?;
+				}
+			}
+		}
+	}
+
 	Ok(())
 }
 
