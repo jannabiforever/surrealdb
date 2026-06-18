@@ -432,14 +432,20 @@ impl Config for CommonConfig {
 /// bytes). The default 0 bytes means that there is no memory threshold.
 /// Any other user-set memory threshold will default to at least 1 MiB.
 pub static MEMORY_THRESHOLD: LazyLock<usize> = LazyLock::new(|| {
-	let n = std::env::var("SURREAL_MEMORY_THRESHOLD")
-		.map(|s| s.parse::<usize>().unwrap_or(0))
-		.unwrap_or(0);
-	match n {
-		default @ 0 => default,
+	std::env::var("SURREAL_MEMORY_THRESHOLD").ok().map(|s| parse_memory_threshold(&s)).unwrap_or(0)
+});
+
+/// Parse a `SURREAL_MEMORY_THRESHOLD` value into a byte count. Accepts a plain
+/// byte count or a human-readable size suffix (`b`/`kb`/`kib`/`mb`/`mib`/
+/// `gb`/`gib`, case-insensitive). `0` (or an unparseable value) disables the
+/// threshold; any other value is floored to 1 MiB.
+fn parse_memory_threshold(value: &str) -> usize {
+	use crate::str::ParseBytes;
+	match value.parse_bytes::<usize>().unwrap_or(0) {
+		0 => 0,
 		specified => std::cmp::max(specified, 1024 * 1024),
 	}
-});
+}
 
 /// Optional fixed seed for the HNSW level-assignment RNG.
 ///
@@ -593,5 +599,23 @@ mod tests {
 		let map = ConfigMap::empty().with_key_value("topk_threshold_pushdown_enabled", "false");
 		config.parse(&map);
 		assert!(!config.topk_threshold_pushdown_enabled, "config map disables the feature");
+	}
+
+	/// `SURREAL_MEMORY_THRESHOLD` must accept human-readable byte suffixes
+	/// (regression for #6860, which dropped suffix parsing and silently
+	/// disabled the guard for values like `1792mb`).
+	#[test]
+	fn memory_threshold_parses_byte_suffixes() {
+		// Human-readable suffix is honoured (the regressed case).
+		assert_eq!(parse_memory_threshold("1792mb"), 1792 * 1024 * 1024);
+		assert_eq!(parse_memory_threshold("1g"), 1024 * 1024 * 1024);
+		// A plain byte count still works.
+		assert_eq!(parse_memory_threshold("1879048192"), 1792 * 1024 * 1024);
+		// `0` disables the threshold.
+		assert_eq!(parse_memory_threshold("0"), 0);
+		// Any non-zero value is floored to at least 1 MiB.
+		assert_eq!(parse_memory_threshold("10"), 1024 * 1024);
+		// An unparseable value disables the threshold rather than panicking.
+		assert_eq!(parse_memory_threshold("garbage"), 0);
 	}
 }
