@@ -331,7 +331,7 @@ jobs:
   test:
     name: Test workspace
     needs: [ prepare-vars ]
-    runs-on: [ runner-amd64-2xlarge ]
+    runs-on: [ runner-amd-32-cores ]
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
@@ -362,12 +362,12 @@ jobs:
           - arch: x86_64-unknown-linux-gnu
             platform: amd64
             os: linux
-            runner: [ runner-amd64-2xlarge ]
+            runner: [ runner-amd-32-cores ]
           # Linux arm64
           - arch: aarch64-unknown-linux-gnu
             platform: arm64
             os: linux
-            runner: [ runner-arm64-2xlarge ]
+            runner: [ runner-arm-32-cores ]
           # macOS amd64
           - arch: x86_64-apple-darwin
             platform: amd64
