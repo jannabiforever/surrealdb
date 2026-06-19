@@ -77,6 +77,9 @@ VOLUME /data /logs
 
 ENV SURREAL_BIND="0.0.0.0:8000"
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+	CMD ["/surreal", "isready", "--endpoint", "http://localhost:8000"]
+
 ENTRYPOINT ["/surreal"]
 
 #
@@ -99,6 +102,9 @@ USER nonroot
 VOLUME /data /logs
 
 ENV SURREAL_BIND="0.0.0.0:8000"
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+	CMD ["/surreal", "isready", "--endpoint", "http://localhost:8000"]
 
 ENTRYPOINT ["/surreal"]
 
@@ -132,6 +138,9 @@ VOLUME /data /logs
 
 ENV SURREAL_BIND="0.0.0.0:8000"
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+	CMD ["/surreal", "isready", "--endpoint", "http://localhost:8000"]
+
 ENTRYPOINT ["/surreal"]
 
 #
@@ -154,5 +163,8 @@ USER nonroot
 VOLUME /data /logs
 
 ENV SURREAL_BIND="0.0.0.0:8000"
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+	CMD ["/surreal", "isready", "--endpoint", "http://localhost:8000"]
 
 ENTRYPOINT ["/surreal"]
