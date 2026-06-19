@@ -13,6 +13,7 @@ use surrealdb_core::dbs::capabilities::Targets;
 use surrealdb_core::dbs::{Capabilities, Session};
 use surrealdb_core::env::VERSION;
 use surrealdb_core::kvs::{Builder, Datastore};
+use surrealdb_core::opengql;
 
 use crate::cli::{Backend, ColorMode};
 use crate::cmd::bench::stats::{ComparisonData, MeasurementData};
@@ -510,6 +511,7 @@ enum BenchRunResult {
 /// request executed against the schema generated for the prepared datastore.
 enum BenchStatement {
 	SurrealQl,
+	OpenGql,
 	GraphQl {
 		schema: async_graphql::dynamic::Schema,
 		/// The case source with the config comment blanked out, computed once.
@@ -532,11 +534,7 @@ impl BenchStatement {
 	) -> Result<Self> {
 		match run.case.test.dialect {
 			Dialect::SurrealQl => Ok(Self::SurrealQl),
-			// OpenGQL benches are not supported: there is no `.gql` file under
-			// `tests/bench`, and the bench statement model only covers SurrealQL
-			// and GraphQL. Reject explicitly so the match stays exhaustive (and
-			// the harness compiles) rather than silently mishandling the dialect.
-			Dialect::OpenGql => Err(anyhow!("OpenGQL benches are not supported")),
+			Dialect::OpenGql => Ok(Self::OpenGql),
 			Dialect::GraphQl => {
 				let schema = graphql::generate_schema(dbs, session)
 					.await
@@ -564,6 +562,21 @@ impl BenchStatement {
 		match self {
 			Self::SurrealQl => {
 				let _ = dbs.execute(&run.case.test.source, session, None).await?;
+			}
+			Self::OpenGql => {
+				// Mirror the SurrealQL arm: parse + process inside the timed
+				// loop, so OpenGQL benches measure the same end-to-end pipeline.
+				// OpenGQL has no capability-gated syntax, so default parser
+				// settings apply (matching the run command).
+				let settings = opengql::GqlParserSettings::default();
+				let query = opengql::parse_to_ast_with_settings(&run.case.test.source, settings)
+					.map_err(|e| {
+						anyhow!(
+							"Failed to parse OpenGQL bench statement: {}",
+							e.render_on_bytes(run.case.test.source.as_bytes())
+						)
+					})?;
+				let _ = dbs.process(query, session, None).await?;
 			}
 			Self::GraphQl {
 				schema,
