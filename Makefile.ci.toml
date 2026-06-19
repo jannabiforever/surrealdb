@@ -662,7 +662,7 @@ category = "CI - LANGUAGE TESTS"
 description = "Run SurrealQL language upgrade tests, hopping through adjacent version pairs"
 script = """
 #!/bin/bash -ex
-# Override _TEST_LANG_UPGRADE_JOBS to tune per-runner concurrency (default 4).
+# Override _TEST_LANG_UPGRADE_JOBS to tune per-runner concurrency (default 12).
 cd language-tests
 cargo build --features "${_TEST_LANG_FEATURES}"
 IFS=',' read -ra V <<< "${LANG_UPGRADE_VERSIONS}"
@@ -672,7 +672,7 @@ for ((i=0; i<${#V[@]}-1; i++)); do
         --from "${V[$i]}" --to "${V[$((i+1))]}" \\
         --backend "${_TEST_API_ENGINE}" \\
         --allow-download --no-wip \\
-        --jobs "${_TEST_LANG_UPGRADE_JOBS:-4}"
+        --jobs "${_TEST_LANG_UPGRADE_JOBS:-12}"
 done
 """
 
