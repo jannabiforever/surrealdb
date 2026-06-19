@@ -40,8 +40,8 @@ env:
   SCCACHE_REGION: us-east-1
   SCCACHE_S3_KEY_PREFIX: ${{ github.repository }} # scope cache to this repo
   SCCACHE_IDLE_TIMEOUT: "0" # don't let the daemon exit mid-compile
-  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AMAZON_ACCESS_KEY }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AMAZON_SECRET_KEY }}
 
 jobs:
   # ----------------------------------------
@@ -56,10 +56,11 @@ jobs:
         include:
           - name: amd64
             target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest-4-cores
+            runner: runner-amd-32-cores
           - name: arm64
             target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest-arm-4-cores
+            # amd64 leg stays on-demand (no amd spot pool); arm builds spot on PRs.
+            runner: runner-arm-32-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -68,7 +69,6 @@ jobs:
         uses: ./.github/actions/setup-environment
         with:
           save-cache: ${{ github.ref == 'refs/heads/main' }}
-          free-disk-space: "true"
 
       - name: Build binary
         run: cargo build --target ${{ matrix.target }}
@@ -85,7 +85,7 @@ jobs:
 
   format:
     name: Check format
-    runs-on: ubuntu-latest-4-cores
+    runs-on: runner-arm-4-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -103,7 +103,6 @@ jobs:
           components: rustfmt
           save-cache: ${{ github.ref == 'refs/heads/main' }}
           enable-sccache: "false"
-          free-disk-space: "true"
 
       - name: Install tools
         uses: ./.github/actions/install-tools
@@ -112,8 +111,8 @@ jobs:
         run: cargo make ci-fmt
 
   clippy:
-    name: Check clippy
-    runs-on: ubuntu-latest-4-cores
+    name: Check clippy (debug)
+    runs-on: runner-arm-16-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -123,7 +122,6 @@ jobs:
         with:
           components: clippy
           save-cache: ${{ github.ref == 'refs/heads/main' }}
-          free-disk-space: "true"
 
       - name: Install tools
         uses: ./.github/actions/install-tools
@@ -134,7 +132,7 @@ jobs:
   clippy-release:
     name: Check clippy (release)
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest-4-cores
+    runs-on: runner-arm-16-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -144,7 +142,6 @@ jobs:
         with:
           components: clippy
           save-cache: ${{ github.ref == 'refs/heads/main' }}
-          free-disk-space: "true"
 
       - name: Install tools
         uses: ./.github/actions/install-tools
@@ -152,10 +149,9 @@ jobs:
       - name: Run clippy release
         run: cargo make ci-clippy-release
 
-  check-release:
-    name: Check workspace (release)
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest-4-cores
+  check-debug:
+    name: Check workspace (debug)
+    runs-on: runner-arm-16-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -164,7 +160,25 @@ jobs:
         uses: ./.github/actions/setup-environment
         with:
           save-cache: ${{ github.ref == 'refs/heads/main' }}
-          free-disk-space: "true"
+
+      - name: Install tools
+        uses: ./.github/actions/install-tools
+
+      - name: Check workspace
+        run: cargo make ci-check
+
+  check-release:
+    name: Check workspace (release)
+    if: github.event_name == 'push' || github.event_name == 'merge_group'
+    runs-on: runner-arm-16-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+        with:
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install tools
         uses: ./.github/actions/install-tools
@@ -174,8 +188,7 @@ jobs:
 
   check-msrv:
     name: Check workspace (MSRV)
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest-4-cores
+    runs-on: runner-arm-16-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
     env:
       msrv: "1.95" # This should be updated if the MSRV is updated.
     steps:
@@ -187,8 +200,6 @@ jobs:
         with:
           toolchain: ${{ env.msrv }}
           save-cache: ${{ github.ref == 'refs/heads/main' }}
-          enable-sccache: "false"
-          free-disk-space: "true"
 
       - name: Install cargo-make
         run: cargo +${{ env.msrv }} install --debug --locked cargo-make
@@ -198,7 +209,7 @@ jobs:
 
   check-wasm:
     name: Check Wasm
-    runs-on: ubuntu-latest-4-cores
+    runs-on: runner-arm-16-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -208,7 +219,6 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
           save-cache: ${{ github.ref == 'refs/heads/main' }}
-          free-disk-space: "true"
 
       - name: Install tools
         uses: ./.github/actions/install-tools
@@ -218,7 +228,7 @@ jobs:
 
   check-revision:
     name: Check revision
-    runs-on: ubuntu-latest-4-cores
+    runs-on: runner-arm-4-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -228,7 +238,6 @@ jobs:
         with:
           save-cache: ${{ github.ref == 'refs/heads/main' }}
           enable-sccache: "false"
-          free-disk-space: "true"
 
       - name: Install revision-lock
         run: cargo install revision-lock --version 0.2.0 --locked
@@ -238,7 +247,7 @@ jobs:
 
   check-docs:
     name: Check docs
-    runs-on: ubuntu-latest-4-cores
+    runs-on: runner-arm-16-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -247,7 +256,6 @@ jobs:
         uses: ./.github/actions/setup-environment
         with:
           save-cache: ${{ github.ref == 'refs/heads/main' }}
-          free-disk-space: "true"
 
       - name: Install tools
         uses: ./.github/actions/install-tools
@@ -257,7 +265,7 @@ jobs:
 
   feature-check:
     name: Check feature combinations
-    runs-on: ubuntu-latest-4-cores
+    runs-on: runner-arm-16-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
     if: github.ref == 'refs/heads/main'
     steps:
       - name: Checkout sources
@@ -268,7 +276,6 @@ jobs:
         with:
           save-cache: ${{ github.ref == 'refs/heads/main' }}
           enable-sccache: "false"
-          free-disk-space: "true"
 
       - name: Install tools
         uses: ./.github/actions/install-tools
@@ -281,7 +288,7 @@ jobs:
 
   unused-deps:
     name: Check unused dependencies
-    runs-on: ubuntu-latest-4-cores
+    runs-on: runner-arm-4-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -291,7 +298,6 @@ jobs:
         with:
           save-cache: ${{ github.ref == 'refs/heads/main' }}
           enable-sccache: "false"
-          free-disk-space: "true"
 
       - name: Install tools
         uses: ./.github/actions/install-tools
@@ -307,10 +313,13 @@ jobs:
   # ----------------------------------------
 
   integration-tests:
-    name: Integration tests
-    # Runs the `ml_integration` tests, which initialize ONNX Runtime at runtime;
-    # that works on the stock GitHub-hosted Ubuntu image.
-    runs-on: ubuntu-latest-4-cores
+    name: Integration tests (${{ matrix.arch }})
+    runs-on: runner-${{ matrix.arch }}-32-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # ARM on every trigger; amd64 added only on merge-queue and push.
+        arch: ${{ (github.event_name == 'merge_group' || github.event_name == 'push') && fromJSON('["arm","amd"]') || fromJSON('["arm"]') }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -319,7 +328,6 @@ jobs:
         uses: ./.github/actions/setup-environment
         with:
           save-cache: ${{ github.ref == 'refs/heads/main' }}
-          free-disk-space: "true"
 
       - name: Install tools
         uses: ./.github/actions/install-tools
@@ -338,10 +346,13 @@ jobs:
   # ----------------------------------------
 
   test:
-    name: Test workspace
-    # Runs on an ephemeral GitHub-hosted runner so PR code never runs on
-    # self-hosted org infra.
-    runs-on: ubuntu-latest-4-cores
+    name: Test workspace (${{ matrix.arch }})
+    # ARM on every trigger; amd64 added only on merge-queue and push to main.
+    runs-on: runner-${{ matrix.arch }}-32-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ (github.event_name == 'merge_group' || github.event_name == 'push') && fromJSON('["arm","amd"]') || fromJSON('["arm"]') }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -350,18 +361,18 @@ jobs:
         uses: ./.github/actions/test-workspace
         with:
           save-cache: ${{ github.ref == 'refs/heads/main' }}
-          free-disk-space: "true"
 
   # ----------------------------------------
   # Storage engine tests
   # ----------------------------------------
 
   kvs-engines:
-    name: KVS - ${{ matrix.engine }} engine
-    runs-on: ubuntu-latest-4-cores
+    name: KVS - ${{ matrix.engine }} engine (${{ matrix.arch }})
+    runs-on: runner-${{ matrix.arch }}-16-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
     strategy:
       fail-fast: false
       matrix:
+        arch: ${{ (github.event_name == 'merge_group' || github.event_name == 'push') && fromJSON('["arm","amd"]') || fromJSON('["arm"]') }}
         engine: [mem, rocksdb, surrealkv, tikv]
     steps:
       - name: Checkout sources
@@ -372,7 +383,6 @@ jobs:
         with:
           save-cache: ${{ github.ref == 'refs/heads/main' }}
           cache-key: kvs
-          free-disk-space: "true"
 
       - name: Install tools
         uses: ./.github/actions/install-tools
@@ -393,7 +403,7 @@ jobs:
 
   sdk-build:
     name: Test SDK build
-    runs-on: ubuntu-latest-4-cores
+    runs-on: runner-arm-4-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -402,7 +412,6 @@ jobs:
         uses: ./.github/actions/setup-environment
         with:
           save-cache: ${{ github.ref == 'refs/heads/main' }}
-          free-disk-space: "true"
 
       - name: Build local
         working-directory: tests/sdk/local
@@ -414,7 +423,7 @@ jobs:
 
   sdk-engines:
     name: Rust SDK - ${{ matrix.engine }} engine
-    runs-on: ubuntu-latest-4-cores
+    runs-on: runner-arm-16-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -429,7 +438,6 @@ jobs:
           save-cache: ${{ github.ref == 'refs/heads/main' }}
           # Engine-independent deps (see kvs-engines) — one shared cache key.
           cache-key: sdk
-          free-disk-space: "true"
 
       - name: Install tools
         uses: ./.github/actions/install-tools
@@ -449,11 +457,12 @@ jobs:
   # ----------------------------------------
 
   lang-tests:
-    name: SurrealQL tests - ${{ matrix.engine }}
-    runs-on: ubuntu-latest-4-cores
+    name: SurrealQL tests - ${{ matrix.engine }} (${{ matrix.arch }})
+    runs-on: runner-${{ matrix.arch }}-32-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
     strategy:
       fail-fast: false
       matrix:
+        arch: ${{ (github.event_name == 'merge_group' || github.event_name == 'push') && fromJSON('["arm","amd"]') || fromJSON('["arm"]') }}
         engine: [mem, surrealkv, rocksdb, tikv]
     steps:
       - name: Checkout sources
@@ -466,12 +475,13 @@ jobs:
           workspaces: language-tests
           # Engine-independent deps (see kvs-engines) — one shared cache key.
           cache-key: lang
-          free-disk-space: "true"
 
       - name: Install tools
         uses: ./.github/actions/install-tools
         with:
-          tools: ${{ matrix.engine == 'mem' && 'cargo-make,cargo-llvm-cov' || 'cargo-make' }}
+          # Coverage (and thus cargo-llvm-cov) only on the arm mem leg; the
+          # amd mem leg runs the plain test task to avoid a duplicate upload.
+          tools: ${{ (matrix.engine == 'mem' && matrix.arch == 'arm') && 'cargo-make,cargo-llvm-cov' || 'cargo-make' }}
 
       - name: Setup databases
         uses: ./.github/actions/setup-databases
@@ -480,15 +490,15 @@ jobs:
 
       - name: Run language tests
         continue-on-error: ${{ matrix.engine == 'tikv' }}
-        if: matrix.engine != 'mem'
+        if: matrix.engine != 'mem' || matrix.arch != 'arm'
         run: cargo make ci-lang-test-${{ matrix.engine }}
 
       - name: Run language tests with coverage
-        if: matrix.engine == 'mem'
+        if: matrix.engine == 'mem' && matrix.arch == 'arm'
         run: cargo make ci-lang-test-coverage
 
       - name: Upload language test coverage to Codecov
-        if: matrix.engine == 'mem'
+        if: matrix.engine == 'mem' && matrix.arch == 'arm'
         uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # (Actions must be pinned by commit hash) v6.0.0
         with:
           files: language-tests-lcov.info
@@ -503,11 +513,12 @@ jobs:
   # ----------------------------------------
 
   lang-upgrade-tests:
-    name: SurrealQL upgrade tests - ${{ matrix.engine }}
-    runs-on: ubuntu-latest-4-cores
+    name: SurrealQL upgrade tests - ${{ matrix.engine }} (${{ matrix.arch }})
+    runs-on: runner-${{ matrix.arch }}-32-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
     strategy:
       fail-fast: false
       matrix:
+        arch: ${{ (github.event_name == 'merge_group' || github.event_name == 'push') && fromJSON('["arm","amd"]') || fromJSON('["arm"]') }}
         engine: [surrealkv, rocksdb]
     steps:
       - name: Checkout sources
@@ -525,7 +536,6 @@ jobs:
             .
           # Engine-independent deps (see kvs-engines) — one shared cache key.
           cache-key: lang-upgrade
-          free-disk-space: "true"
 
       - name: Resolve upgrade version chain
         id: vers
@@ -544,9 +554,9 @@ jobs:
           # Pre-built surreal-vX.Y.Z tarballs from download.surrealdb.com.
           # Release tarballs are immutable, so stale-key restores are safe.
           path: language-tests/.binary_cache
-          key: lang-upgrade-binaries-v1-${{ runner.os }}-${{ steps.vers.outputs.chain }}
+          key: lang-upgrade-binaries-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.vers.outputs.chain }}
           restore-keys: |
-            lang-upgrade-binaries-v1-${{ runner.os }}-
+            lang-upgrade-binaries-v1-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install tools
         uses: ./.github/actions/install-tools
@@ -562,8 +572,13 @@ jobs:
 
   required-checks:
     name: Required checks
-    runs-on: ubuntu-latest-4-cores
-    if: success() || failure()
+    runs-on: ubuntu-latest
+    # !cancelled() so the gate runs even when some needs are skipped (e.g. the
+    # main-only jobs on a PR). success() || failure() evaluates to false when a
+    # need is skipped — which skips this aggregator and leaves the required
+    # check unreported on both PRs and merge_group runs. The step below treats
+    # skipped needs as success.
+    if: ${{ !cancelled() }}
     needs:
       # Server build
       - build
@@ -571,6 +586,7 @@ jobs:
       - format
       - clippy
       - clippy-release
+      - check-debug
       - check-release
       - check-msrv
       - check-wasm
@@ -601,6 +617,7 @@ jobs:
             "${{ needs.format.result }}"
             "${{ needs.clippy.result }}"
             "${{ needs.clippy-release.result }}"
+            "${{ needs.check-debug.result }}"
             "${{ needs.check-release.result }}"
             "${{ needs.check-msrv.result }}"
             "${{ needs.check-wasm.result }}"

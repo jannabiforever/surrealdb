@@ -1,13 +1,11 @@
-name: External SDK tests
+name: SDKs
 
 # Exercise external SDK repos against a freshly built surreal binary.
-# All jobs run on the stock GitHub-hosted ubuntu-24.04 image (arm64 build steps
-# use the native ubuntu-24.04-arm-4-cores). Not in PR required checks.
+# Runs on the org's amd64 spot runners against an amd64 surreal binary.
+# Not in PR required checks.
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 6 * * 1"
   pull_request:
     types:
       - opened
@@ -33,9 +31,8 @@ env:
   SCCACHE_REGION: us-east-1
   SCCACHE_S3_KEY_PREFIX: ${{ github.repository }}
   SCCACHE_IDLE_TIMEOUT: "0"
-  # Dedicated bucket-scoped creds, not the release-publishing AMAZON_* keys.
-  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AMAZON_ACCESS_KEY }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AMAZON_SECRET_KEY }}
 
 jobs:
   # ----------------------------------------
@@ -43,22 +40,9 @@ jobs:
   # ----------------------------------------
 
   build:
-    name: Build binary (${{ matrix.name }})
-    strategy:
-      matrix:
-        include:
-          - name: amd64
-            target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04-4-cores
-          - name: arm64
-            target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm-4-cores
-    # Compiles PR-authored code. Both arches run on ephemeral GitHub-hosted
-    # runners (amd64 on ubuntu-24.04, arm64 on the native ubuntu-24.04-arm-4-cores), so
-    # PR code never runs on self-hosted org infrastructure.
-    runs-on: ${{ matrix.runner }}
+    name: Build binary (amd64)
+    runs-on: runner-amd-16-cores-spot
     steps:
-
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # (Actions must be pinned by commit hash) v6.0.2
 
@@ -66,20 +50,19 @@ jobs:
         uses: ./.github/actions/setup-environment
         with:
           save-cache: ${{ github.ref == 'refs/heads/main' }}
-          free-disk-space: 'true'
 
       - name: Build binary
-        run: cargo build --target ${{ matrix.target }}
+        run: cargo build --target x86_64-unknown-linux-gnu
 
       - name: Upload artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # (Actions must be pinned by commit hash) v7.0.0
         with:
-          name: surreal-${{ matrix.name }}
-          path: target/${{ matrix.target }}/debug/surreal
+          name: surreal-amd64
+          path: target/x86_64-unknown-linux-gnu/debug/surreal
 
   sdk-javascript:
     name: SDK - JavaScript (${{ matrix.version }}, ${{ matrix.protocol }})
-    runs-on: ubuntu-24.04-4-cores
+    runs-on: runner-amd-16-cores-spot
     needs: build
     permissions:
       contents: read
@@ -135,7 +118,7 @@ jobs:
 
   sdk-golang:
     name: SDK - Golang (${{ matrix.version }}, ${{ matrix.protocol }})
-    runs-on: ubuntu-24.04-4-cores
+    runs-on: runner-amd-16-cores-spot
     needs: build
     strategy:
       fail-fast: false
@@ -197,7 +180,7 @@ jobs:
 
   sdk-python:
     name: SDK - Python (${{ matrix.version }}, ${{ matrix.protocol }})
-    runs-on: ubuntu-24.04-4-cores
+    runs-on: runner-amd-16-cores-spot
     needs: build
     strategy:
       fail-fast: false
@@ -269,7 +252,7 @@ jobs:
 
   sdk-php:
     name: SDK - PHP (${{ matrix.version }})
-    runs-on: ubuntu-24.04-4-cores
+    runs-on: runner-amd-16-cores-spot
     needs: build
     strategy:
       fail-fast: false
@@ -330,7 +313,7 @@ jobs:
 
   sdk-dotnet:
     name: SDK - .NET (${{ matrix.version }})
-    runs-on: ubuntu-24.04-4-cores
+    runs-on: runner-amd-16-cores-spot
     needs: build
     strategy:
       fail-fast: false
@@ -412,7 +395,7 @@ jobs:
 
   sdk-output:
     name: SDK test summary
-    runs-on: ubuntu-24.04-4-cores
+    runs-on: runner-amd-16-cores-spot
     if: always()
     needs:
       - sdk-javascript

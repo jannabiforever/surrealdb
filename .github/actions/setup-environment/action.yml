@@ -33,7 +33,7 @@ inputs:
   free-disk-space:
     description: 'Whether to free disk space by removing pre-installed software'
     required: false
-    default: 'true'
+    default: 'false'
   enable-sccache:
     description: 'Whether to compile via sccache (RUSTC_WRAPPER)'
     required: false
