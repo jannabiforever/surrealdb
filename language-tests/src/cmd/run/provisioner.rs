@@ -8,7 +8,7 @@ use surrealdb_core::channel;
 use surrealdb_core::cnf::ConfigMap;
 use surrealdb_core::dbs::Capabilities;
 use surrealdb_core::dbs::capabilities::Targets;
-use surrealdb_core::kvs::{Datastore, LockType, TransactionType};
+use surrealdb_core::kvs::Datastore;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::cli::Backend;
@@ -129,9 +129,11 @@ impl CreateInfo {
 			Backend::TikV => {
 				let p = "127.0.0.1:2379";
 				let ds = builder.build_with_path(&format!("tikv://{p}")).await?;
-				let tx = ds.transaction(TransactionType::Write, LockType::Optimistic).await?;
-				tx.delr(vec![0u8]..vec![0xffu8]).await?;
-				tx.commit().await?;
+				// Every TiKV datastore in a run aliases the one physical cluster, so a
+				// freshly built handle still sees whatever earlier tests left behind.
+				// Physically drop the entire keyspace out-of-transaction; `bootstrap`
+				// below then re-seeds the node keys. See `reset_storage`.
+				ds.unsafe_destroy_range(vec![0u8], vec![0xffu8]).await?;
 				ds
 			}
 		};
@@ -142,6 +144,37 @@ impl CreateInfo {
 			store: Arc::new(ds),
 			path,
 		})
+	}
+
+	/// Reset a reused datastore's storage between tests.
+	///
+	/// Only TiKV needs this. Every TiKV datastore in a run aliases the one
+	/// physical cluster, so the reused base datastore can observe keys left
+	/// behind by `clean`/create-path tests — whose post-run cleanup the harness
+	/// does not verify — and the next base test then fails the retained-key
+	/// check on that foreign data. Embedded backends give each datastore its
+	/// own directory, so there is nothing to reset, hence the no-op.
+	///
+	/// We physically drop the keys via `unsafe_destroy_range` rather than a
+	/// transactional `delr`: the wipe runs serially (`--jobs 1`) with no open
+	/// transaction, so the MVCC-bypass hazards do not apply, and it avoids both
+	/// the `delr` key cap and the tombstone build-up of wiping on every test.
+	///
+	/// Crucially we wipe *around* the node/bootstrap keys rather than the whole
+	/// keyspace: `/!ic` (index-compaction queue), `/!nd` (cluster membership)
+	/// and `/!nh` / `/!ni` (namespace-ID generator) live contiguously in
+	/// `[/!ic, /!ns)`, and nothing a test creates falls in that band (tests
+	/// create `/!ac`, `/!cg`, `/!eq` below it and `/!ns`, `/!tl`, `/!us` plus
+	/// the `/*` data keys at or above it). Preserving that block keeps this
+	/// long-lived datastore registered, so we skip the per-test `bootstrap`
+	/// (three node-registry transactions) that a full wipe would force —
+	/// these are the same prefixes the retained-key check whitelists.
+	async fn reset_storage(&self, ds: &Datastore) -> Result<()> {
+		if let Backend::TikV = self.backend {
+			ds.unsafe_destroy_range(vec![0u8], b"/!ic".to_vec()).await?;
+			ds.unsafe_destroy_range(b"/!ns".to_vec(), vec![0xffu8]).await?;
+		}
+		Ok(())
 	}
 
 	fn produce_path(&self) -> String {
@@ -208,6 +241,11 @@ impl Permit {
 				channel,
 			} => {
 				sender = Some(channel);
+				// The create path wipes at build time; the reused base datastore is
+				// never rebuilt, so reset it here to clear any cruft a prior test
+				// (e.g. a `clean` test defining extra namespaces) left on the shared
+				// physical cluster before handing it to this test.
+				self.info.reset_storage(ds.store.as_ref()).await?;
 				ds
 			}
 			PermitInner::Create {
