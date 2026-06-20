@@ -35,6 +35,8 @@ pub enum Category {
 	RootConfig,
 	/// crate::key::root::ic                 /!ic{ns}{db}{tb}{ix}{nid}{uuid}
 	IndexCompaction,
+	/// crate::key::root::rc                 /!rc{kind}{ns}{db}{tb}{ix}{expunge}{uuid}
+	Reclaim,
 	/// crate::key::root::eq                 /!eq{ns}{db}{tb}{ev}{ts}{nid}
 	EventQueue,
 	///
@@ -293,6 +295,7 @@ impl Display for Category {
 			Self::IndexFullTextDocCountAndLength => "IndexFullTextDocCountAndLength",
 			Self::IndexTermDocuments => "IndexTermDocuments",
 			Self::IndexCompaction => "IndexCompaction",
+			Self::Reclaim => "Reclaim",
 			Self::IndexCountState => "IndexCountState",
 			Self::IndexBuildState => "IndexBuildState",
 			Self::IndexBuildReservation => "IndexBuildReservation",

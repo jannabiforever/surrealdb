@@ -344,7 +344,10 @@ pub async fn schedule_run(
 
 /// Checks for keys retained in the datastore after clean up which should not be there.
 async fn check_retained_keys(dbs: &Datastore) -> Result<Vec<Vec<u8>>> {
-	const ALLOWED_KEY_PREFIXES: &[&[u8]] = &[b"/!ni", b"/!nh", b"/!nd", b"/!ic"];
+	// `/!tl` are task-lease keys (e.g. written when the tombstone-reclaim task
+	// acquires its lease during cleanup); like `/!ic` they are background-task
+	// infrastructure that legitimately persists, not leaked test data.
+	const ALLOWED_KEY_PREFIXES: &[&[u8]] = &[b"/!ni", b"/!nh", b"/!nd", b"/!ic", b"/!tl"];
 
 	let txn = dbs
 		.transaction(
@@ -558,7 +561,7 @@ async fn run_test_body(
 /// how the body exited: skipping it (as the old early-return paths did) leaks
 /// seed data from importing tests that fail before execution onto the shared
 /// datastore, breaking later tests.
-async fn cleanup_environment(dbs: &Datastore, session: &Session) -> Result<()> {
+async fn cleanup_environment(dbs: &Arc<Datastore>, session: &Session) -> Result<()> {
 	if let Some(ref ns) = session.ns {
 		if let Some(ref db) = session.db {
 			let session = Session::owner().with_ns(ns);
@@ -608,6 +611,24 @@ async fn cleanup_environment(dbs: &Datastore, session: &Session) -> Result<()> {
 			}
 		}
 	}
+
+	// `REMOVE NAMESPACE`/`REMOVE DATABASE`/`REMOVE INDEX` defer their data
+	// deletion to a background reclaim task, which is not otherwise running inside the
+	// test harness. Drain it last (after every REMOVE above) so deferred removals
+	// actually reclaim their data and queue entries, leaving the reused datastore
+	// clean for the retained-key check and the next test.
+	// Grace `ZERO`: drain immediately. The harness is single-threaded per
+	// datastore with no concurrent readers, so the snapshot-safety grace that
+	// production uses is unnecessary here and would leave residue for the
+	// retained-key check.
+	Datastore::reclaim_tombstones(
+		Arc::clone(dbs),
+		std::time::Duration::from_secs(1),
+		std::time::Duration::ZERO,
+		tokio_util::sync::CancellationToken::new(),
+	)
+	.await
+	.context("failed to drain tombstone reclaim queue")?;
 
 	Ok(())
 }

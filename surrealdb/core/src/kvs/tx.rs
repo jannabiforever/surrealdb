@@ -1272,6 +1272,147 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Remove a namespace's catalog definition and enqueue its data prefix for
+	/// asynchronous background reclaim.
+	///
+	/// Unlike [`crate::catalog::providers::NamespaceProvider::del_ns`], this
+	/// does **not** delete the (potentially huge) `/*{ns}` data prefix inside
+	/// the transaction. Only the catalog name→id entry is removed, so the
+	/// namespace is immediately unreachable; a reclaim job is enqueued and
+	/// [`crate::kvs::Datastore::reclaim_tombstones`] destroys the data later.
+	/// Because both writes are staged in this transaction, a rollback undoes
+	/// the removal and never destroys data.
+	pub(crate) async fn del_ns_deferred(
+		&self,
+		ns: &str,
+		expunge: bool,
+	) -> Result<Option<NamespaceId>> {
+		let Some(ns_def) = self.get_ns_by_name(ns, None).await? else {
+			return Ok(None);
+		};
+		// Delete only the catalog definition; defer the data deletion.
+		let key = crate::key::root::ns::new(&ns_def.name);
+		if expunge {
+			self.clr(&key).await?;
+		} else {
+			self.del(&key).await?;
+		}
+		// Enqueue background reclaim of the namespace data prefix.
+		let rc = crate::key::root::rc::ReclaimKey::namespace(
+			ns_def.namespace_id,
+			expunge,
+			Uuid::now_v7(),
+		);
+		self.set(
+			&rc,
+			&crate::key::root::rc::ReclaimState {
+				observed_ms: 0,
+			},
+		)
+		.await?;
+		// Invalidate cached namespace lookups so the removal is observed.
+		self.cache.remove(&cache::tx::Lookup::Nss);
+		self.cache.remove(&cache::tx::Lookup::NsByName(&ns_def.name));
+		Ok(Some(ns_def.namespace_id))
+	}
+
+	/// Remove a database's catalog definition and enqueue its data prefix for
+	/// asynchronous background reclaim.
+	///
+	/// The deferred companion to
+	/// [`crate::catalog::providers::DatabaseProvider::del_db`] used by
+	/// `REMOVE DATABASE`: the `/*{ns}*{db}` prefix is destroyed later by
+	/// [`crate::kvs::Datastore::reclaim_tombstones`], not in this transaction.
+	pub(crate) async fn del_db_deferred(
+		&self,
+		ns: &str,
+		db: &str,
+		expunge: bool,
+	) -> Result<Option<DatabaseId>> {
+		let Some(db_def) = self.get_db_by_name(ns, db, None).await? else {
+			return Ok(None);
+		};
+		// Delete only the catalog definition; defer the data deletion.
+		let key = crate::key::namespace::db::new(db_def.namespace_id, &db_def.name);
+		if expunge {
+			self.clr(&key).await?;
+		} else {
+			self.del(&key).await?;
+		}
+		// Enqueue background reclaim of the database data prefix.
+		let rc = crate::key::root::rc::ReclaimKey::database(
+			db_def.namespace_id,
+			db_def.database_id,
+			expunge,
+			Uuid::now_v7(),
+		);
+		self.set(
+			&rc,
+			&crate::key::root::rc::ReclaimState {
+				observed_ms: 0,
+			},
+		)
+		.await?;
+		// Invalidate cached database lookups so the removal is observed.
+		self.cache.remove(&cache::tx::Lookup::Dbs(db_def.namespace_id));
+		self.cache.remove(&cache::tx::Lookup::DbByName(ns, &db_def.name));
+		Ok(Some(db_def.database_id))
+	}
+
+	/// Remove an index's catalog definition and enqueue its data prefix for
+	/// asynchronous background reclaim.
+	///
+	/// The deferred companion to
+	/// [`crate::catalog::providers::TableProvider::del_tb_index`] used by
+	/// `REMOVE INDEX`. The catalog definition and id→name lookup are removed
+	/// immediately so the index stops being maintained and used; the
+	/// `/*{ns}*{db}*{tb}+{ix}` data prefix is destroyed later by
+	/// [`crate::kvs::Datastore::reclaim_tombstones`].
+	///
+	/// Safe against index recreation because index ids are never reused: a new
+	/// `DEFINE INDEX` of the same name allocates a fresh id (the old definition
+	/// is already gone), so its data prefix is disjoint from the one queued for
+	/// reclaim here.
+	pub(crate) async fn del_tb_index_deferred(
+		&self,
+		ns: NamespaceId,
+		db: DatabaseId,
+		tb: &TableName,
+		ix: &str,
+	) -> Result<()> {
+		let Some(ix_def) = self.get_tb_index(ns, db, tb, ix, None).await? else {
+			return Ok(());
+		};
+		// Delete the catalog definition; defer the index data deletion.
+		let key = crate::key::table::ix::new(ns, db, tb, &ix_def.name);
+		self.del(&key).await?;
+		// Delete the id-to-name lookup.
+		let name_lookup_key =
+			crate::key::table::ix::IndexNameLookupKey::new(ns, db, tb, ix_def.index_id);
+		self.del(&name_lookup_key).await?;
+		// Enqueue background reclaim of the index data prefix.
+		let rc = crate::key::root::rc::ReclaimKey::index(
+			ns,
+			db,
+			std::borrow::Cow::Borrowed(tb),
+			ix_def.index_id,
+			false,
+			Uuid::now_v7(),
+		);
+		self.set(
+			&rc,
+			&crate::key::root::rc::ReclaimState {
+				observed_ms: 0,
+			},
+		)
+		.await?;
+		// Invalidate the cached list of all indexes for this table.
+		self.cache.remove(&cache::tx::Lookup::Ixs(ns, db, tb.as_ref()));
+		// Invalidate the cached index entry.
+		self.cache.remove(&cache::tx::Lookup::Ix(ns, db, tb.as_ref(), &ix_def.name));
+		Ok(())
+	}
+
 	/// Insert or update a key in the datastore.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::tx", skip_all)]
 	pub async fn set<K>(&self, key: &K, val: &K::ValueType) -> Result<()>
@@ -2085,33 +2226,6 @@ impl NamespaceProvider for Transaction {
 	) -> BoxProviderFut<'a, Result<NamespaceId>> {
 		Box::pin(async move { self.sequences.next_namespace_id(ctx).await })
 	}
-
-	fn del_ns<'a>(&'a self, ns: &'a str, expunge: bool) -> BoxProviderFut<'a, Result<Option<()>>> {
-		Box::pin(async move {
-			let Some(ns_def) = self.get_ns_by_name(ns, None).await? else {
-				return Ok(None);
-			};
-			let key = crate::key::root::ns::new(&ns_def.name);
-			let namespace_root = crate::key::namespace::all::new(ns_def.namespace_id);
-			if expunge {
-				self.clr(&key).await?;
-				self.clrp(&namespace_root).await?;
-			} else {
-				self.del(&key).await?;
-				self.delp(&namespace_root).await?;
-			};
-
-			// Invalidate the cached list of all namespaces
-			let list_key = cache::tx::Lookup::Nss;
-			self.cache.remove(&list_key);
-
-			// Invalidate the cached namespace entry
-			let ns_key = cache::tx::Lookup::NsByName(&ns_def.name);
-			self.cache.remove(&ns_key);
-
-			Ok(Some(()))
-		})
-	}
 }
 
 // --------------------------------------------------
@@ -2279,38 +2393,6 @@ impl DatabaseProvider for Transaction {
 			self.cache.insert(qey, entry);
 
 			Ok(cached_db)
-		})
-	}
-
-	fn del_db<'a>(
-		&'a self,
-		ns: &'a str,
-		db: &'a str,
-		expunge: bool,
-	) -> BoxProviderFut<'a, Result<Option<()>>> {
-		Box::pin(async move {
-			let Some(db) = self.get_db_by_name(ns, db, None).await? else {
-				return Ok(None);
-			};
-			let key = crate::key::namespace::db::new(db.namespace_id, &db.name);
-			let database_root = crate::key::database::all::new(db.namespace_id, db.database_id);
-			if expunge {
-				self.clr(&key).await?;
-				self.clrp(&database_root).await?;
-			} else {
-				self.del(&key).await?;
-				self.delp(&database_root).await?
-			};
-
-			// Invalidate the cached list of all databases for this namespace
-			let list_key = cache::tx::Lookup::Dbs(db.namespace_id);
-			self.cache.remove(&list_key);
-
-			// Invalidate the cached database entry
-			let db_key = cache::tx::Lookup::DbByName(ns, &db.name);
-			self.cache.remove(&db_key);
-
-			Ok(Some(()))
 		})
 	}
 

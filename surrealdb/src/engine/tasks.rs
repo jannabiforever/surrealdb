@@ -64,8 +64,9 @@ pub fn init(dbs: Arc<Datastore>, canceller: CancellationToken, opts: &EngineOpti
 	let task5 = spawn_task_index_compaction(Arc::clone(&dbs), canceller.clone(), opts);
 	let task6 = spawn_task_event_processing(Arc::clone(&dbs), canceller.clone(), opts);
 	let task7 = spawn_task_tikv_gc(Arc::clone(&dbs), canceller.clone(), opts);
-	let task8 = spawn_task_tikv_lock_cleanup(dbs, canceller, opts);
-	Tasks(vec![task1, task2, task3, task4, task5, task6, task7, task8])
+	let task8 = spawn_task_tikv_lock_cleanup(Arc::clone(&dbs), canceller.clone(), opts);
+	let task9 = spawn_task_reclaim_tombstones(dbs, canceller, opts);
+	Tasks(vec![task1, task2, task3, task4, task5, task6, task7, task8, task9])
 }
 
 fn spawn_task_node_membership_refresh(
@@ -250,6 +251,55 @@ fn spawn_task_index_compaction(
 			}
 		}
 		trace!("Background task exited: Running index compaction");
+	}))
+}
+
+/// Spawns the periodic background reclaim of tombstoned data.
+///
+/// `REMOVE NAMESPACE/DATABASE/INDEX` delete only the catalog definition and
+/// enqueue the data prefix for reclaim; this task periodically destroys the
+/// orphaned data out-of-band (via `unsafe_destroy_range` on TiKV or a
+/// transactional prefix delete on other backends), so the `REMOVE` statement
+/// returns immediately. The task runs at `opts.reclaim_interval`.
+fn spawn_task_reclaim_tombstones(
+	dbs: Arc<Datastore>,
+	canceller: CancellationToken,
+	opts: &EngineOptions,
+) -> Task {
+	// Get the delay interval and snapshot-safety grace from the config.
+	let interval = opts.reclaim_interval;
+	// Clamp the grace up to at least the TiKV GC lifetime: on TiKV,
+	// `unsafe_destroy_range` bypasses MVCC, so data must not be reclaimed while a
+	// snapshot older than the GC safepoint (`now - tikv_gc_lifetime`) could still
+	// read it. Deriving the effective grace here means a longer `--tikv-gc-lifetime`
+	// can never be undercut by leaving `--reclaim-grace` at its default.
+	let grace = opts.reclaim_grace.max(opts.tikv_gc_lifetime);
+	// Spawn a future
+	Box::pin(spawn(async move {
+		// Log the interval frequency
+		trace!("Running tombstone reclaim every {interval:?} (grace {grace:?})");
+		// Create a new time-based interval ticket
+		let mut ticker = interval_ticker(interval).await;
+		// Loop continuously until the task is cancelled
+		loop {
+			tokio::select! {
+				biased;
+				// Check if this has shutdown
+				_ = canceller.cancelled() => break,
+				// Receive a notification on the channel
+				Some(_) = ticker.next() => {
+					if let Err(e) =
+						Datastore::reclaim_tombstones(Arc::clone(&dbs), interval, grace, canceller.clone()).await
+					{
+						if canceller.is_cancelled() {
+							break;
+						}
+						error!("Error running tombstone reclaim: {e}");
+					}
+				}
+			}
+		}
+		trace!("Background task exited: Running tombstone reclaim");
 	}))
 }
 

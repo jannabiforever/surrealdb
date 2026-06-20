@@ -70,6 +70,9 @@ use crate::idx::IndexKeyBase;
 use crate::idx::index::IndexOperation;
 use crate::idx::trees::store::IndexStores;
 use crate::key::root::ic::IndexCompactionKey;
+use crate::key::root::rc::{
+	RECLAIM_DATABASE, RECLAIM_INDEX, RECLAIM_NAMESPACE, ReclaimKey, ReclaimState,
+};
 use crate::kvs::LockType::*;
 use crate::kvs::TransactionType::*;
 use crate::kvs::cache::ds::DatastoreCache;
@@ -2222,6 +2225,241 @@ impl Datastore {
 			}
 		}
 		Ok((count_iteration, count_error))
+	}
+
+	/// Periodically drains the background reclaim queue (`/!rc` keys),
+	/// destroying the data prefix of namespaces/databases/indexes that were
+	/// removed by a committed `REMOVE` statement.
+	///
+	/// `REMOVE NAMESPACE/DATABASE/INDEX` delete only the catalog definition
+	/// inside the user transaction and enqueue a [`ReclaimKey`]; this task
+	/// performs the expensive data deletion out-of-band so the user statement
+	/// returns immediately and never trips a request/transaction timeout.
+	///
+	/// Coordinated across the cluster by a [`TaskLeaseType::ReclaimTombstones`]
+	/// lease so only one node reclaims at a time. The queue is read in a
+	/// short-lived read transaction; each prefix is destroyed independently
+	/// (idempotently — re-running on an already-empty prefix is a no-op) and the
+	/// processed queue entry is then deleted in a separate write transaction, so
+	/// a crash mid-reclaim simply retries on the next pass.
+	///
+	/// Snapshot safety: a queued removal is only reclaimed once it has been
+	/// *observed* by this task for at least `grace`. The reclaim task destroys
+	/// data out-of-band — on TiKV via `unsafe_destroy_range`, which bypasses
+	/// MVCC — so a read transaction whose snapshot predates the `REMOVE` must be
+	/// given time to finish first. On first sight the task stamps the entry's
+	/// [`ReclaimState::observed_ms`]; aging is measured from there, not from the
+	/// key's `uid` (a UUIDv7 stamped while the `REMOVE` statement runs, which can
+	/// be arbitrarily earlier than the commit inside a long `BEGIN`/`COMMIT`
+	/// block). Because the task only ever reads committed entries, `observed_ms`
+	/// is always at or after the removal's commit, so `age >= grace` implies the
+	/// commit is at least `grace` old — equivalent to it having fallen behind the
+	/// MVCC GC safepoint (`now - tikv_gc_lifetime`) when `grace >= tikv_gc_lifetime`,
+	/// by which point any transaction that could still read the data has expired.
+	/// A `grace` of zero reclaims immediately without stamping (used by tests and
+	/// the language-test harness teardown, where there are no concurrent readers).
+	///
+	/// Returns `(iterations, errors)`.
+	#[instrument(level = "trace", target = "surrealdb::core::kvs::ds", skip(dbs, canceller))]
+	pub async fn reclaim_tombstones(
+		dbs: Arc<Datastore>,
+		interval: Duration,
+		grace: Duration,
+		canceller: CancellationToken,
+	) -> Result<(usize, usize)> {
+		trace!(target: TARGET, "Attempting tombstone reclaim process");
+		// Coordinate across the cluster so only one node reclaims at a time.
+		let lh = LeaseHandler::new_with_canceller(
+			dbs.sequences.clone(),
+			dbs.id,
+			dbs.transaction_factory.clone(),
+			TaskLeaseType::ReclaimTombstones,
+			interval * 2,
+			canceller.clone(),
+		)?;
+		let mut count_iteration = 0;
+		let mut count_error = 0;
+		// Continue without interruptions while there are entries and the lease.
+		loop {
+			Self::ensure_not_cancelled(&canceller)?;
+			// If we don't hold the lease, another node is handling this task.
+			if !lh.has_lease().await? {
+				return Ok((count_iteration, count_error));
+			}
+			Self::ensure_not_cancelled(&canceller)?;
+			// Read the reclaim queue in a short-lived read transaction to avoid
+			// holding a write lock across the entire reclaim cycle.
+			let (beg, end) = ReclaimKey::range();
+			let items = {
+				let txn = dbs.transaction(Read, Optimistic).await?;
+				let res = txn.getr(beg..end, None).await;
+				let _ = txn.cancel().await;
+				res?
+			};
+			Self::ensure_not_cancelled(&canceller)?;
+			if items.is_empty() {
+				return Ok((count_iteration, count_error));
+			}
+			count_iteration += 1;
+			// Current wall-clock time (unix millis), used to age each entry
+			// against `grace` and to stamp first observations.
+			let now_ms = web_time::SystemTime::now()
+				.duration_since(web_time::SystemTime::UNIX_EPOCH)
+				.map(|d| d.as_millis() as u64)
+				.unwrap_or(0);
+			let grace_ms = grace.as_millis() as u64;
+			// `done`: entries reclaimed this pass (to delete from the queue).
+			// `to_stamp`: entries seen for the first time (to record an
+			// observation time so aging is measured from commit, not the
+			// pre-commit `uid`). Entries seen but still inside the grace window
+			// are left untouched for a later pass.
+			let mut done: Vec<Key> = Vec::with_capacity(items.len());
+			let mut to_stamp: Vec<Key> = Vec::new();
+			for (k, v) in &items {
+				Self::ensure_not_cancelled(&canceller)?;
+				lh.try_maintain_lease().await?;
+				let rc = match ReclaimKey::decode_key(k) {
+					Ok(rc) => rc,
+					Err(e) => {
+						count_error += 1;
+						warn!(target: TARGET, "Failed to decode reclaim queue entry: {e}");
+						continue;
+					}
+				};
+				// Zero grace: reclaim immediately without the observe-then-age
+				// dance (tests / harness teardown — no concurrent readers).
+				if grace.is_zero() {
+					match dbs.reclaim_decoded(&rc).await {
+						Ok(()) => done.push(k.clone()),
+						Err(e) => {
+							count_error += 1;
+							warn!(target: TARGET, "Tombstone reclaim failed for a queue entry: {e}");
+						}
+					}
+					continue;
+				}
+				let state = match ReclaimState::kv_decode_value(v, ()) {
+					Ok(s) => s,
+					Err(e) => {
+						count_error += 1;
+						warn!(target: TARGET, "Failed to decode reclaim queue state: {e}");
+						continue;
+					}
+				};
+				if state.observed_ms == 0 {
+					// First sighting of this committed entry — record an
+					// observation time (>= commit) and defer reclaim. Aging is
+					// measured from here, never from the pre-commit `uid`.
+					to_stamp.push(k.clone());
+					continue;
+				}
+				// Snapshot-safety gate: only destroy data once it has been
+				// observed for at least `grace`, by which point any transaction
+				// that could still read it is behind the MVCC GC safepoint.
+				if now_ms.saturating_sub(state.observed_ms) >= grace_ms {
+					match dbs.reclaim_decoded(&rc).await {
+						Ok(()) => done.push(k.clone()),
+						Err(e) => {
+							count_error += 1;
+							warn!(target: TARGET, "Tombstone reclaim failed for a queue entry: {e}");
+						}
+					}
+				}
+			}
+			// Persist queue changes in a single write transaction: stamp
+			// newly-observed entries and delete reclaimed ones. Done separately
+			// from the read scan so we don't conflict with concurrent enqueues.
+			if !done.is_empty() || !to_stamp.is_empty() {
+				let txn = dbs.transaction(Write, Optimistic).await?;
+				if let Err(e) = Self::ensure_not_cancelled(&canceller) {
+					let _ = txn.cancel().await;
+					return Err(e);
+				}
+				for k in &to_stamp {
+					if let Ok(rc) = ReclaimKey::decode_key(k) {
+						let state = ReclaimState {
+							observed_ms: now_ms,
+						};
+						if let Err(e) = txn.set(&rc, &state).await {
+							warn!(target: TARGET, "Failed to stamp reclaim queue entry: {e}");
+						}
+					}
+				}
+				for k in &done {
+					if let Err(e) = txn.del(k).await {
+						warn!(target: TARGET, "Failed to delete reclaim queue entry: {e}");
+					}
+				}
+				if let Err(e) = txn.commit().await {
+					let _ = txn.cancel().await;
+					warn!(target: TARGET, "Failed to commit reclaim queue update: {e}");
+					return Ok((count_iteration, count_error));
+				}
+			}
+			// If this pass reclaimed nothing, the remaining entries are still
+			// inside their grace window (or were just stamped, or are
+			// persistently failing) — stop now and let the next timer tick retry
+			// once they have aged, rather than busy-looping.
+			if done.is_empty() {
+				return Ok((count_iteration, count_error));
+			}
+		}
+	}
+
+	/// Destroy the data prefix of a decoded reclaim queue entry.
+	async fn reclaim_decoded(&self, rc: &ReclaimKey<'_>) -> Result<()> {
+		let expunge = rc.expunge != 0;
+		match rc.kind {
+			RECLAIM_NAMESPACE => {
+				let prefix = crate::key::namespace::all::new(rc.ns);
+				self.reclaim_prefix(&prefix, expunge).await
+			}
+			RECLAIM_DATABASE => {
+				let prefix = crate::key::database::all::new(rc.ns, rc.db);
+				self.reclaim_prefix(&prefix, expunge).await
+			}
+			RECLAIM_INDEX => {
+				let prefix = crate::key::index::all::new(rc.ns, rc.db, rc.tb.as_ref(), rc.ix);
+				self.reclaim_prefix(&prefix, expunge).await
+			}
+			other => {
+				warn!(target: TARGET, "Unknown reclaim queue entry kind {other}, skipping");
+				Ok(())
+			}
+		}
+	}
+
+	/// Destroy a key prefix out-of-band: `unsafe_destroy_range` on TiKV, a
+	/// transactional prefix delete on every other backend. Idempotent — a
+	/// re-run on an already-empty prefix is a no-op.
+	async fn reclaim_prefix<K>(&self, prefix: &K, expunge: bool) -> Result<()>
+	where
+		K: crate::kvs::KVKey + std::fmt::Debug,
+	{
+		#[cfg(feature = "kv-tikv")]
+		if self.tikv_ops().is_some() {
+			// `unsafe_destroy_range` hard-removes every version in the range
+			// in a single out-of-transaction call, so it ignores `expunge`
+			// (the catalog entry is already gone — there is nothing to retain).
+			let range = crate::kvs::util::to_prefix_range(prefix)?;
+			return self.unsafe_destroy_range(range.start, range.end).await;
+		}
+		// Non-TiKV backends: delete the prefix transactionally. This runs off
+		// the user request path, so even a large prefix delete here cannot trip
+		// a client deadline.
+		let txn = self.transaction(Write, Optimistic).await?;
+		let res = if expunge {
+			txn.clrp(prefix).await
+		} else {
+			txn.delp(prefix).await
+		};
+		match res {
+			Ok(()) => txn.commit().await,
+			Err(e) => {
+				let _ = txn.cancel().await;
+				Err(e)
+			}
+		}
 	}
 
 	#[cfg(not(target_family = "wasm"))]

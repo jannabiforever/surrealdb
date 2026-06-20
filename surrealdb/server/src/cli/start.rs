@@ -74,6 +74,16 @@ pub struct StartCommandArguments {
 	#[arg(env = "SURREAL_ASYNC_EVENT_PROCESSING_INTERVAL", long = "async-event-interval", value_parser = super::validator::duration)]
 	#[arg(default_value = "5s")]
 	event_processing_interval: Duration,
+	#[arg(env = "SURREAL_RECLAIM_INTERVAL", long = "reclaim-interval", value_parser = super::validator::duration)]
+	#[arg(default_value = "60s")]
+	reclaim_interval: Duration,
+	#[arg(
+		help = "Minimum age a removed namespace/database/index must reach before its data is physically reclaimed (snapshot-safety grace; effective value is max(this, --tikv-gc-lifetime))",
+		help_heading = "Database"
+	)]
+	#[arg(env = "SURREAL_RECLAIM_GRACE", long = "reclaim-grace", value_parser = super::validator::duration)]
+	#[arg(default_value = "10m")]
+	reclaim_grace: Duration,
 	#[arg(
 		help = "The interval at which the TiKV MVCC garbage collector runs",
 		help_heading = "Database"
@@ -213,6 +223,8 @@ pub async fn init<
 		changefeed_gc_interval,
 		index_compaction_interval,
 		event_processing_interval,
+		reclaim_interval,
+		reclaim_grace,
 		tikv_gc_interval,
 		tikv_gc_lifetime,
 		tikv_lock_cleanup_interval,
@@ -250,6 +262,8 @@ pub async fn init<
 		.with_changefeed_gc_interval(changefeed_gc_interval)
 		.with_index_compaction_interval(index_compaction_interval)
 		.with_event_processing_interval(event_processing_interval)
+		.with_reclaim_interval(reclaim_interval)
+		.with_reclaim_grace(reclaim_grace)
 		.with_tikv_gc_interval(tikv_gc_interval)
 		.with_tikv_gc_lifetime(tikv_gc_lifetime)
 		.with_tikv_lock_cleanup_interval(tikv_lock_cleanup_interval);

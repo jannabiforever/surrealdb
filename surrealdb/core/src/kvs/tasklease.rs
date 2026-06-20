@@ -28,6 +28,8 @@ pub(crate) enum TaskLeaseType {
 	IndexCompaction,
 	/// Event processing
 	EventProcessing,
+	/// Background reclaim of tombstoned namespace/database/index data
+	ReclaimTombstones,
 }
 
 /// Represents a distributed task lease stored in the datastore.
