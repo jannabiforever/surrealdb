@@ -6,8 +6,8 @@
 
 use crate::opengql::ast::{
 	BinaryOp, EdgeDirection, ElementPredicate, GqlExpr, GqlLiteral, GqlQuery, GqlStatement,
-	LabelExpr, MatchQuery, QuantifierKind, ReturnItem, ReturnItems, SetQuantifier, TruthValue,
-	UnaryOp,
+	LabelExpr, MatchClause, MatchItem, MatchQuery, QuantifierKind, ReturnItem, ReturnItems,
+	SetQuantifier, TruthValue, UnaryOp,
 };
 use crate::opengql::{GqlParserSettings, parse_str, parse_with_settings};
 
@@ -25,6 +25,22 @@ fn parse(source: &str) -> MatchQuery {
 		stmt: GqlStatement::Match(query),
 	} = query;
 	query
+}
+
+/// Returns the plain `MATCH` clauses of a parsed query, asserting every item
+/// is a plain (non-`OPTIONAL`) clause. Most statement and pattern tests build
+/// queries with no `OPTIONAL` items, so this keeps their `[i]` indexing into
+/// the clause list ergonomic.
+#[track_caller]
+fn match_clauses(query: &MatchQuery) -> Vec<&MatchClause> {
+	query
+		.items
+		.iter()
+		.map(|item| match item {
+			MatchItem::Match(clause) => clause,
+			MatchItem::Optional(_) => panic!("expected a plain MATCH clause, found OPTIONAL"),
+		})
+		.collect()
 }
 
 /// Parses the source, expecting an error, and returns the rendered error.
@@ -215,9 +231,9 @@ fn representative_query() {
 		 RETURN a.name AS n, b.name ORDER BY n SKIP 5 LIMIT 10",
 	);
 
-	assert_eq!(query.matches.len(), 1);
-	let clause = &query.matches[0];
-	assert!(!clause.optional);
+	let clauses = match_clauses(&query);
+	assert_eq!(clauses.len(), 1);
+	let clause = clauses[0];
 	assert_eq!(clause.patterns.len(), 1);
 
 	let pattern = &clause.patterns[0];
@@ -268,7 +284,7 @@ fn representative_query() {
 #[test]
 fn expression_precedence() {
 	let query = parse("RETURN 1 + 2 * 3, NOT a OR b, x = y AND z IS NOT TRUE");
-	assert!(query.matches.is_empty());
+	assert!(query.items.is_empty());
 	let ReturnItems::Items(items) = &query.ret.items else {
 		panic!("expected return items");
 	};
@@ -351,7 +367,7 @@ fn null_test_and_literals() {
 #[test]
 fn quantified_edge_and_function_call() {
 	let query = parse("MATCH (a)-[:knows]->{1,3}(b) RETURN upper(b.name), count(b)");
-	let step = &query.matches[0].patterns[0].steps[0];
+	let step = &match_clauses(&query)[0].patterns[0].steps[0];
 	assert!(step.edge.var.is_none());
 	assert_eq!(
 		step.edge.quantifier.as_ref().map(|x| x.kind),
@@ -389,13 +405,24 @@ fn optional_match_labels_and_props() {
 		 MATCH (b {name: 'x', age: 30}), (c) \
 		 RETURN DISTINCT *",
 	);
-	assert_eq!(query.matches.len(), 2);
-	assert!(query.matches[0].optional);
-	let node = &query.matches[0].patterns[0].start;
+	assert_eq!(query.items.len(), 2);
+	// The leading item is the plain `OPTIONAL MATCH` form: a block of exactly
+	// one inner MATCH clause.
+	let MatchItem::Optional(block) = &query.items[0] else {
+		panic!("expected an OPTIONAL item, got {:?}", query.items[0]);
+	};
+	assert_eq!(block.items.len(), 1);
+	let MatchItem::Match(optional_clause) = &block.items[0] else {
+		panic!("expected a MATCH clause inside the OPTIONAL block");
+	};
+	let node = &optional_clause.patterns[0].start;
 	assert!(matches!(node.label, Some(LabelExpr::Disjunction(..))));
 	assert!(matches!(node.predicate, Some(ElementPredicate::Where(_))));
-	assert_eq!(query.matches[1].patterns.len(), 2);
-	let Some(ElementPredicate::Props(props)) = &query.matches[1].patterns[0].start.predicate else {
+	let MatchItem::Match(plain_clause) = &query.items[1] else {
+		panic!("expected a plain MATCH item, got {:?}", query.items[1]);
+	};
+	assert_eq!(plain_clause.patterns.len(), 2);
+	let Some(ElementPredicate::Props(props)) = &plain_clause.patterns[0].start.predicate else {
 		panic!("expected a property map");
 	};
 	assert_eq!(props.len(), 2);
@@ -407,12 +434,13 @@ fn optional_match_labels_and_props() {
 #[test]
 fn parameters_and_path_variable() {
 	let query = parse("MATCH p = (a:person) WHERE a.age > $min RETURN a.name SKIP $s LIMIT $l");
-	let pattern = &query.matches[0].patterns[0];
+	let clause = match_clauses(&query)[0];
+	let pattern = &clause.patterns[0];
 	assert_eq!(pattern.path_var.as_ref().map(|x| x.name.as_str()), Some("p"));
 	let Some(GqlExpr::Binary {
 		right,
 		..
-	}) = &query.matches[0].where_clause
+	}) = &clause.where_clause
 	else {
 		panic!("expected a where clause");
 	};
@@ -426,7 +454,7 @@ fn non_reserved_keywords_as_identifiers() {
 	// `node`, `type` and `first` are non-reserved words; `Type` keeps its
 	// original casing.
 	let query = parse("MATCH (node:Type) RETURN node.first AS last");
-	let node = &query.matches[0].patterns[0].start;
+	let node = &match_clauses(&query)[0].patterns[0].start;
 	assert_eq!(node.var.as_ref().map(|x| x.name.as_str()), Some("node"));
 	assert!(matches!(&node.label, Some(LabelExpr::Name(x)) if x.name == "Type"));
 	let ReturnItems::Items(items) = &query.ret.items else {
@@ -439,7 +467,7 @@ fn non_reserved_keywords_as_identifiers() {
 #[test]
 fn edge_directions() {
 	let query = parse("MATCH (a)<-[x]-(b)~[y]~(c)<~[z]~(d)<-(e)<->(f)-(g) RETURN 1");
-	let steps = &query.matches[0].patterns[0].steps;
+	let steps = &match_clauses(&query)[0].patterns[0].steps;
 	let directions: Vec<_> = steps.iter().map(|x| x.edge.direction).collect();
 	assert_eq!(
 		directions,

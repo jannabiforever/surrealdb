@@ -1,17 +1,17 @@
 //! Column naming and reserved-name validation.
 //!
-//! Implements the naming rules of `doc/opengql/LOWERING.md` §2.2 and §5: the
-//! `__` prefix is reserved for the internal binding fields (`__a`, `__m`),
+//! Implements the naming rules of `doc/opengql/V2_DESIGN.md` §8: the `__`
+//! prefix is reserved for the hidden binding names (`__e<n>`, `__v<n>`),
 //! engine-bound parameter names are rejected, and a `RETURN` item is named by
 //! its explicit alias or, failing that, by the verbatim source text of its
-//! expression.
+//! expression. The validations are unchanged from v1.
 
 use crate::opengql::ast::{Ident, ReturnItem};
 use crate::syn::error::{SyntaxError, bail};
 use crate::syn::token::Span;
 
 /// Parameter names which the engine binds itself and which therefore cannot
-/// be supplied as GQL parameters (`doc/opengql/LOWERING.md` §2.2).
+/// be supplied as GQL parameters.
 const RESERVED_PARAMS: &[&str] = &[
 	"this", "self", "parent", "value", "before", "after", "event", "auth", "session", "token",
 	"access",
@@ -58,7 +58,7 @@ pub(super) fn validate_alias(ident: &Ident) -> Result<(), SyntaxError> {
 
 /// Returns the column name of a `RETURN` item and the span it originates
 /// from: an explicit alias wins, unaliased items are named by the verbatim
-/// source text of their expression (`doc/opengql/LOWERING.md` §5).
+/// source text of their expression (`doc/opengql/V2_DESIGN.md` §8).
 pub(super) fn column_name(item: &ReturnItem) -> Result<(String, Span), SyntaxError> {
 	match &item.alias {
 		Some(alias) => {

@@ -1,17 +1,40 @@
-# OpenGQL → SurrealQL AST lowering (v1, read-only)
+# OpenGQL to MatchPlan lowering (v2)
 
-This is the normative design for `surrealdb/core/src/opengql/lower/`. It maps the
-GQL AST (`opengql::ast`) onto the SurrealQL surface AST (`crate::sql`), which the
-engine executes via `Datastore::process` (`sql::Ast → expr::LogicalPlan` is the
-mechanical `From` in `sql/ast.rs`). **No SurrealQL text is ever generated or
-re-parsed** — the lowering constructs `sql::*` values directly; the SurrealQL
-shown below is the `ToSql` rendering of those values, used for snapshot tests and
-human verification.
+This is the normative design for `surrealdb/core/src/opengql/lower/`. The
+lowering turns a parsed GQL AST (`opengql::ast`) into a
+[`MatchPlan`](../../surrealdb/core/src/expr/match_plan.rs) — the
+language-neutral, binding-table IR — wrapped in a `LogicalPlan` as a single
+top-level `Expr::Match`. **No SurrealQL surface AST is generated**: the streaming
+execution planner (`exec/planner/match_plan.rs`) compiles the `MatchPlan`
+directly into physical operators (`exec/operators/` — `graph/`, `join/`, and the
+generic `bind.rs`/`distinct.rs`). The `MatchPlan` never runs under the
+compute-only planner — its `compute()` arm is a hard error.
 
-Every engine behavior this design relies on is pinned by
-`language-tests/tests/opengql/lowering_substrate.surql` (referenced below as
-E1–E8), which passes under all planner strategies (`compute-only`, `all-ro`,
-`best-effort-ro`). If that test ever breaks, this design must be revisited.
+`V2_DESIGN.md` is the **authoritative spec** for the IR, the operators, the
+planner, and the plumbing. This document is narrower: it specifies what the
+*lowering* is responsible for — the semantic analysis, the binding registry, the
+conjunct dependency sets, the 3VL guard insertion, and the output spec — and
+defers everything about *how the plan executes* to `V2_DESIGN.md`. Where this
+document and `V2_DESIGN.md` overlap (the IR shape, the pinned rules R1–R8),
+`V2_DESIGN.md` wins; this file does not restate it.
+
+Two corpora pin the behaviour this design relies on:
+
+- **Engine substrate** — `language-tests/tests/opengql/lowering_substrate.surql`
+  (the E1–E8 pins the §4 guard rules cite, kept for continuity) and
+  `exec_substrate.surql` (the v2 operator-level pins: the 3VL guard trio, the
+  NULL/NONE sort position R7 relies on, RecordId auto-fetch) pin the
+  SurrealQL/engine facts the guard rules and binding-row model depend on, under
+  every planner strategy.
+- **Operator substrate** — the unit tests in `surrealdb/core/src/exec/operators/`
+  (`graph/{expand.rs, endpoint.rs, path_expand.rs, distinct_edges.rs}`,
+  `join/hash_join.rs`, `bind.rs`, `distinct.rs`, `scan/fetch.rs`, with shared
+  fixtures in `test_util.rs`) pin the operator
+  semantics the lowering targets (R2–R6, the join/null rules, the FieldState
+  fetch boundary).
+
+If either corpus changes in a way that contradicts this design, the design must
+be revisited.
 
 ## 1. Model mapping
 
@@ -20,256 +43,298 @@ E1–E8), which passes under all planner strategies (`compute-only`, `all-ro`,
 | node label `(:person)` | table `person` |
 | edge type `[:knows]` | RELATE edge table `knows` (records with `in`/`out` RecordIds) |
 | property | record field |
-| node/edge identity | the record's `id` (returned objects keep `id`, edges keep `in`/`out`) |
+| node/edge identity | the record's `id` (binding rows hold full objects, so edges keep `in`/`out`) |
 | parameter `$x` | SurrealQL param `$x` (arrives via the `vars` argument) |
 
-## 2. The binding model
+## 2. The binding model (lowering's view)
 
-GQL returns **one row per binding** of the pattern variables. The IR facts that
-force the shape (all pinned):
+GQL returns **one row per binding** of the pattern variables. v2 makes this
+literal: a binding row is a `Value::Object` keyed by binding name, and every
+expression the lowering emits is **binding-row scoped** — a variable `v` lowers
+to `Idiom[Field("v")]` and `v.x` to `Idiom[Field("v"), Field("x")]`, in every
+position (predicate, projection, sort key). There is no `$parent`/`$this`/`__m`
+addressing and no scope table: the v1 `Role × ScopeKind` machinery is gone (the
+scope-collapse note in `lower/expr.rs`). `V2_DESIGN.md` §3 specifies what each
+binding-kind's value *is* at runtime (full record object, edge id, edge-group
+array, alternating path array, or `Value::Null` on an optional miss); the
+lowering only needs to know that group and path bindings hold composite values
+with no addressable field structure, so property access on them is rejected.
 
-- A graph `Lookup` with an inline projection (`->(SELECT * FROM knows WHERE …)`)
-  yields an **array of full edge objects**, with the lookup `cond` filtering
-  per-edge (E1).
-- `SPLIT` unnests one array field into rows, but an **empty array passes the row
-  through** under the streaming engine, and splitting two correlated fields
-  produces a cross product — so: exactly **one split field per hop**, and an
-  explicit `WHERE __m != []` guard for inner-join semantics (E2).
-- Within one SELECT, WHERE runs **before** SPLIT, and the legacy engine splits on
-  *output* docs — so the unnest needs its own `SELECT *` layer, and per-binding
-  predicates need a third, outer layer.
-- `$parent` inside a lookup `cond` refers to the enclosing row (E4); `$this` is
-  the current row (E1).
-- The far node is **derived from the edge** (`__m.out` / `__m.in`); RecordId
-  field access auto-fetches (`__m.out.name`), and `.*` fetches the full record
-  (`__m.out.*`) (E3). This makes (edge, node) pairing structural — nothing to
-  join.
+The lowering does **not** decide joins, anchors, conjunct placement, or operator
+selection — those are the planner's (`V2_DESIGN.md` §1, §6). The lowering
+*declares* the structure the planner consumes: which bindings exist and of what
+kind, which clause/pattern each element belongs to, which bindings each
+predicate reads (its `deps`), and the final output spec.
 
-### 2.1 Shapes
+## 3. The lowering's responsibilities
 
-**No edge step** — `MATCH (n:person) …` collapses to a single SELECT
-(no L2/L3): `n` → `$this`, `n.x` → `x`.
+The lowering is the **semantic analysis** front of the IR contract
+(`V2_DESIGN.md` §1: "Lowering owns semantics"). It runs over a `reblessive`
+stack because the parser builds arbitrarily deep linear expression chains. Its
+responsibilities, by module:
 
-**One edge step** — `MATCH (a:person)-[k:knows]->(b:person) WHERE … RETURN …`
-lowers to three nested SELECTs:
+### 3.1 Binding registry — `lower/binding.rs`
 
-```sql
--- L1 "bind": one row per anchor; __m = matching edges as full edge objects
-SELECT $this AS __a,
-       ->(SELECT * FROM knows WHERE record::tb(out) = 'person' AND <edge-scope preds>) AS __m
-FROM person WHERE <anchor-scope preds>
--- L2 "unnest": one row per (anchor, edge); guard enforces inner-join in BOTH engines
-SELECT * FROM (L1) WHERE __m != [] SPLIT __m
--- L3 "return": residual predicates, projection, DISTINCT, ORDER, SKIP, LIMIT
-SELECT <projections> FROM (L2) [WHERE <residual>] [GROUP BY <aliases>]
-       [ORDER BY …] [LIMIT l] [START s]
-```
+A single pass over the whole `MatchItem` tree (plain `MATCH` clauses and the
+`OPTIONAL` operands that nest them) in textual order, building the binding
+registry that becomes `MatchPlan::bindings`:
 
-- Direction `->` = `Lookup{kind: Graph(Dir::Out)}`, far end `out`;
-  `<-` = `Graph(Dir::In)`, far end `in`.
-- The b-side label filter is `record::tb(out) = '<label>'` (resp. `in`); omit it
-  when the non-anchor node has no label.
-- The anchor is the **leftmost node** and must be labeled (its table is the
-  `FROM`). Otherwise reject.
-- L2 must project `*` (legacy splits output docs) and must carry the
-  `__m != []` guard (streaming passes empty arrays through).
-- Multi-hop (>1 step) is rejected in v1; the scaffold extends with one
-  `__m<i>` + split layer per hop.
+- **Declaration vs reuse.** Each user-named pattern variable is declared once,
+  at first occurrence, with a `BindingKind` (`Node` / `Edge` / `EdgeGroup` under
+  a quantifier / `Path`). Anonymous elements get a hidden `__v<n>` (node) or
+  `__e<n>` (edge) binding so every element is addressable and DIFFERENT-EDGES can
+  read anonymous edge ids.
+- **Node-variable reuse is the join key.** A node variable reused *across*
+  patterns/clauses resolves to the **same** `BindingId` — the shared binding the
+  planner equi-joins on (R1). The lowering declares the shared id; it never
+  builds the join.
+- **Within-pattern node repeat is a self-loop.** A node variable reused *within
+  one pattern* (`(a)-[…]->(a)`) cannot share the id — there is no join in a
+  single chain to materialise the equality, and a shared id would let the second
+  occurrence overwrite the first on the binding row. It is rewritten to a fresh
+  hidden node binding plus an `id`-equality conjunct (recorded as
+  `node_equalities` and emitted by `pattern.rs`), per the `V2_DESIGN.md` §2 IR
+  invariant.
+- **`optional_depth`.** Each binding records the `OPTIONAL` nesting depth it was
+  first declared at (`0` = mandatory). This is the single fact the 3VL guard
+  amendment (§4) consults.
+- **Anchorability** (R2/`V2_DESIGN.md` §0) is validated per pattern, against the
+  bindings present *before* the pattern: every pattern needs ≥1 labelled element
+  or ≥1 variable already bound earlier. A pattern that is anchorable in the
+  abstract but lies outside the shapes the planner physically realises is also
+  rejected here (the `pattern_is_realisable` check mirrors the planner's anchor
+  selection exactly, so a cleanly-lowered plan never hits a planner internal
+  error — `V2_DESIGN.md` §6 contract).
 
-### 2.2 Variable addressing
+### 3.2 Clauses, patterns, conjuncts — `lower/pattern.rs`
 
-Post-split scope (L3 projections, residual predicates, ORDER BY):
+Per flattened clause: build a `PatternPlan` for each comma-separated pattern
+(node/edge steps with the full multi-hop chain intact, edge directions and
+quantifiers validated per R6, labels resolved to `TableName`), then collect and
+lower the clause's predicates into a flat list of `MatchPredicate`s:
 
-| GQL | idiom |
-|---|---|
-| `a` | `__a` |
-| `a.x` | `__a.x` |
-| `k` | `__m` |
-| `k.x` | `__m.x` |
-| `b` | `__m.out.*` (or `__m.in.*` for `<-`) |
-| `b.x` | `__m.out.x` |
+- **Predicate sources, in contract order:** the explicit clause `WHERE`, then the
+  inline element `WHERE`s of every pattern, then the property-map equalities
+  (`{city: 'London'}` ≡ `<element>.city = 'London'`), element by element.
+- **NNF conjunct split.** Each source is split into top-level conjuncts, pushing
+  `NOT` through `AND`/`OR` (De Morgan) so conjuncts hidden under negation are
+  classified independently; ORs are never distributed. The user's boolean spine
+  is otherwise preserved.
+- **Dependency sets.** Each conjunct records `deps`: the exact, sorted, deduped
+  set of `BindingId`s its variable references resolve to. The planner places each
+  conjunct at the earliest stage of its owning clause where `deps ⊆ bound`
+  (`V2_DESIGN.md` §6); the lowering only computes the set.
+- **Clause ownership (R3).** A conjunct lives on the clause whose pattern scope
+  introduces its bindings. For an `OPTIONAL` clause this is structural: a
+  predicate written inside the optional attaches to that clause and so compiles
+  inside the optional's own subplan (pre-null), while a later clause's predicate
+  that merely references an optional binding is owned by that later clause
+  (post-null). This is the placement that makes R3's pre-/post-null distinction
+  fall out of the plan shape rather than needing a runtime flag.
+- **Quantified-edge predicate rule (R6).** A conjunct referencing a quantified
+  edge group together with any other binding is rejected — the per-path traversal
+  has no place to evaluate a cross-variable constraint.
 
-Edge scope (predicates pushed into the L1 lookup `cond`):
+### 3.3 Expression lowering & guards — `lower/expr.rs`
 
-| GQL | idiom |
-|---|---|
-| `k.x` | `x` |
-| `b.x` | `out.x` (resp. `in.x`) |
-| `a.x` | `$parent.x` |
+Lowers each GQL expression with uniform binding addressing (§2) and the
+three-valued-logic guards (§4). Value position (projections, sort keys,
+comparison operands) lowers two-valued; predicate position (`WHERE`) lowers
+three-valued with the guards. Expressions are still built as `crate::sql::Expr`
+and converted to `crate::expr::Expr` per slot by the caller — the guard and NNF
+machinery is unchanged from v1; only the variable-addressing leaf differs.
 
-Anchor scope (L1 `cond`): `a.x` → `x`.
+### 3.4 Output spec — `lower/mod.rs`
 
-Internal binding fields use the reserved `__` prefix; GQL variables, aliases and
-parameters starting with `__` are rejected. Parameters named
-`this, self, parent, value, before, after, event, auth, session, token, access`
-are rejected (engine-reserved).
-
-## 3. Predicate placement
-
-1. Merge: explicit pattern WHERE ∧ node/edge inline WHEREs ∧ property-map
-   equalities (a property map `{city: 'London'}` is sugar for `n.city = 'London'`
-   conjuncts attached to its element).
-2. Normalize to **negation normal form** (push NOT through AND/OR and into
-   comparisons; needed for the 3VL guards below). Never distribute ORs.
-3. Split top-level ANDs into conjuncts and classify each by the variables it
-   references:
-   - **⊆ {anchor} (or none)** → L1 `cond` (anchor scope rewrite).
-   - **references k or b** (incl. mixed with a), with every non-anchor
-     reference a property access → the lookup `cond` (edge-scope rewrite with
-     `$parent`). This is correct, not just an optimization: all of {a,k,b}
-     are visible there.
-   - **fallback** (not expressible in edge scope: a *bare* `k`/`b` reference
-     — the lookup scope cannot address the full record — or any non-anchor
-     reference on a variable-length hop) → L3 `cond` (post-split rewrite).
-     Always semantically valid, just scans more.
-4. The L2 `__m != []` guard is structural, independent of user predicates.
-
-Conjunct folding preserves the user's boolean spine: an n-conjunct chain
-lowers to an n-deep `sql::Expr` AND spine, the same shape syn-parsed
-SurrealQL produces for the equivalent WHERE. Operator-spine depth is bounded
-at parse on both front-ends by `CommonConfig::max_expression_parsing_depth`
-(default 128): syn's `ParserSettings::expr_recursion_limit` and the
-mirroring `GqlParserSettings::expr_recursion_limit` charge a shared budget
-per nesting level *and* per operator appended to a flat spine, so the
-recursive walks downstream (drop, `ToSql`, the `sql::Ast →
-expr::LogicalPlan` conversion) stay well within the machine stack. The §4
-guard expansion multiplies a comparison leaf into at most five conjuncts —
-a bounded constant factor (≤ ~640 lowered levels at the default limit,
-~20× under the observed overflow threshold, and covered by the deep-chain
-lowering tests).
+Builds `MatchOutput` per R7/R8 (§5): the projected columns (with final names,
+duplicates rejected, `RETURN *` pre-expanded), the `DISTINCT` flag, the resolved
+`ORDER BY` keys, and the `SKIP`/`LIMIT` counts. Also enforces the top-level
+structural rejections: an empty query (no `MATCH`), and a query that **leads**
+with `OPTIONAL` (R3 — an `OPTIONAL` is a left-outer join and needs a preceding
+mandatory clause to join against).
 
 ## 4. Three-valued logic (the guard rules)
 
+*(Kept from the v1 contract — verified against `lower/expr.rs` — with the
+optional-nullability amendment of `V2_DESIGN.md` §8.)*
+
 SurrealQL comparisons are two-valued over a total order (`NONE`/`NULL` sort below
 numbers; `NULL = NULL` is true — E8c), while GQL comparisons with null are
-UNKNOWN and WHERE keeps only TRUE. After NNF, lower each leaf:
+UNKNOWN and `WHERE` keeps only TRUE. After NNF (the operator is complemented
+first when a `NOT` was pushed in, so the guard applies to the *effective*
+comparison), each leaf lowers as follows. The guard for a set of nullable atoms
+is, per atom, the conjunct pair `atom != NONE AND atom != NULL` (built by
+`guard_conjuncts`, in that order), AND-ed in front of the comparison.
 
-- Ordering comparison `x OP y` (`<` `<=` `>` `>=`):
-  `x != NONE AND x != NULL AND y != NONE AND y != NULL AND (x OP y)` —
-  guarding only operands that can be null/missing (property accesses, params;
-  never literals). Pinned by E8a/E8b.
-- Equality `=`: guard only when **both** sides are nullable (covers the
-  `NULL = NULL → true` delta); `x = <literal>` needs no guard.
-- Inequality `<>`: guard when **either** side is nullable — `NULL != 'A'` is
+- **Ordering comparison** `x OP y` (`<` `<=` `>` `>=`): guard **every** nullable
+  operand — `x != NONE AND x != NULL AND y != NONE AND y != NULL AND (x OP y)`,
+  guarding only operands that can be null/missing (property accesses, params,
+  optional-bound bare variables; never literals). Pinned by E8a/E8b.
+- **Equality** `=`: guard only when **both** sides are nullable (this covers the
+  `NULL = NULL → true` delta — E8c); `x = <literal>` needs no guard.
+- **Inequality** `<>`: guard when **either** side is nullable — `NULL != 'A'` is
   true in SurrealQL but UNKNOWN (excluded) in GQL, so a one-sided null must
   exclude the row.
-- These guards apply **in every scope, including lookup conds** — E4 pins the
-  hazard (`out.age < $parent.age` with a missing `out.age` is TRUE unguarded).
-- `NOT b.flag` (bare nullable boolean) → `b.flag = false`
-  (UNKNOWN→excluded, FALSE→kept — matches GQL in WHERE position).
-- `x IS NULL` → `(x = NULL OR x = NONE)`; `IS NOT NULL` → negation. GQL cannot
-  observe SurrealDB's NONE-vs-NULL distinction in v1 (document in user docs).
-- `x IS TRUE|FALSE|UNKNOWN [NOT]` → equality against `true`/`false`, with
-  `IS UNKNOWN` → `(x = NULL OR x = NONE)`; `IS NOT …` negates the whole test.
-- `XOR`: lower as boolean inequality of guarded operands, or reject in v1 if not
-  cleanly expressible — implementer's choice, but the choice must be a snapshot
-  test either way.
+- Guards apply **in every position** (a binding-row predicate has no scope
+  distinction in v2; the v1 "applies in lookup conds too" hazard is subsumed).
+- **Bare nullable boolean / fallthrough predicate** `b.flag` → `b.flag = true`;
+  `NOT b.flag` → `b.flag = false` (UNKNOWN→excluded, FALSE→kept — matches GQL in
+  `WHERE` position). Implemented as an equality against an explicit boolean for
+  any predicate-position expression that is not a recognised comparison/test.
+- `x IS NULL` → `(x = NULL OR x = NONE)`; `IS NOT NULL` → `(x != NULL AND x !=
+  NONE)`. GQL cannot observe SurrealDB's NONE-vs-NULL distinction (document in
+  user docs).
+- `x IS TRUE|FALSE [NOT]` → equality against `true`/`false`; `x IS UNKNOWN` →
+  the same null test as `IS NULL`; `IS NOT …` negates the whole test.
+- `XOR`: **rejected** (no exactly-equivalent three-valued lowering) —
+  *"`XOR` is not supported yet"*.
 
-## 5. RETURN, DISTINCT, ORDER, SKIP, LIMIT
+### 4.1 The optional-nullability amendment (R3)
 
-- Projection: `sql` `Fields::Select` with one `Field::Single` per item; **always
-  emit an explicit alias**, as a **single** `Part::Field` whose name may contain
-  dots (E5/E6 pin dotted aliases working in ORDER/GROUP BY). Explicit `AS x`
-  wins; unaliased items use the **verbatim source text** of the expression
-  (`ReturnItem.text`) as the column name.
-- Duplicate column names → reject ("duplicate column name; use AS").
-- `RETURN *` → all named pattern variables, alphabetical order, each as a column
-  named by the variable.
-- `RETURN DISTINCT` → `GROUP BY` all projected aliases in L3 (E6).
-- ORDER BY: `Order { value: <alias idiom>, direction }` when the sort key
-  matches a RETURN item — by dotted name or by lowering to the same expression
-  (alias resolution is engine-side). Any other sort key is **rejected**: the
-  legacy engine sorts the projected output rows (a non-column key silently
-  no-op sorts) while the streaming engine resolves source fields, so only
-  column-matching keys behave identically under every planner strategy — the
-  same invariant `syn` enforces for plain SELECTs ("Missing order idiom").
-  `NULLS FIRST|LAST` → reject in v1 (no engine mapping).
-- `SKIP`/`OFFSET` → `START`; `LIMIT` → `LIMIT`; both accept integer literals or
-  `$param`.
-- List literals `[…]` and record literals `{…}` lower to SurrealQL
-  array/object literals, in any value position (e.g.
-  `RETURN [n.age, 1] AS lst, {a: n.age} AS mp`).
-- Aggregates in RETURN (`count`, `sum`, …) → reject in v1 ("aggregates not
-  supported yet"). `FunctionCall.star`/`quantifier` (e.g. `count(*)`,
-  `count(DISTINCT x)`) get the same targeted rejection.
-- Function whitelist v1: empty (every function call is rejected with "function
-  X is not supported yet") — extending it is a deliberate, tested act.
+The one v2 change to the guard machinery. A **bare** variable reference `v` is
+nullable iff `v` is optional-bound — declared inside an `OPTIONAL` operand
+(`optional_depth(v) > 0`). On an optional miss its whole binding is
+`Value::Null` (R3), so a comparison reading it must exclude the pre-null row,
+exactly as a property access or param would. A **mandatory** bare variable is
+never nullable (its binding is always a full record). Concretely, `nullable()`
+and `nullable_atoms()` in `lower/expr.rs` treat `Variable(v)` as a guard atom
+exactly when `Scope::variable_is_optional(v)` is true. Property accesses and
+params remain unconditionally nullable as in v1.
 
-## 6. Variable-length edges
+## 5. Naming, RETURN, DISTINCT, ORDER, SKIP, LIMIT
 
-`-[:knows]->{1,3}` (single edge step, **no edge variable, no edge predicate,
-min = 1**) lowers to a recursion idiom bound as the hop field:
+*(The naming rules are kept from the v1 contract — `lower/naming.rs` is reused
+verbatim.)*
 
-```sql
-SELECT $this AS __a, id.{1..3+collect}(->knows->person) AS __m FROM person
+- **Column names.** Each projected item gets a final name (the row-object key):
+  explicit `AS x` wins; an unaliased item is named by the **verbatim source
+  text** of its expression. Duplicate column names are rejected (*"Duplicate
+  column name `{name}`"*).
+- **`RETURN *`** (R8) expands to all **user-named** bindings — including group
+  and path variables — in **alphabetical** order, each column named by the
+  variable and carrying the whole binding value. An empty expansion is rejected
+  (*"RETURN * requires at least one named pattern variable"*).
+- **Reserved names.** GQL variables, aliases and parameters beginning with `__`
+  are rejected (the reserved prefix), as are parameters with engine-reserved
+  names (`this`, `parent`, `value`, …) — `lower/naming.rs::validate_param_name`.
+- **`DISTINCT`** sets `MatchOutput::distinct`; the planner builds the
+  `Project → Distinct → Sort → Limit` tail (`V2_DESIGN.md` §6). `ALL` is the
+  default no-dedup quantifier.
+- **`ORDER BY`** (R7): **without** `DISTINCT`, a sort key is a full binding-row
+  expression evaluated pre-projection over **all** bindings — so a key naming a
+  RETURN column resolves to that column's *underlying binding-row expression*
+  (Sort runs before Project), and any other key lowers directly. **With**
+  `DISTINCT`, the key must name a returned column (by dotted name, or by lowering
+  to the same expression as one) and the sort references it by name (Sort runs
+  post-Project in the DISTINCT tail); any other key is rejected (*"With RETURN
+  DISTINCT, ORDER BY may only reference returned columns"*). `NULLS FIRST|LAST`
+  is rejected.
+- **`SKIP`/`OFFSET`** and **`LIMIT`** lower to `MatchOutput::skip`/`limit` and
+  accept an unsigned integer literal or a `$param`.
+- **List/record literals** lower to SurrealQL array/object literals in any value
+  position.
+- **Functions and aggregates** are rejected: the v2 function whitelist is empty
+  (*"The function `{}` is not supported yet"*), with a dedicated message for
+  aggregates and `count(*)`/`count(DISTINCT …)` forms (*"Aggregate functions are
+  not supported yet"*).
+
+## 6. Quantifiers (R6)
+
+A quantified edge binds a **group variable** (`BindingKind::EdgeGroup`, R4); the
+chain's far node and the optional path variable are declared as usual. The full
+quantifier set is legal — `*` ≡ `{0,}`, `+` ≡ `{1,}`, `?` ≡ `{0,1}`, `{n}`,
+`{n,m}`, `{n,}`, `{,m}`, `{,}` — and the lowering normalises each to a
+`{min, max: Option<u32>}` `EdgeQuantifier`. The **only** lowering rejection is
+`max < min` (*"The quantifier maximum must not be smaller than its minimum"*).
+The per-path semantics, the `min == 0` zero-length emission, and the
+unbounded-form termination via edge-uniqueness-within-path are all the
+`PathExpand` operator's job (`V2_DESIGN.md` §5, pinned by `path_expand.rs`); the
+lowering only emits the bounds. An inline predicate on a quantified edge is
+edge-only (§3.2). Property access on the group variable is rejected (§2).
+
+> This is the v2 generalisation of the v1 restriction (`min == 1`,
+> distinct-reachable). See `REFERENCE.md` §(h) for the cardinality change a user
+> upgrading from the v1 draft will observe.
+
+## 7. Rejection ledger
+
+The lowering's rejections, grouped by where they live. Messages are quoted so
+they are searchable; the authoritative source is the `bail!`/`syntax_error!`
+sites in `lower/{binding,pattern,expr,naming,mod}.rs`.
+
+**Pattern/binding rejections** (`binding.rs`, `pattern.rs`):
+
+- non-anchorable pattern — *"Cannot choose a starting table for this pattern:
+  label at least one node or reuse a variable bound by an earlier pattern"*;
+- anchorable-but-not-realisable shape — *"This MATCH pattern shape is not
+  supported yet"*;
+- repeated edge/group variable — *"Edge variable `{}` cannot be repeated"* (R2:
+  an edge cannot bind twice, so the join is always empty);
+- repeated path variable — *"Path variable `{}` is declared more than once"*;
+- kind-mismatched reuse — *"Variable `{}` is already bound as {} but reused as
+  {}"*;
+- optional-rebind — *"Variable `{}` was first bound inside an OPTIONAL and cannot
+  be re-declared outside it"*;
+- undirected / multi-directional edges — *"Undirected and multi-directional edge
+  patterns are not supported yet"*;
+- label expressions — *"Label expressions (`!`, `&`, `|`, `%`) are not supported
+  yet"*;
+- quantifier `max < min` — *"The quantifier maximum must not be smaller than its
+  minimum"*;
+- cross-variable quantified-edge predicate — *"A predicate inside a quantified
+  edge may only reference that edge"*.
+
+**Expression rejections** (`expr.rs`):
+
+- property access on a group/path variable — *"Property access on a group or path
+  variable is not supported yet"*;
+- `XOR` — *"`XOR` is not supported yet"*;
+- aggregates — *"Aggregate functions are not supported yet"*; any other function
+  — *"The function `{}` is not supported yet"*.
+
+**Output / structural rejections** (`mod.rs`):
+
+- empty query — *"A query without a MATCH clause is not supported yet"*;
+- leading `OPTIONAL` — *"A query cannot start with OPTIONAL MATCH: OPTIONAL is a
+  left-outer join and needs a preceding MATCH to join against"*;
+- `NULLS FIRST|LAST` — *"`NULLS FIRST`/`NULLS LAST` ordering is not supported
+  yet"*;
+- DISTINCT ORDER scope — *"With RETURN DISTINCT, ORDER BY may only reference
+  returned columns"*;
+- duplicate column — *"Duplicate column name `{}`"*; empty `RETURN *` — *"RETURN
+  \* requires at least one named pattern variable"*.
+
+Five of these are **new in v2** (they guard constructs v1 rejected wholesale):
+repeated edge variable, kind-mismatched reuse, optional-rebind,
+cross-variable quantified-edge predicate, and property-access-on-group/path-var.
+The DISTINCT-ORDER message changed from v1's *"ORDER BY may only reference RETURN
+items"*. Fourteen former v1 rejections became features — see `REFERENCE.md` §(h)
+for the full table with v1's quoted error texts.
+
+## 8. Worked example
+
+`MATCH (a:person)-[k:knows]->(b:person) WHERE k.since > 2020 RETURN a.name AS a_name, b.name AS b_name`
+lowers to a `MatchPlan` with three bindings (`a:Node`, `k:Edge`, `b:Node`), one
+mandatory clause with one pattern (`a -[k]-> b`) and one predicate (deps `[k]`),
+and two output columns. The predicate's guard expansion (§4, ordering
+comparison, `k.since` nullable) makes the lowered expression
+`k.since != NONE AND k.since != NULL AND k.since > 2020`. The deterministic
+`MatchPlan` renderer (`expr/match_plan.rs::impl ToSql`) reproduces this query as
+
+```
+MATCH (a:person)-[k:knows]->(b:person) WHERE k.since != NONE AND k.since != NULL AND k.since > 2020 RETURN a.name AS a_name, b.name AS b_name
 ```
 
-i.e. `Part::Recurse(Recurse::Range(Some(1), Some(3)), Some(idiom![->knows->person]),
-Some(RecurseInstruction::Collect{inclusive: false}))` (E7). The elements of `__m`
-are RecordIds, so `b` → `__m.*` and `b.x` → `__m.x` in post-split scope.
-`{1}` → `Recurse::Fixed(1)`.
+— the rendering used by EXPLAIN and the snapshot tests, with predicate slots
+delegating to `Expr`'s `ToSql` so the guard shapes stay diffable. The
+corresponding *plan tree* (anchor `Bind`, `Expand` with the predicate pushed
+onto it, `Project`) is pinned in `V2_DESIGN.md` §6 (i). Further worked plan trees
+for joins, OPTIONAL and quantified paths are in `V2_DESIGN.md` §6 (ii)–(iv).
 
-**Documented deviation**: `Collect` deduplicates, so v1 semantics are "distinct
-reachable nodes", not GQL's one-row-per-path. `*`/`+`/`{0,m}`/`?`, quantifiers
-with an edge variable or predicate, and quantified groups are rejected.
+## 9. Result shape caveat (document, don't fight)
 
-**Minimum exactly one**: quantifiers with min ≥ 2 (`{2}`, `{2,4}`) are
-rejected ("not supported yet"). The streaming engine's collect BFS inserts a
-node into its dedup set at first discovery *before* the min-depth collect
-check, so a node first reached below the minimum is never emitted even when
-it is also reachable within [min, max] — and the legacy engine disagrees, so
-the behavior diverges across planner strategies and cannot be pinned by a
-substrate test. Lift the restriction only once that engine issue is fixed
-and the behavior is pinned. With min = 1 the only depth-0 discovery is the
-anchor itself, which `Collect{inclusive: false}` does not seed into the
-dedup set, so nothing can be dropped.
-
-## 7. Rejection list (lowering errors; parse already rejected its own share)
-
-Each produces a `SyntaxError` with the construct's span and a "not supported
-yet"-style actionable message:
-
-multiple MATCH clauses · `OPTIONAL MATCH` · comma-separated patterns ·
-path variables `p =` · >1 edge step · undirected/mixed edge directions (only
-`Left`/`Right` lower; `Undirected`, `LeftOrUndirected`, `UndirectedOrRight`,
-`LeftOrRight`, `Any` reject) · label expressions beyond a single `Name` (`!`,
-`&`, `|`, `%`) on nodes or edges · unlabeled anchor node · quantifier violations
-(§6) · aggregates / any function call (§5) · `NULLS FIRST|LAST` · ORDER BY
-expressions not matching a RETURN item (§5) · duplicate columns · `__`-prefixed
-variables/aliases/params · engine-reserved param names · `XOR` (if the
-implementer takes the reject option) · `UNKNOWN` literal in a non-boolean-test
-position if not cleanly lowerable (`GqlLiteral` has no Unknown — truth-tests
-carry it; nothing to do unless the parser surfaces it elsewhere).
-
-## 8. Worked examples (snapshot-test anchors)
-
-ToSql rendering may differ in whitespace/parens — assert against actual
-`to_sql()` output once verified equivalent.
-
-1. `MATCH (n:person) RETURN n`
-   → `SELECT $this AS n FROM person`
-2. `MATCH (n:person) WHERE n.age > 18 RETURN n.name AS name ORDER BY name SKIP 5 LIMIT 10`
-   → `SELECT name AS name FROM person WHERE age != NONE AND age != NULL AND age > 18 ORDER BY name LIMIT 10 START 5`
-3. `MATCH (a:person)-[:knows]->(b:person) RETURN a.name, b.name`
-   → ```SELECT `a.name` (= __a.name), `b.name` (= __m.out.name) FROM (SELECT * FROM (SELECT $this AS __a, ->(SELECT * FROM knows WHERE record::tb(out) = 'person') AS __m FROM person) WHERE __m != [] SPLIT __m)```
-4. `MATCH (a:person)-[k:knows]->(b:person) WHERE k.since > 2020 RETURN a, k, b`
-   → L1 lookup cond: `(since != NONE AND since != NULL AND since > 2020) AND record::tb(out) = 'person'`; L3: `SELECT __a AS a, __m AS k, __m.out.* AS b FROM (…)`
-5. `MATCH (n:person {city: 'London'}) RETURN n`
-   → `SELECT $this AS n FROM person WHERE city = 'London'` (equality vs non-null literal: no guard)
-6. `MATCH (a:person)-[:knows]->{1,3}(b:person) RETURN b`
-   → §6 recursion shape, L3 `SELECT __m.* AS b FROM (…)`
-7. `MATCH (a:person)-[k:knows]->(b:person) RETURN DISTINCT b.name`
-   → L3 `SELECT __m.out.name AS ⟨b.name⟩ FROM (…) GROUP BY ⟨b.name⟩`
-
-## 9. Unused clause fields
-
-Fill `sql::SelectStatement` fields not driven by the GQL query with the same
-defaults the SurrealQL parser produces for an equivalent plain SELECT (check
-`syn`'s SELECT statement parser and the GraphQL precedent `gql/tables.rs` —
-expr-layer analog). Snapshot tests make any mistake visible immediately.
-
-## 10. Result shape caveat (document, don't fight)
-
-Rows are `Value::Object` keyed by column name; SurrealDB objects are key-ordered,
-so the RETURN-list column order is not preserved in the value. The GQL AST keeps
-the ordered column list (`ReturnClause.items`) for a future row-set wire format.
+Binding rows are `Value::Object` keyed by column name; SurrealDB objects are
+key-ordered, so the `RETURN`-list column order is not preserved in the value
+itself. The GQL AST keeps the ordered column list (`ReturnClause.items`) and the
+`MatchOutput::columns` order is preserved in the IR for a future row-set wire
+format, but a client reading the result object must not rely on column order.

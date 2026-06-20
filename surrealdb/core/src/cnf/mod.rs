@@ -230,6 +230,31 @@ pub struct CommonConfig {
 	/// Whether eligible `ORDER BY … LIMIT` table scans may skip record decode
 	/// for rows that cannot beat the current top-K threshold (default: true)
 	pub topk_threshold_pushdown_enabled: bool,
+	/// Maximum number of build-side rows a GQL `MATCH` hash join (and the
+	/// whole-row `Distinct` dedup that rides the same budget) may hold in memory
+	/// before failing the query (default: 1,000,000). Bounds the in-memory
+	/// build/seen set for OpenGQL v2 binding-table execution; spill to disk is a
+	/// future change (matching the `Aggregate` stance). Errors that trip this
+	/// guard name the env knob (`SURREAL_GQL_MAX_JOIN_BUILD_ROWS`).
+	pub gql_max_join_build_rows: usize,
+	/// Maximum number of paths a single GQL `MATCH` `PathExpand` (variable-length
+	/// / quantified edge traversal) may have live on its DFS stack plus already
+	/// emitted, per source row, before failing the query (default: 1,000,000).
+	/// Bounds the worst-case path explosion of a quantified pattern over a dense
+	/// or cyclic graph; edge-uniqueness-within-path guarantees termination but the
+	/// number of distinct paths can still be very large. Errors that trip this
+	/// guard name the env knob (`SURREAL_GQL_MAX_PATH_ROWS`).
+	pub gql_max_path_rows: usize,
+	/// Maximum number of rows a single GQL `MATCH` fan-out operator (`HashJoin` —
+	/// including the `Cross` cartesian product — and single-hop `Expand`) may
+	/// emit, cumulatively across all batches, before failing the query (default:
+	/// 1,000,000). Unlike `gql_max_join_build_rows` (which bounds the in-memory
+	/// build/seen set), this bounds the *output* product: a cross join of a
+	/// bounded build side against a streaming probe side, or a high-fan-out
+	/// expand, can emit unboundedly many rows while holding only a small build
+	/// set. Errors that trip this guard name the env knob
+	/// (`SURREAL_GQL_MAX_OUTPUT_ROWS`).
+	pub gql_max_output_rows: usize,
 	/// The maximum stack size of the JavaScript function runtime (default: 256 KiB)
 	pub scripting_max_stack_size: usize,
 	/// The maximum memory limit of the JavaScript function runtime (default: 2 MiB)
@@ -329,6 +354,9 @@ impl Default for CommonConfig {
 			scan_batch_size: crate::exec::operators::scan::common::DEFAULT_SCAN_BATCH_SIZE,
 			max_order_limit_priority_queue_size: 1000,
 			topk_threshold_pushdown_enabled: true,
+			gql_max_join_build_rows: 1_000_000,
+			gql_max_path_rows: 1_000_000,
+			gql_max_output_rows: 1_000_000,
 			scripting_max_stack_size: 256 * 1024,
 			scripting_max_memory_limit: 2 << 20,
 			scripting_max_time_limit: Duration::from_secs(5),
@@ -383,6 +411,9 @@ impl Config for CommonConfig {
 			&mut self.max_order_limit_priority_queue_size,
 		)
 		.parse_key("topk_threshold_pushdown_enabled", &mut self.topk_threshold_pushdown_enabled)
+		.parse_key("gql_max_join_build_rows", &mut self.gql_max_join_build_rows)
+		.parse_key("gql_max_path_rows", &mut self.gql_max_path_rows)
+		.parse_key("gql_max_output_rows", &mut self.gql_max_output_rows)
 		.parse_key("scripting_max_stack_size", &mut self.scripting_max_stack_size)
 		.parse_key("scripting_max_memory_limit", &mut self.scripting_max_memory_limit)
 		.parse_key_with("scripting_max_time_limit", &mut self.scripting_max_time_limit, |x| {
@@ -525,6 +556,12 @@ pub static REGEX_CACHE_SIZE: LazyLock<usize> =
 pub static SURREALISM_MAX_POOL_SIZE: LazyLock<usize> =
 	lazy_env_parse!("SURREAL_SURREALISM_MAX_POOL_SIZE", usize, 8);
 
+// The OpenGQL v2 MATCH resource limits (`gql_max_join_build_rows`,
+// `gql_max_path_rows`, `gql_max_output_rows`) live on `CommonConfig` above, not
+// as global statics: every operator that reads them already has the execution
+// `CommonConfig` in hand (`ctx.root().ctx.config`), so they are per-datastore
+// and settable programmatically (not only via `SURREAL_GQL_*` env vars).
+
 /// Number of worker threads in the shared KVS blocking threadpool
 /// (`surrealdb-threadpool`) used by the `kv-mem`, `kv-rocksdb`, and
 /// `kv-surrealkv` storage backends to run synchronous storage work off the
@@ -599,6 +636,27 @@ mod tests {
 		let map = ConfigMap::empty().with_key_value("topk_threshold_pushdown_enabled", "false");
 		config.parse(&map);
 		assert!(!config.topk_threshold_pushdown_enabled, "config map disables the feature");
+	}
+
+	/// The OpenGQL v2 MATCH resource limits live on `CommonConfig` (not as global
+	/// statics): they default to 1M and parse from the config map under the same
+	/// keys `ConfigMap::from_env` derives from `SURREAL_GQL_MAX_*`, so the env
+	/// vars keep working and embedded callers can set them programmatically.
+	#[test]
+	fn gql_match_limits_parse_from_config_map() {
+		let mut config = CommonConfig::default();
+		assert_eq!(config.gql_max_join_build_rows, 1_000_000);
+		assert_eq!(config.gql_max_path_rows, 1_000_000);
+		assert_eq!(config.gql_max_output_rows, 1_000_000);
+
+		let map = ConfigMap::empty()
+			.with_key_value("gql_max_join_build_rows", "5")
+			.with_key_value("gql_max_path_rows", "7")
+			.with_key_value("gql_max_output_rows", "9");
+		config.parse(&map);
+		assert_eq!(config.gql_max_join_build_rows, 5);
+		assert_eq!(config.gql_max_path_rows, 7);
+		assert_eq!(config.gql_max_output_rows, 9);
 	}
 
 	/// `SURREAL_MEMORY_THRESHOLD` must accept human-readable byte suffixes

@@ -1,17 +1,21 @@
-//! Lowering of the GQL AST onto the SurrealQL surface AST.
+//! Lowering of the GQL AST onto the declarative [`MatchPlan`] IR.
 //!
-//! Implements the normative design in `doc/opengql/LOWERING.md`: a parsed
-//! [`GqlQuery`] is mapped directly onto [`crate::sql`] values — no SurrealQL
-//! text is ever generated or re-parsed. The engine behaviors the
-//! construction relies on are pinned by
-//! `language-tests/tests/opengql/lowering_substrate.surql` (E1–E8).
+//! Implements the normative design in `doc/opengql/V2_DESIGN.md` §8: a parsed
+//! [`GqlQuery`] becomes an [`Expr::Match`] holding a [`MatchPlan`] (the
+//! language-neutral binding-table plan node), wrapped in a [`LogicalPlan`]. No
+//! SurrealQL surface AST is produced; the streaming execution planner compiles
+//! the [`MatchPlan`] into operators.
 //!
-//! Layout: [`pattern`] analyzes and scaffolds the binding shape (§2, §3,
-//! §6), [`expr`] lowers expressions per scope with the three-valued-logic
-//! guards (§2.2, §4), [`naming`] owns the column-name and reserved-name
-//! rules (§5), and this module dispatches and assembles the final
-//! [`Ast`].
+//! Layout: [`binding`] runs the variable-resolution semantic pass over the
+//! whole query (the binding registry, hidden bindings, anchorability, and the
+//! node-variable-reuse-as-join-key / repeated-edge / kind-mismatch rules),
+//! [`pattern`] emits each clause's [`PatternPlan`]s and NNF-split predicates
+//! with their dependency sets, [`expr`] lowers expressions with uniform binding
+//! addressing and the three-valued-logic guards, [`naming`] owns the
+//! column-name and reserved-name rules, and this module dispatches and
+//! assembles the output spec (R7/R8) and the final [`LogicalPlan`].
 
+mod binding;
 mod expr;
 mod naming;
 mod pattern;
@@ -20,162 +24,177 @@ mod pattern;
 mod test;
 
 use reblessive::{Stack, Stk};
+use surrealdb_types::ToSql;
 
-use self::expr::{Scope, ScopeKind};
-use self::pattern::Placement;
+use self::binding::Registry;
+use self::expr::Scope;
+use crate::expr::match_plan::{MatchColumn, MatchOrder, MatchOutput, MatchPlan};
+use crate::expr::plan::{LogicalPlan, TopLevelExpr};
+use crate::expr::{Expr, Idiom, Literal, Param};
 use crate::opengql::ast::{
-	GqlExpr, GqlLiteral, GqlQuery, GqlStatement, MatchQuery, OrderItem, ReturnClause, ReturnItems,
-	SetQuantifier,
-};
-use crate::sql::field::Selector;
-use crate::sql::order::{OrderList, Ordering};
-use crate::sql::{
-	Ast, Expr, Field, Fields, Group, Groups, Idiom, Limit, Literal, Order, Param, Start,
+	GqlExpr, GqlLiteral, GqlQuery, GqlStatement, MatchItem, MatchQuery, OrderItem, ReturnClause,
+	ReturnItems, SetQuantifier,
 };
 use crate::syn::error::{SyntaxError, bail, syntax_error};
 
-/// Lowers a parsed GQL query onto the SurrealQL surface AST.
+/// Lowers a parsed GQL query into a [`LogicalPlan`] carrying a single
+/// [`Expr::Match`].
 ///
 /// Runs on a [`reblessive`] stack: the GQL AST contains arbitrarily deep
 /// expression chains which the machine stack must not recurse over.
-pub(super) fn lower(query: GqlQuery) -> Result<Ast, SyntaxError> {
+pub(super) fn lower(query: GqlQuery) -> Result<LogicalPlan, SyntaxError> {
 	let GqlQuery {
 		stmt: GqlStatement::Match(query),
 	} = query;
 	let mut stack = Stack::new();
-	stack.enter(|stk| lower_match_query(stk, &query)).finish()
+	let plan = stack.enter(|stk| lower_match_query(stk, &query)).finish()?;
+	Ok(LogicalPlan {
+		expressions: vec![TopLevelExpr::Expr(Expr::Match(Box::new(plan)))],
+	})
 }
 
-async fn lower_match_query(stk: &mut Stk, query: &MatchQuery) -> Result<Ast, SyntaxError> {
-	let clause = match query.matches.as_slice() {
-		[clause] => clause,
-		[] => {
-			bail!(
-				"A query without a MATCH clause is not supported yet",
-				@query.ret.span => "start the query with a MATCH clause"
-			);
-		}
-		[_, second, ..] => {
-			bail!("Multiple MATCH clauses are not supported yet", @second.span);
-		}
-	};
-	if clause.optional {
-		bail!("OPTIONAL MATCH is not supported yet", @clause.span);
+/// Lowers the `MatchQuery` into a [`MatchPlan`]: one [`MatchClausePlan`] per
+/// MATCH statement (in textual order, `OPTIONAL` operands flattened and tagged),
+/// each carrying every comma-separated pattern, joined by the planner on the
+/// shared node bindings the registry declares. A reused node variable is a
+/// single binding (the equi-join key); the lowering declares the shared id but
+/// never decides the join. `OPTIONAL` clauses are tagged with `optional` and a
+/// per-block `optional_group` for the planner's left-join (R3). The empty-query
+/// case stays rejected.
+async fn lower_match_query(stk: &mut Stk, query: &MatchQuery) -> Result<MatchPlan, SyntaxError> {
+	reject_empty_query(query)?;
+	reject_leading_optional(query)?;
+
+	// The binding registry spans the whole query, walking the `MatchItem` tree in
+	// textual order: a node variable reused across patterns / clauses keeps the id
+	// of its first declaration (one shared binding), and each binding records the
+	// `OPTIONAL` depth it was first declared at. The flattened clause list carries
+	// each clause's OPTIONAL metadata.
+	let bindings = binding::analyze(&query.items)?;
+
+	let mut clauses = Vec::with_capacity(bindings.clauses.len());
+	for clause_bindings in bindings.clauses.iter() {
+		clauses.push(pattern::lower_clause(stk, clause_bindings, &bindings.registry).await?);
 	}
 
-	let shape = pattern::analyze(clause)?;
-	let bindings = &shape.bindings;
-	let Some(path) = clause.patterns.first() else {
-		// `analyze` validated that exactly one pattern exists.
-		return Err(syntax_error!(
-			"Internal error: MATCH clause without a pattern",
-			@clause.span
-		));
-	};
+	let output = lower_output(stk, &query.ret, &bindings.registry).await?;
 
-	// Predicate placement (§3): merge, NNF-split, classify and lower each
-	// conjunct in the scope of its placement.
-	let conjuncts = pattern::collect_conjuncts(clause.where_clause.as_ref(), path);
-	let mut anchor_preds = Vec::new();
-	let mut edge_preds = Vec::new();
-	let mut post_preds = Vec::new();
-	for conjunct in &conjuncts {
-		let (kind, slot) = match pattern::classify(conjunct, bindings)? {
-			Placement::Anchor => (ScopeKind::Anchor, &mut anchor_preds),
-			Placement::Edge => (ScopeKind::Edge, &mut edge_preds),
-			Placement::PostSplit => (ScopeKind::PostSplit, &mut post_preds),
-		};
-		let scope = Scope {
-			kind,
-			bindings,
-		};
-		slot.push(pattern::lower_conjunct(stk, conjunct, &scope).await?);
-	}
-	let anchor_cond = expr::and_chain(anchor_preds);
-	let edge_cond =
-		expr::and_chain(edge_preds.into_iter().chain(pattern::far_label_filter(&shape)));
-	let post_cond = expr::and_chain(post_preds);
-
-	let mut select = pattern::build_frame(&shape, anchor_cond, edge_cond, post_cond);
-
-	// Projections, DISTINCT, ORDER BY and paging apply to the outermost
-	// layer, in post-split scope — which for the degenerate no-edge shape
-	// is the anchor scope itself (§2.1, §5).
-	let scope = Scope {
-		kind: if shape.hop.is_some() {
-			ScopeKind::PostSplit
-		} else {
-			ScopeKind::Anchor
-		},
-		bindings,
-	};
-	let columns = lower_return_items(stk, &query.ret, &scope).await?;
-	let distinct = matches!(query.ret.quantifier, Some(SetQuantifier::Distinct));
-	if !query.ret.order_by.is_empty() {
-		let mut orders = Vec::with_capacity(query.ret.order_by.len());
-		for item in &query.ret.order_by {
-			orders.push(lower_order_item(stk, item, &columns, &scope).await?);
-		}
-		select.order = Some(Ordering::Order(OrderList(orders)));
-	}
-	if distinct {
-		// `RETURN DISTINCT` → GROUP BY all projected aliases (§5, E6).
-		select.group =
-			Some(Groups(columns.iter().map(|c| Group(Idiom::field(c.name.clone()))).collect()));
-	}
-	select.fields = Fields::Select(
-		columns
-			.into_iter()
-			.map(|c| {
-				Field::Single(Selector {
-					expr: c.expr,
-					alias: Some(Idiom::field(c.name)),
-				})
-			})
-			.collect(),
-	);
-	if let Some(skip) = &query.ret.skip {
-		select.start = Some(Start(lower_count(skip)?));
-	}
-	if let Some(limit) = &query.ret.limit {
-		select.limit = Some(Limit(lower_count(limit)?));
-	}
-
-	Ok(Ast::single_expr(Expr::Select(Box::new(select))))
+	Ok(MatchPlan {
+		bindings: bindings.registry.into_defs(),
+		clauses,
+		output,
+	})
 }
 
-/// A projected column: its name (the row object key) and the lowered value
-/// expression.
+/// Rejects an empty query (no MATCH clause). Multiple MATCH clauses and
+/// `OPTIONAL` operands all lower.
+fn reject_empty_query(query: &MatchQuery) -> Result<(), SyntaxError> {
+	if query.items.is_empty() {
+		bail!(
+			"A query without a MATCH clause is not supported yet",
+			@query.ret.span => "start the query with a MATCH clause"
+		);
+	}
+	Ok(())
+}
+
+/// Rejects a query that LEADS with `OPTIONAL` (R3): an `OPTIONAL` is a left-outer
+/// join against the binding table accumulated by the clauses before it, so the
+/// first MATCH statement of a query must be mandatory — there is nothing to
+/// left-outer against otherwise. (The planner relies on this: the first fold unit
+/// is always a mandatory clause.)
+fn reject_leading_optional(query: &MatchQuery) -> Result<(), SyntaxError> {
+	if let Some(MatchItem::Optional(block)) = query.items.first() {
+		bail!(
+			"A query cannot start with OPTIONAL MATCH: OPTIONAL is a left-outer join and needs a \
+			 preceding MATCH to join against",
+			@block.span => "begin with a plain `MATCH …` clause before any `OPTIONAL`"
+		);
+	}
+	Ok(())
+}
+
+/// A projected column: its final name (the row object key) and the lowered
+/// binding-row value expression.
 struct Column {
 	name: String,
 	expr: Expr,
 }
 
-/// Lowers the RETURN items into named columns (§5): explicit aliases win,
-/// unaliased items are named by their verbatim source text, `RETURN *`
-/// expands to the named pattern variables in alphabetical order, and
-/// duplicate column names are rejected.
+/// Lowers the RETURN clause into the [`MatchOutput`] spec: the projected
+/// columns (R8), the DISTINCT flag, the resolved ORDER BY keys (R7) and the
+/// SKIP/LIMIT counts.
+async fn lower_output(
+	stk: &mut Stk,
+	ret: &ReturnClause,
+	registry: &Registry,
+) -> Result<MatchOutput, SyntaxError> {
+	let columns = lower_return_items(stk, ret, registry).await?;
+	let distinct = matches!(ret.quantifier, Some(SetQuantifier::Distinct));
+
+	let mut order = Vec::with_capacity(ret.order_by.len());
+	for item in &ret.order_by {
+		order.push(lower_order_item(stk, item, &columns, distinct, registry).await?);
+	}
+
+	let skip = match &ret.skip {
+		Some(skip) => Some(lower_count(skip)?),
+		None => None,
+	};
+	let limit = match &ret.limit {
+		Some(limit) => Some(lower_count(limit)?),
+		None => None,
+	};
+
+	Ok(MatchOutput {
+		columns: columns
+			.into_iter()
+			.map(|c| MatchColumn {
+				name: c.name,
+				expr: c.expr,
+			})
+			.collect(),
+		distinct,
+		order,
+		skip,
+		limit,
+	})
+}
+
+/// Lowers the RETURN items into named columns (R8): explicit aliases win,
+/// unaliased items are named by their verbatim source text, `RETURN *` expands
+/// to the user-named bindings (incl. group and path variables) in alphabetical
+/// order, and duplicate column names are rejected.
 async fn lower_return_items(
 	stk: &mut Stk,
 	ret: &ReturnClause,
-	scope: &Scope<'_>,
+	registry: &Registry,
 ) -> Result<Vec<Column>, SyntaxError> {
+	let scope = Scope {
+		registry,
+	};
 	let mut columns: Vec<Column> = Vec::new();
 	match &ret.items {
 		ReturnItems::Star => {
-			let mut vars = scope.bindings.vars.clone();
-			vars.sort_by(|a, b| a.0.cmp(&b.0));
-			if vars.is_empty() {
+			let mut names: Vec<&str> = registry
+				.bindings()
+				.iter()
+				.filter(|b| b.user_named)
+				.map(|b| b.name.as_str())
+				.collect();
+			names.sort_unstable();
+			if names.is_empty() {
 				bail!(
 					"RETURN * requires at least one named pattern variable",
 					@ret.span => "name a pattern element or list the return items explicitly"
 				);
 			}
-			for (name, role) in vars {
-				let expr = scope.role_expr(role, &[], ret.span)?;
+			for name in names {
+				// `RETURN *` returns the whole binding value (a group or path
+				// variable surfaces its composite value, never a field).
 				columns.push(Column {
-					name,
-					expr,
+					name: name.to_owned(),
+					expr: Expr::Idiom(Idiom::field(name)),
 				});
 			}
 		}
@@ -188,10 +207,11 @@ async fn lower_return_items(
 						@name_span => "use `AS` to give the items distinct column names"
 					);
 				}
-				let expr = expr::lower_value(stk, &item.expr, scope).await?;
+				let lowered = expr::lower_value(stk, &item.expr, &scope).await?;
 				columns.push(Column {
 					name,
-					expr,
+					// `lower_value` builds `sql::Expr`; the IR is `expr::Expr`.
+					expr: lowered.into(),
 				});
 			}
 		}
@@ -199,59 +219,83 @@ async fn lower_return_items(
 	Ok(columns)
 }
 
-/// Lowers an ORDER BY item (§5). Sort keys must name a RETURN column or
-/// lower to the same expression as one; the row then sorts on that column
-/// (alias resolution is engine-side, pinned for dotted names by E5/E6).
+/// Lowers an ORDER BY item (R7).
+///
+/// Without DISTINCT the sort key is a full binding-row expression evaluated
+/// pre-projection over all bindings (returned or not). With DISTINCT the key
+/// must name a returned column or lower to the same expression as one — the
+/// sort then references that column by name (Sort runs post-projection in the
+/// DISTINCT pipeline); any other key is rejected.
 async fn lower_order_item(
 	stk: &mut Stk,
 	item: &OrderItem,
 	columns: &[Column],
-	scope: &Scope<'_>,
-) -> Result<Order, SyntaxError> {
+	distinct: bool,
+	registry: &Registry,
+) -> Result<MatchOrder, SyntaxError> {
 	if item.nulls_first.is_some() {
 		bail!("`NULLS FIRST`/`NULLS LAST` ordering is not supported yet", @item.span);
 	}
-	let value = order_key(stk, item, columns, scope).await?;
-	Ok(Order {
-		value,
-		collate: false,
-		numeric: false,
-		direction: item.ascending.unwrap_or(true),
+	let ascending = item.ascending.unwrap_or(true);
+	let scope = Scope {
+		registry,
+	};
+
+	if distinct {
+		let column = distinct_order_column(stk, item, columns, &scope).await?;
+		return Ok(MatchOrder {
+			expr: Expr::Idiom(Idiom::field(column)),
+			ascending,
+		});
+	}
+
+	// Non-DISTINCT: Sort runs pre-projection over the binding rows, so a key
+	// naming a RETURN column (its alias, or the verbatim text of an unaliased
+	// item) cannot reference the projected column — it sorts on that column's
+	// underlying binding-row expression instead. Any other key lowers directly.
+	if let Some(name) = order_key_name(&item.expr)
+		&& let Some(column) = columns.iter().find(|c| c.name == name)
+	{
+		return Ok(MatchOrder {
+			expr: column.expr.clone(),
+			ascending,
+		});
+	}
+	let lowered: Expr = expr::lower_value(stk, &item.expr, &scope).await?.into();
+	Ok(MatchOrder {
+		expr: lowered,
+		ascending,
 	})
 }
 
-async fn order_key(
+/// Resolves a DISTINCT ORDER BY key to the name of the RETURN column it
+/// references — by dotted name, or by lowering to the same expression as a
+/// column — rejecting any key that is not a returned column.
+async fn distinct_order_column(
 	stk: &mut Stk,
 	item: &OrderItem,
 	columns: &[Column],
 	scope: &Scope<'_>,
-) -> Result<Idiom, SyntaxError> {
-	// A sort key matching a RETURN column by name: its alias or the
-	// verbatim text of an unaliased item.
+) -> Result<String, SyntaxError> {
+	// A key matching a column by name: its alias, or the verbatim text of an
+	// unaliased item.
 	if let Some(name) = order_key_name(&item.expr)
-		&& columns.iter().any(|c| c.name == name)
+		&& let Some(column) = columns.iter().find(|c| c.name == name)
 	{
-		return Ok(Idiom::field(name));
+		return Ok(column.name.clone());
 	}
-	let lowered = expr::lower_value(stk, &item.expr, scope).await?;
-	// A sort key lowering to the same expression as a RETURN item sorts on
-	// that item's column.
+	let lowered: Expr = expr::lower_value(stk, &item.expr, scope).await?.into();
 	if let Some(column) = columns.iter().find(|c| c.expr == lowered) {
-		return Ok(Idiom::field(column.name.clone()));
+		return Ok(column.name.clone());
 	}
-	// Any other sort key is rejected: the legacy engine sorts the projected
-	// output rows (a non-column key silently no-op sorts) while the
-	// streaming engine resolves source fields (sorting correctly), so only
-	// column-matching keys behave identically under every planner strategy
-	// — the same invariant `syn` enforces for plain SELECT statements.
 	bail!(
-		"ORDER BY may only reference RETURN items",
+		"With RETURN DISTINCT, ORDER BY may only reference returned columns",
 		@item.span => "return the sort expression under an alias and order by the alias"
 	);
 }
 
-/// The dotted name of a sort key that is a plain variable or property
-/// chain, used to match RETURN columns by name.
+/// The dotted name of a sort key that is a plain variable or property chain,
+/// used to match RETURN columns by name.
 fn order_key_name(expr: &GqlExpr) -> Option<String> {
 	let mut names: Vec<&str> = Vec::new();
 	let mut base = expr;
@@ -267,8 +311,8 @@ fn order_key_name(expr: &GqlExpr) -> Option<String> {
 	Some(names.join("."))
 }
 
-/// Lowers a SKIP/LIMIT count: an unsigned integer literal or a parameter
-/// (§5). The parser only produces these two forms.
+/// Lowers a SKIP/LIMIT count: an unsigned integer literal or a parameter. The
+/// parser only produces these two forms.
 fn lower_count(expr: &GqlExpr) -> Result<Expr, SyntaxError> {
 	match expr {
 		GqlExpr::Literal(GqlLiteral::Integer(i), _) => Ok(Expr::Literal(Literal::Integer(*i))),
@@ -277,11 +321,48 @@ fn lower_count(expr: &GqlExpr) -> Result<Expr, SyntaxError> {
 			span,
 		} => {
 			naming::validate_param_name(name, *span)?;
-			Ok(Expr::Param(Param::new(name.as_str())))
+			Ok(Expr::Param(Param::from(name.clone())))
 		}
 		other => Err(syntax_error!(
 			"Expected an unsigned integer or a parameter",
 			@other.span()
 		)),
+	}
+}
+
+/// A lowered, prepared GQL query: a [`LogicalPlan`] containing the single
+/// top-level [`Expr::Match`].
+///
+/// Renders (`Debug`/`ToSql`) via the [`MatchPlan`]'s deterministic GQL-ish
+/// rendering rather than the SurrealQL surface, so EXPLAIN and logs show the
+/// plan as a MATCH query.
+///
+/// `Clone` lets a caller lower a query once and execute the same prepared plan
+/// repeatedly (e.g. the language-test bench harness, which keeps parse+lowering
+/// out of the timed loop).
+#[derive(Clone)]
+pub struct PreparedGqlQuery(pub(crate) LogicalPlan);
+
+impl std::fmt::Debug for PreparedGqlQuery {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_tuple("PreparedGqlQuery").field(&self.to_sql()).finish()
+	}
+}
+
+impl ToSql for PreparedGqlQuery {
+	fn fmt_sql(&self, f: &mut String, fmt: surrealdb_types::SqlFormat) {
+		// Render the embedded `MatchPlan` directly via its own `ToSql`. The
+		// `LogicalPlan`/`Ast` rendering round-trips through
+		// `From<expr::Expr> for sql::Expr`, which has no `sql` surface for
+		// `Expr::Match` (it logs + `debug_assert!`s + emits a `None`
+		// placeholder); going straight to the `MatchPlan` keeps the GQL-ish
+		// rendering and avoids that placeholder path.
+		match self.0.expressions.as_slice() {
+			[TopLevelExpr::Expr(Expr::Match(plan))] => plan.fmt_sql(f, fmt),
+			// A `PreparedGqlQuery` is only ever a single top-level `Expr::Match`
+			// by construction; fall back to the plan rendering otherwise so the
+			// method never panics.
+			_ => self.0.fmt_sql(f, fmt),
+		}
 	}
 }

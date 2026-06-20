@@ -5,7 +5,7 @@
 
 use rstest::rstest;
 
-use super::{label_str, parse, parse_err};
+use super::{label_str, match_clauses, parse, parse_err};
 use crate::opengql::ast::{
 	EdgeDirection, ElementPredicate, GqlExpr, LabelExpr, PathPattern, PathStep, QuantifierKind,
 };
@@ -14,9 +14,10 @@ use crate::opengql::ast::{
 /// and returns the pattern.
 #[track_caller]
 fn single_pattern(source: &str) -> PathPattern {
-	let mut query = parse(source);
-	assert_eq!(query.matches.len(), 1, "expected a single match clause in {source:?}");
-	let mut clause = query.matches.pop().expect("one match clause");
+	let query = parse(source);
+	let mut clauses = match_clauses(&query);
+	assert_eq!(clauses.len(), 1, "expected a single match clause in {source:?}");
+	let mut clause = clauses.pop().expect("one match clause").clone();
 	assert_eq!(clause.patterns.len(), 1, "expected a single pattern in {source:?}");
 	clause.patterns.pop().expect("one pattern")
 }
@@ -168,7 +169,8 @@ fn label_expression_spans() {
 	// operator chains, so lowering can reject them precisely.
 	let source = "MATCH (a:!%|p) RETURN 1";
 	let query = parse(source);
-	let label = query.matches[0].patterns[0].start.label.as_ref().expect("a label expression");
+	let label =
+		match_clauses(&query)[0].patterns[0].start.label.as_ref().expect("a label expression");
 	let span = label.span();
 	assert_eq!(&source[span.offset as usize..(span.offset + span.len) as usize], "!%|p");
 	let LabelExpr::Disjunction(negation, _, _) = label else {

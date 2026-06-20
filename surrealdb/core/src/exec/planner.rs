@@ -62,6 +62,10 @@
 mod aggregate;
 mod cycle_guard;
 mod idiom;
+// GQL `MATCH` planning (`plan_match`). Gated like the IR it consumes
+// (`expr::Expr::Match` is `#[cfg(feature = "opengql")]`).
+#[cfg(feature = "opengql")]
+mod match_plan;
 mod row_scope;
 mod select;
 mod source;
@@ -582,6 +586,13 @@ impl<'ctx> Planner<'ctx> {
 			| Expr::Relate(_)
 			| Expr::Insert(_) => Err(Error::PlannerUnsupported(
 				"DML subqueries not yet supported in execution plans".to_string(),
+			)),
+
+			// GQL MATCH is only ever planned as a top-level operator tree
+			// (`plan_match`), never as a scalar sub-expression.
+			#[cfg(feature = "opengql")]
+			Expr::Match(_) => Err(Error::PlannerUnsupported(
+				"GQL MATCH cannot be used as a sub-expression".to_string(),
 			)),
 		}
 	}
@@ -1154,6 +1165,13 @@ impl<'ctx> Planner<'ctx> {
 						"DDL statements not yet supported in execution plans".to_string(),
 					))
 				}
+
+				// GQL MATCH is planned into an operator tree by `plan_match`
+				// (`exec/planner/match_plan.rs`). It never returns
+				// PlannerUnsupported/Unimplemented — a MatchPlan only reaches here
+				// because it lowered cleanly, so any failure is a real error.
+				#[cfg(feature = "opengql")]
+				Expr::Match(m) => self.plan_match(*m).await,
 			}
 		})
 	}

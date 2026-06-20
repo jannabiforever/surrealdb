@@ -3,8 +3,17 @@
 //! This module implements a second query language alongside SurrealQL: the
 //! ISO GQL property-graph query language (the Cypher-style `MATCH … RETURN …`
 //! language standardised as ISO/IEC 39075:2024). Queries are lexed and parsed
-//! into a GQL-specific AST ([`ast::GqlQuery`]) which is then lowered onto the
-//! existing SurrealQL execution pipeline.
+//! into a GQL-specific AST ([`ast::GqlQuery`]) which is then lowered to a
+//! [`MatchPlan`](crate::expr::match_plan::MatchPlan) — a language-neutral
+//! binding-table IR embedded as [`Expr::Match`](crate::expr::Expr::Match) —
+//! and executed by the streaming engine. No SurrealQL surface AST is produced
+//! along the way; the GQL front-end shares the parser conventions, error
+//! types and execution operators of SurrealQL but not its statement AST.
+//!
+//! The normative v2 contracts live in `doc/opengql/`: `V2_DESIGN.md` (the
+//! `MatchPlan` IR, operators, planner and plumbing), `LOWERING.md` (the
+//! lowering's own responsibilities) and `REFERENCE.md` (the grammar plus the
+//! v2 semantic rules R1–R8 and the v1→v2 behaviour-change table).
 //!
 //! The normative grammar reference lives in `doc/opengql/` at the repository
 //! root: `REFERENCE.md` is the distilled specification of the supported
@@ -27,11 +36,11 @@ pub mod token;
 use anyhow::{Result, bail, ensure};
 use reblessive::Stack;
 
+pub use self::lower::PreparedGqlQuery;
 use crate::cnf::CommonConfig;
 use crate::dbs::Capabilities;
 use crate::dbs::capabilities::ExperimentalTarget;
 use crate::err::Error;
-use crate::sql::Ast;
 use crate::syn::error::{SyntaxError, syntax_error};
 use crate::syn::token::Span;
 
@@ -65,23 +74,24 @@ pub fn parse_with_settings(
 	stack.enter(|stk| parser.parse_query(stk)).finish()
 }
 
-/// Lowers a parsed GQL query onto the SurrealQL surface AST
-/// (`doc/opengql/LOWERING.md`).
+/// Lowers a parsed GQL query into a [`PreparedGqlQuery`] (the declarative
+/// [`MatchPlan`](crate::expr::match_plan::MatchPlan) embedded in a logical
+/// plan; `doc/opengql/V2_DESIGN.md` §8).
 ///
-/// The returned [`Ast`] executes through the same pipeline as parsed
-/// SurrealQL; no SurrealQL text is generated or re-parsed.
-pub fn lower(query: ast::GqlQuery) -> Result<Ast, SyntaxError> {
-	lower::lower(query)
+/// The returned plan executes through the streaming execution engine; no
+/// SurrealQL surface AST is generated.
+pub fn lower(query: ast::GqlQuery) -> Result<PreparedGqlQuery, SyntaxError> {
+	Ok(PreparedGqlQuery(lower::lower(query)?))
 }
 
-/// Parses a GQL query and lowers it onto the SurrealQL surface AST, with
-/// the given parser settings.
-pub fn parse_to_ast_with_settings(
+/// Parses a GQL query and lowers it into a [`PreparedGqlQuery`], with the given
+/// parser settings.
+pub fn parse_to_plan_with_settings(
 	input: &str,
 	settings: GqlParserSettings,
-) -> Result<Ast, SyntaxError> {
+) -> Result<PreparedGqlQuery, SyntaxError> {
 	let query = parse_with_settings(input, settings)?;
-	lower::lower(query)
+	lower(query)
 }
 
 /// Creates the GQL parser settings from the global configuration values as
@@ -101,7 +111,9 @@ pub fn settings_from_capabilities_config(
 	}
 }
 
-/// Parses a GQL query and lowers it onto the SurrealQL surface AST.
+/// Parses a GQL query and lowers it into a [`PreparedGqlQuery`] (a
+/// [`MatchPlan`](crate::expr::match_plan::MatchPlan) embedded in a logical
+/// plan), enforcing the experimental capability gate.
 ///
 /// The whole language is gated behind the `opengql` experimental capability,
 /// so unlike [`crate::syn::parse_with_capabilities`] (which only derives
@@ -118,7 +130,7 @@ pub fn parse_with_capabilities(
 	input: &str,
 	capabilities: &Capabilities,
 	config: &CommonConfig,
-) -> Result<Ast> {
+) -> Result<PreparedGqlQuery> {
 	trace!(target: TARGET, "Parsing OpenGQL query");
 
 	if !capabilities.allows_experimental(&ExperimentalTarget::OpenGql) {
@@ -129,7 +141,7 @@ pub fn parse_with_capabilities(
 		bail!("Experimental capability `opengql` is not enabled");
 	}
 	ensure!(input.len() <= u32::MAX as usize, Error::QueryTooLarge);
-	parse_to_ast_with_settings(input, settings_from_capabilities_config(capabilities, config))
+	parse_to_plan_with_settings(input, settings_from_capabilities_config(capabilities, config))
 		.map_err(|e| e.render_on(input))
 		.map_err(Error::InvalidQuery)
 		.map_err(anyhow::Error::new)

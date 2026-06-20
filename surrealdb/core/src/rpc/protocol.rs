@@ -1629,11 +1629,11 @@ pub trait RpcProtocol {
 				}
 			};
 
-			// Parse the GQL query into a SurrealQL AST
-			let ast = self.kvs().parse_opengql(&query)?;
+			// Parse and lower the GQL query into a prepared plan
+			let plan = self.kvs().parse_opengql(&query)?;
 
 			Ok(DbResult::Query(
-				run_query(self, txn, session_id, QueryForm::Parsed(ast), vars)
+				run_query(self, txn, session_id, QueryForm::Plan(plan), vars)
 					.await
 					.map_err(types_error_from_anyhow)?,
 			))
@@ -1837,6 +1837,10 @@ pub trait RpcProtocol {
 enum QueryForm<'a> {
 	Text(&'a str),
 	Parsed(Ast),
+	/// A pre-lowered GQL query. Only constructed by the `gql` handler, which
+	/// is itself gated behind the `opengql` feature.
+	#[cfg(feature = "opengql")]
+	Plan(crate::opengql::PreparedGqlQuery),
 }
 
 async fn run_query<T>(
@@ -1878,6 +1882,16 @@ where
 			(QueryForm::Parsed(ast), None) => {
 				this.kvs().process_with_transaction(ast, &session, vars, tx).await?
 			}
+			#[cfg(feature = "opengql")]
+			(QueryForm::Plan(plan), Some(cancel)) => {
+				this.kvs()
+					.process_opengql_with_transaction_and_cancel(plan, &session, vars, tx, cancel)
+					.await?
+			}
+			#[cfg(feature = "opengql")]
+			(QueryForm::Plan(plan), None) => {
+				this.kvs().process_opengql_with_transaction(plan, &session, vars, tx).await?
+			}
 		}
 	} else {
 		// No transaction - execute normally
@@ -1890,6 +1904,12 @@ where
 				this.kvs().process_with_cancel(ast, &session, vars, cancel).await?
 			}
 			(QueryForm::Parsed(ast), None) => this.kvs().process(ast, &session, vars).await?,
+			#[cfg(feature = "opengql")]
+			(QueryForm::Plan(plan), Some(cancel)) => {
+				this.kvs().process_opengql_with_cancel(plan, &session, vars, cancel).await?
+			}
+			#[cfg(feature = "opengql")]
+			(QueryForm::Plan(plan), None) => this.kvs().process_opengql(plan, &session, vars).await?,
 		}
 	};
 

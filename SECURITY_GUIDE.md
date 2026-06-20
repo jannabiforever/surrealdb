@@ -668,6 +668,99 @@ Flag when changes touch:
 
 ---
 
+## 15a. OpenGQL (experimental ISO GQL surface)
+
+**Files**: `opengql/` (lexer, parser, `lower/`), `expr/match_plan.rs`,
+the binding-table operators — `exec/operators/graph/` (`expand.rs`, `endpoint.rs`,
+`path_expand.rs`, `distinct_edges.rs`), `exec/operators/join/hash_join.rs`,
+`exec/operators/{bind.rs, distinct.rs}`, and the FieldState-aware fetch helper
+`exec/operators/scan/fetch.rs` —
+`exec/planner/match_plan.rs`, `kvs/ds.rs` (`parse_opengql` / `process_opengql` /
+`execute_opengql`), `rpc/protocol.rs` (`gql` method, `QueryForm::Plan`),
+`ntw/opengql.rs` (`/gql` route)
+
+OpenGQL is a second query language lowered to a `MatchPlan` IR and executed by
+the streaming engine. It is **read-only**: the lowering constructs only a single
+top-level `Expr::Match`, and no GQL surface can express a mutation (CREATE,
+RELATE, UPDATE, DELETE, DEFINE, REMOVE all parse-then-reject or have no grammar).
+Its security posture rests on four invariants.
+
+### Invariants
+
+- **Binding-fetch equivalence (the central data-leak boundary).** Every binding
+  row's contents must be exactly what a `SELECT` on that table would return for
+  the same caller. All fetched node/edge bindings (Expand targets and edges,
+  EndpointBind nodes, PathExpand intermediate and terminal nodes/edges) must go
+  through the FieldState-aware helper in `exec/operators/scan/fetch.rs`
+  (`resolve_with_field_state`), which applies, in order: table-level SELECT
+  permission (deny ⇒ record dropped, neither existence nor contents leak),
+  computed-field evaluation, and field-level SELECT permission (unreadable fields
+  cut). The bare `scan::common::resolve_record_batch` must **not** be substituted
+  — it applies only the table-level permission and skips the field-level
+  machinery, which would leak restricted fields into binding rows.
+- **Layered gate chain.** Reaching the GQL executor must require, in order: the
+  `opengql` cargo feature compiled in; for HTTP, the `RouteTarget::Gql` capability
+  on the `/gql` route; the `ExperimentalTarget::OpenGql` experimental capability
+  (checked in `Datastore::parse_opengql` *and* `opengql::parse_with_capabilities`
+  — the language gates itself, not relying on the caller); `allows_query_by_subject`
+  for the session's auth subject (the `gql` RPC method); and a valid, non-anonymous
+  session under the namespace/database authorization context. Removing or
+  reordering any layer is a regression.
+- **Resource bounds.** The path-expansion and join operators must enforce row-count
+  ceilings: `SURREAL_GQL_MAX_PATH_ROWS` (default 1,000,000) bounds live+emitted
+  rows in `PathExpand` **per source row** (the counter resets for each input row,
+  so it caps the genuinely dangerous single-source combinatorial explosion and
+  keeps live DFS memory at `O(longest_path × fan-out)`; the aggregate output is
+  bounded by `N_source_rows × SURREAL_GQL_MAX_PATH_ROWS`, where `N_source_rows` is
+  itself bounded by the anchor scan's cardinality — size the knob with that
+  per-source ceiling in mind), `SURREAL_GQL_MAX_JOIN_BUILD_ROWS` (default
+  1,000,000) bounds the `HashJoin` build side (and the `Distinct` seen-set), and
+  `SURREAL_GQL_MAX_OUTPUT_ROWS` (default 1,000,000) bounds the cumulative rows
+  *emitted* by `HashJoin` and single-hop `Expand` — a distinct axis, because a
+  `Cross` product or high-fan-out join emits far more rows than either side
+  holds while the build set stays small. Exceeding any must abort the query with
+  an error naming the knob — quantifiers, multi-pattern joins, cartesian (no
+  shared variable) joins, and variable-length paths are amplification vectors and
+  must stay bounded.
+- **Cancellation.** The match operators do heavy work without pulling fresh
+  upstream batches (`HashJoin` fully drains its build side then fans out the
+  probe; `PathExpand` runs a per-source DFS; `Expand` scans a vertex's whole
+  adjacency), so upstream cancellation cannot propagate through them. Each must
+  poll `ctx.cancellation()` in its hot loops (the streaming buffer/monitor
+  wrappers inject none) or a long-running MATCH ignores client disconnect / query
+  timeout — a DoS. Dropping a poll is a regression.
+- **Read-only execution.** The `MatchPlan` must run only under the streaming
+  engine; its compute-only arm is a hard error (`Expr::Match` `compute()` returns
+  *"GQL MATCH requires the streaming execution engine; it cannot run under the
+  compute-only planner strategy"*). `Expr::Match` must never enter a `sql::Ast`,
+  the catalog, or `Revisioned` serialization — the `From<expr::Expr> for sql::Expr`
+  conversion logs, `debug_assert!`s, and emits a placeholder rather than
+  round-tripping it.
+
+### Review Triggers
+
+Flag when changes touch:
+
+- `exec/operators/scan/fetch.rs` or any binding-fetch call site (a switch to
+  `resolve_record_batch`, or a new fetch path that bypasses FieldState, is a
+  field-permission leak)
+- The gate chain: `ExperimentalTarget::OpenGql`, `RouteTarget::Gql`,
+  `allows_query_by_subject` in the `gql` RPC method, or the experimental check in
+  `Datastore::parse_opengql`
+- `SURREAL_GQL_MAX_PATH_ROWS` / `SURREAL_GQL_MAX_JOIN_BUILD_ROWS` /
+  `SURREAL_GQL_MAX_OUTPUT_ROWS` defaults or their enforcement in `PathExpand` /
+  `HashJoin` / `Expand` / `Distinct`, or removal of a `ctx.cancellation()` poll
+  from any match operator's hot loop
+- The `HashJoin` residual (`on`) predicate or `fold_optional`'s routing of a
+  correlated OPTIONAL-block predicate into it — a correlated predicate that
+  becomes a post-join `Filter` instead silently turns an OPTIONAL into an inner
+  join (drops rows that must be null-filled)
+- The lowering's read-only surface (any path that would let GQL construct an
+  `Expr` other than a top-level `Expr::Match`, or express a mutation)
+- The `Expr::Match` compute-arm error or the `sql::Expr` conversion guard
+
+---
+
 ## Cross-Cutting Concerns
 
 ### Confused Deputy Prevention

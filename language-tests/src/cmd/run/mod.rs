@@ -500,9 +500,15 @@ async fn run_test_body(
 		Dialect::OpenGql => {
 			// OpenGQL has no capability-gated syntax; the default recursion
 			// limit matches `syn::parser::ParserSettings::default()` above.
+			// Lowering produces a `PreparedGqlQuery` (a `MatchPlan` embedded
+			// in a logical plan); it executes through the streaming engine via
+			// `process_opengql`, so `.gql` cases default away from the
+			// compute-only strategy (see `Dialect::OpenGql` default in the
+			// schema's planner-strategy seam).
 			let settings = opengql::GqlParserSettings::default();
 			let source = &run.case.test.source.as_bytes();
-			let query = match opengql::parse_to_ast_with_settings(&run.case.test.source, settings) {
+			let query = match opengql::parse_to_plan_with_settings(&run.case.test.source, settings)
+			{
 				Ok(x) => x,
 				Err(e) => {
 					return Ok(BodyOutcome::Early(TestTaskResult::ParserError(
@@ -512,7 +518,7 @@ async fn run_test_body(
 			};
 
 			let start = Instant::now();
-			let result = dbs.process(query, &*session, None).await;
+			let result = dbs.process_opengql(query, &*session, None).await;
 			let did_timeout = start.elapsed() > timeout_duration;
 			let result = result
 				.map(|x| x.into_iter().map(|x| x.result.map_err(|e| e.to_string())).collect())

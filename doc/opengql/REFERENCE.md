@@ -214,12 +214,13 @@ accept non-reserved words wherever `regularIdentifier` is required.
 
 ### Statement context
 
-A v1 query is an `ambientLinearQueryStatement` (line 554):
+A query is an `ambientLinearQueryStatement` (line 554):
 `simpleLinearQueryStatement? primitiveResultStatement` — i.e. zero or more
-`matchStatement`s (via `simpleQueryStatement`, line 563; v1: exactly one)
-followed by a result statement. The enclosing `compositeQueryExpression`
-(line 504) adds `UNION | EXCEPT | INTERSECT | OTHERWISE` chaining —
-**parse-and-reject in v1**. Likewise `focusedLinearQueryStatement`
+`matchStatement`s (via `simpleQueryStatement`, line 563; **v2: one or more**,
+the first of which must be mandatory, the rest plain or `OPTIONAL`, chained
+sequentially per R1/R3) followed by a result statement. The enclosing
+`compositeQueryExpression` (line 504) adds `UNION | EXCEPT | INTERSECT |
+OTHERWISE` chaining — **parse-then-reject**. Likewise `focusedLinearQueryStatement`
 (`USE graph …`), `selectStatement` (SQL-style SELECT, line 689), and the
 other `primitiveQueryStatement`s (`LET`, `FOR`, `FILTER`, standalone
 `orderByAndPageStatement`).
@@ -229,17 +230,21 @@ other `primitiveQueryStatement`s (`LET`, `FOR`, `FILTER`, standalone
 ```
 matchStatement         : simpleMatchStatement | optionalMatchStatement ;
 simpleMatchStatement   : MATCH graphPatternBindingTable ;
-optionalMatchStatement : OPTIONAL optionalOperand ;          // v1: reject
-graphPatternBindingTable : graphPattern graphPatternYieldClause? ;  // YIELD: v1 reject
+optionalMatchStatement : OPTIONAL optionalOperand ;          // v2: supported (R3)
+graphPatternBindingTable : graphPattern graphPatternYieldClause? ;  // YIELD: reject
 ```
+
+> "v2: supported" marks productions the **lowering** now executes; "reject" /
+> "parse-then-reject" marks productions the parser recognises but the lowering
+> declines. See §(g)–(h) for the runtime semantics and the v1→v2 change table.
 
 ### Graph pattern (16.4, lines 803–848)
 
 ```
 graphPattern   : matchMode? pathPatternList keepClause? graphPatternWhereClause? ;
-pathPatternList: pathPattern (COMMA pathPattern)* ;          // v1: exactly one
+pathPatternList: pathPattern (COMMA pathPattern)* ;          // v2: multi-pattern (R1)
 pathPattern    : pathVariableDeclaration? pathPatternPrefix? pathPatternExpression ;
-pathVariableDeclaration : pathVariable EQUALS_OPERATOR ;     // p = …   v1: reject
+pathVariableDeclaration : pathVariable EQUALS_OPERATOR ;     // p = …   v2: supported (R5)
 graphPatternWhereClause : WHERE searchCondition ;
 ```
 
@@ -339,11 +344,14 @@ generalQuantifier      : LEFT_BRACE lowerBound? COMMA upperBound? RIGHT_BRACE ; 
 
 Postfix on a `pathFactor` (i.e. *after* the edge pattern: `-[:knows]->{1,3}`),
 plus the separate `?` optional quantifier. Both bounds of `generalQuantifier`
-are optional but the comma is required. `*` ≡ `{0,}`, `+` ≡ `{1,}`. v1: parse
-all; lowering accepts only `{1}`/`{1,n}` — the minimum must be exactly one —
-on a single edge-pattern (per plan, `*`/`+`/`?`/`{0,m}`/unbounded `{n,}`,
-minimums greater than one, and edge variables or predicates on quantified
-edges are rejected; see `LOWERING.md` §6 for why min ≥ 2 is deferred).
+are optional but the comma is required. `*` ≡ `{0,}`, `+` ≡ `{1,}`. **v2
+supports the full set** — `* + ? {n} {n,m} {n,} {,m} {,}` — with one row per
+path at every depth in `[min, max]` (R6); only `max < min` is rejected. A
+quantified edge binds a **group variable** (R4) and may carry an inline
+predicate referencing **only that edge** (a cross-variable reference is
+rejected, R6/§(h)); property access on the group variable is rejected. This is
+a v2 change from the v1 draft, which lowered only `{1}`/`{1,n}` as
+distinct-reachable recursion — see §(h) for the cardinality change.
 
 ---
 
@@ -489,3 +497,154 @@ Places where Cypher habits would make the parser wrong:
     common Cypher variable names like `count`, `exists`, `value`, `start`,
     `end`, `set`, `limit` are **reserved** in GQL and unusable as variables
     without delimiting.
+
+---
+
+## (g) v2 execution semantics (R1–R8)
+
+Sections (a)–(f) describe the *grammar* the parser accepts. This section
+describes the *runtime semantics* the v2 lowering and the streaming engine
+give to that grammar. These eight rules are pinned and normative; the
+authoritative statement is `V2_DESIGN.md` §0 (reproduced here verbatim so the
+grammar reference is self-contained) and they are enforced by the operator
+substrate tests (`surrealdb/core/src/exec/operators/` — `graph/`, `join/`, and
+the generic `bind.rs`/`distinct.rs`) and the `.gql` language tests under
+`language-tests/tests/opengql/`.
+
+- **R1** Comma patterns ≡ sequential MATCH for equi-joins on shared variables;
+  they differ only in edge-uniqueness scope (R2 is per MATCH statement).
+- **R2** Default match mode = **DIFFERENT EDGES**: within one MATCH statement
+  (incl. quantifier expansions) no edge record binds twice; nodes repeat
+  freely.
+- **R3** OPTIONAL = left-outer vs the accumulated binding table. Unmatched ⇒
+  every binding first introduced inside binds `Value::Null` (incl. group/path —
+  Null, not `[]`). Inside-optional predicates evaluate pre-null (part of the
+  optional's own match); outside predicates post-null. Chained OPTIONALs
+  left-to-right. Block forms are all-or-nothing units.
+- **R4** Edge variable under a quantifier = **group variable**: ordered LIST of
+  the traversed edge records; one row per path; `[]` for a zero-length path;
+  Null on an optional miss.
+- **R5** Path value (`RETURN p`) = alternating array `[node, edge, node, …,
+  node]` of full records (2k+1 elements; single-node path = `[node]`).
+- **R6** Quantifiers `* + ? {n} {n,m} {n,} {,m} {,}`: one row per path at every
+  depth in `[min, max]`; unbounded forms terminate via
+  edge-uniqueness-within-path (subsumed by R2); `min == 0` emits the
+  zero-length path (target = source, empty group, `[node]` path).
+- **R7** ORDER BY: without DISTINCT — full expressions over all bindings,
+  evaluated pre-projection on binding rows. With DISTINCT — returned columns
+  only; the error text is *"With RETURN DISTINCT, ORDER BY may only reference
+  returned columns"*.
+- **R8** `RETURN *` = all user-named bindings (incl. group/path vars),
+  alphabetical.
+
+> **ISO-39075 caveat on R2.** The DIFFERENT-EDGES default is *verified* against
+> the Kusto and Google Spanner GQL implementations, which both default to
+> no-repeated-edge-within-a-match. The ISO/IEC 39075:2024 §16.4 normative text
+> that would settle the question definitively is paywalled and was not consulted
+> directly; the pin stands on the implementation consensus either way. If the
+> ISO wording is ever confirmed to differ, R2 is the rule to revisit.
+
+Two corollaries the rules above imply, restated for searchability:
+
+- **Joins & null**: a Null binding never equi-joins — it is excluded from the
+  hash build (and, for an Inner join, also from the probe); a Left join passes
+  a null-keyed probe row through null-filled.
+- **Optional-miss value is `Value::Null`** (not NONE). `b IS NULL` lowers to
+  `(b = NULL OR b = NONE)` → TRUE; `b.x` on a Null `b` yields NONE, so the
+  ordering guards exclude it; a bare `RETURN b` surfaces NULL.
+- **Anchorability**: every pattern needs ≥1 labelled element OR ≥1 variable
+  already bound by an earlier pattern/clause; there are no whole-graph scans.
+  The lowering rejection is *"Cannot choose a starting table for this pattern:
+  label at least one node or reuse a variable bound by an earlier pattern"*.
+
+---
+
+## (h) v1 → v2 behaviour changes
+
+An earlier draft of the OpenGQL front-end ("v1") lowered each query to a
+SurrealQL `SELECT` and supported only a single linear pattern. v2 replaced that
+with the binding-table `MatchPlan` IR executed by the streaming engine, and in
+doing so **turned 14 former lowering rejections into supported features** and
+**changed the semantics of variable-length edges**. The table below quotes the
+*old v1 error texts* verbatim, so a user who hit one of them (in a tutorial,
+blog post, cached error, or older build) and searches for it finds the
+explanation of what the construct now does.
+
+> The v1 error texts below are quoted from the original lowering at git commit
+> `6b814d436` (`surrealdb/core/src/opengql/lower/{mod,pattern,expr}.rs`).
+
+### Former rejections that are now features
+
+| Construct | Old v1 error (verbatim) | v2 behaviour |
+|---|---|---|
+| Multiple `MATCH` clauses | `"Multiple MATCH clauses are not supported yet"` | Sequential MATCH; each clause equi-joins the accumulated binding table on shared node variables (R1). |
+| `OPTIONAL MATCH` | `"OPTIONAL MATCH is not supported yet"` | Left-outer join against the accumulated bindings; missed bindings bind `Value::Null` (R3). Block form `OPTIONAL { … }` is one all-or-nothing unit. |
+| Comma-separated patterns | `"Comma-separated graph patterns are not supported yet"` | Multi-pattern MATCH; patterns sharing a node variable equi-join, otherwise a cross product (R1). |
+| Path variables `p = (…)` | `"Path variables are not supported yet"` | `RETURN p` yields the alternating `[node, edge, …, node]` array of full records (R5). |
+| Multi-hop chains | `"Multi-hop path patterns (more than one edge step) are not supported yet"` | Chains of any length lower to a sequence of `Expand` operators. |
+| Repeated node variable | `"Variable \`{}\` is declared more than once in the pattern"` (hint: *"joins on a repeated variable are not supported yet"*) | A node variable reused **across** patterns/clauses is the equi-join key; reused **within** one pattern (a self-loop `(a)-[…]->(a)`) it becomes a hidden binding + an `id`-equality conjunct. |
+| Variable-length edge variable | `"Variable-length edge patterns cannot declare an edge variable"` | A quantified edge variable is a **group variable** (R4): the ordered list of traversed edge records, one row per path. |
+| Variable-length edge predicate | `"Variable-length edge patterns cannot have a WHERE clause or property map"` | A quantified edge may carry an inline predicate, provided it references **only that edge** (see deviations below). |
+| `*` quantifier | `"The \`*\` quantifier is not supported yet"` | `{0,}`: one row per path at every depth, `min == 0` emits the zero-length path (R6). |
+| `+` quantifier | `"The \`+\` quantifier is not supported yet"` | `{1,}`: one row per path, unbounded (terminates via edge-uniqueness-within-path, R6). |
+| `?` quantifier | `"The \`?\` quantifier is not supported yet"` | `{0,1}` (R6). |
+| `{0,m}` minimum zero | `"Variable-length quantifiers must have a minimum of at least one"` | `min == 0` is legal and emits the zero-length path (target = source, empty group, `[node]` path) (R6). |
+| `{n,}` unbounded | `"Unbounded variable-length quantifiers are not supported yet"` | Legal; terminates via edge-uniqueness-within-path (R6). |
+| `{2}` / `{2,4}` min > 1 | `"Variable-length quantifiers with a minimum greater than one are not supported yet"` | Any minimum is legal; one row per path at every depth in `[min, max]` (R6). |
+| Variable-length node count | (v1 semantics, *not* an error) "distinct reachable nodes" via the `collect` recursion | **Behaviour change** — now **one row per path** (R6). A node reachable by *k* distinct paths returns *k* rows, not one. This is the one place v2 changes the *result* of a query v1 accepted, not just whether it is accepted. |
+
+### v2-specific deviations and pins (read before relying on the above)
+
+- **Variable-length is now per-path, not distinct-reachable.** This is the only
+  behaviour change to a query v1 *accepted*. v1's `collect` recursion
+  deduplicated reachable nodes (and was capped at `min == 1` for that reason);
+  v2 emits one row per path and so returns the GQL-correct cardinality. Counts
+  and any downstream LIMIT/OFFSET over a variable-length result will differ.
+- **Property access on a group or path variable is rejected.** A quantified
+  edge group and a path variable hold composite values (an edge list / an
+  alternating array) with no addressable field structure; `p.x` or `g.since`
+  is rejected: *"Property access on a group or path variable is not supported
+  yet"* (hint: *"return the variable itself"*). Return the whole variable and
+  destructure client-side.
+- **A quantified-edge inline predicate is edge-only.** A predicate inside a
+  quantified edge may reference only that edge — the per-path traversal has
+  nowhere to evaluate a cross-variable constraint: *"A predicate inside a
+  quantified edge may only reference that edge"*.
+- **DIFFERENT EDGES is the default and the only mode** (R2). No edge record
+  binds twice within one MATCH statement; nodes repeat freely. The `REPEATABLE
+  ELEMENTS` / explicit `DIFFERENT EDGES` `matchMode` syntax still parses-then-
+  rejects (`"KEEP clauses are not supported yet"` and the match-mode rejections
+  are unchanged from v1's parse surface).
+- **OPTIONAL null semantics** (R3): a binding first introduced inside an
+  `OPTIONAL` binds `Value::Null` on a miss (including a group → Null, never
+  `[]`, and a path → Null). A predicate written *inside* the optional evaluates
+  pre-null (it is part of the optional's own match); a predicate *outside*
+  referencing an optional binding evaluates post-null. A query may not **start**
+  with `OPTIONAL` (*"A query cannot start with OPTIONAL MATCH: OPTIONAL is a
+  left-outer join and needs a preceding MATCH to join against"*), and a node
+  first bound inside an `OPTIONAL` may not be re-declared in a mandatory clause
+  (*"Variable \`{}\` was first bound inside an OPTIONAL and cannot be
+  re-declared outside it"*).
+- **ORDER-BY scoping** (R7): without `DISTINCT`, `ORDER BY` takes full
+  expressions over **all** bindings (returned or not), evaluated pre-projection
+  on the binding rows — so `ORDER BY a.age` is valid even when `a` is not in the
+  `RETURN` list. With `DISTINCT`, only returned columns may be referenced
+  (*"With RETURN DISTINCT, ORDER BY may only reference returned columns"*) — a
+  message change from v1's broader *"ORDER BY may only reference RETURN items"*.
+
+### Rejections that are unchanged from v1
+
+Still rejected (parse-then-reject or lowering rejection), with their messages
+intact: undirected/multi-directional edges (*"Undirected and multi-directional
+edge patterns are not supported yet"*), label expressions beyond a single name
+(*"Label expressions (`!`, `&`, `|`, `%`) are not supported yet"*), `GROUP BY`,
+aggregates (*"Aggregate functions are not supported yet"*) and every other
+function call (*"The function `{}` is not supported yet"*), `NULLS FIRST|LAST`
+(*"`NULLS FIRST`/`NULLS LAST` ordering is not supported yet"*), `XOR` (*"`XOR`
+is not supported yet"*), `KEEP`, `YIELD`, `EXISTS`/`CASE`/`CAST`, mutations,
+path-search and path-mode prefixes (`SHORTEST`, `TRAIL`, …), and all the
+`UNION`/`EXCEPT`/`INTERSECT`/`OTHERWISE` composition and `USE`-graph forms. v2
+adds five *new* rejections that did not exist in v1 because the constructs they
+guard were wholly rejected before: repeated edge variable, kind-mismatched
+reuse, optional-rebind, cross-variable quantified-edge predicate, and
+property-access-on-group/path-var (all quoted above or in `LOWERING.md`).

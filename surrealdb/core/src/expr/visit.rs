@@ -302,6 +302,28 @@ implement_visitor! {
 		Expr::Explain { statement, .. } => {
 			this.visit_expr(statement)?;
 		},
+		#[cfg(feature = "opengql")]
+		Expr::Match(plan) => {
+			// Walk every reachable Expr: clause predicates, output columns,
+			// ORDER BY exprs, and SKIP/LIMIT.
+			for clause in plan.clauses.iter(){
+				for predicate in clause.predicates.iter(){
+					this.visit_expr(&predicate.expr)?;
+				}
+			}
+			for column in plan.output.columns.iter(){
+				this.visit_expr(&column.expr)?;
+			}
+			for order in plan.output.order.iter(){
+				this.visit_expr(&order.expr)?;
+			}
+			if let Some(skip) = plan.output.skip.as_ref(){
+				this.visit_expr(skip)?;
+			}
+			if let Some(limit) = plan.output.limit.as_ref(){
+				this.visit_expr(limit)?;
+			}
+		},
 	}
 
 	Ok(())
@@ -1825,6 +1847,28 @@ implement_visitor_mut! {
 		},
 		Expr::Explain { statement, .. } => {
 			this.visit_mut_expr(statement)?;
+		},
+		#[cfg(feature = "opengql")]
+		Expr::Match(plan) => {
+			// Walk every reachable Expr: clause predicates, output columns,
+			// ORDER BY exprs, and SKIP/LIMIT.
+			for clause in plan.clauses.iter_mut(){
+				for predicate in clause.predicates.iter_mut(){
+					this.visit_mut_expr(&mut predicate.expr)?;
+				}
+			}
+			for column in plan.output.columns.iter_mut(){
+				this.visit_mut_expr(&mut column.expr)?;
+			}
+			for order in plan.output.order.iter_mut(){
+				this.visit_mut_expr(&mut order.expr)?;
+			}
+			if let Some(skip) = plan.output.skip.as_mut(){
+				this.visit_mut_expr(skip)?;
+			}
+			if let Some(limit) = plan.output.limit.as_mut(){
+				this.visit_mut_expr(limit)?;
+			}
 		},
 	}
 

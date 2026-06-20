@@ -1,15 +1,15 @@
 /**
 [test]
-reason = "Lowering rejection: a repeated pattern variable is an equality join, which v1 does not lower."
+reason = "Lowering rejection: reusing a node variable as an edge is a kind mismatch (a node-as-node reuse is now a join key; only kind-mismatched reuse is rejected)."
 
 [test.results]
-parsing-error = '''
-Variable `n` is declared more than once in the pattern
+parsing-error = """
+Variable `n` is already bound as a node but reused as an edge
   --> [15:19]
    |
 15 | MATCH (n:person)-[n:knows]->(b:person) RETURN n
-   |                   ^ joins on a repeated variable are not supported yet
-'''
+   |                   ^ use a fresh name, or reuse the variable as the same kind of element
+"""
 */
 
 MATCH (n:person)-[n:knows]->(b:person) RETURN n

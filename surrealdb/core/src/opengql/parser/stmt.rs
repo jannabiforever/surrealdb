@@ -11,46 +11,31 @@
 use reblessive::Stk;
 
 use crate::opengql::ast::{
-	GqlExpr, GqlLiteral, GqlStatement, MatchClause, MatchQuery, OrderItem, ReturnClause,
-	ReturnItem, ReturnItems, SetQuantifier,
+	GqlExpr, GqlLiteral, GqlStatement, MatchClause, MatchItem, MatchQuery, OptionalBlock,
+	OrderItem, ReturnClause, ReturnItem, ReturnItems, SetQuantifier,
 };
-use crate::opengql::parser::mac::{expected, unexpected};
+use crate::opengql::parser::mac::{enter_object_recursion, expected, unexpected};
 use crate::opengql::parser::{ParseResult, Parser};
 use crate::opengql::token::{NumberKind, Span, TokenKind, t};
 use crate::syn::error::bail;
 
 impl Parser<'_> {
-	/// Parse a top level statement: zero or more `MATCH` clauses followed by
-	/// a `RETURN` clause.
+	/// Parse a top level statement: zero or more `MATCH` items (plain or
+	/// `OPTIONAL`) followed by a `RETURN` clause.
 	pub(super) async fn parse_statement(&mut self, stk: &mut Stk) -> ParseResult<GqlStatement> {
-		let mut matches = Vec::new();
+		let mut items = Vec::new();
 		loop {
 			let token = self.peek();
 			match token.kind {
 				t!("MATCH") => {
 					self.pop_peek();
-					let clause = self.parse_match_clause(stk, false, token.span).await?;
-					matches.push(clause);
+					let clause = self.parse_match_clause(stk, token.span).await?;
+					items.push(MatchItem::Match(clause));
 				}
 				t!("OPTIONAL") => {
 					self.pop_peek();
-					let next = self.peek();
-					match next.kind {
-						t!("MATCH") => {
-							self.pop_peek();
-							let clause = self.parse_match_clause(stk, true, token.span).await?;
-							matches.push(clause);
-						}
-						// `optionalOperand` also allows `{`/`(` delimited
-						// match statement blocks (GQL.g4:590-594).
-						t!("{") | t!("(") => {
-							bail!(
-								"OPTIONAL MATCH blocks are not supported yet",
-								@token.span.covers(next.span) => "use a plain `OPTIONAL MATCH` clause"
-							);
-						}
-						_ => unexpected!(self, next, "`MATCH`"),
-					}
+					let block = stk.run(|stk| self.parse_optional_operand(stk, token.span)).await?;
+					items.push(MatchItem::Optional(block));
 				}
 				t!("RETURN") => break,
 				t!("FINISH") => {
@@ -92,21 +77,95 @@ impl Parser<'_> {
 		let ret = self.parse_return_clause(stk).await?;
 		self.check_trailing_clauses()?;
 		Ok(GqlStatement::Match(MatchQuery {
-			matches,
+			items,
 			ret,
 		}))
 	}
 
-	/// Parse a `MATCH` clause graph pattern: `matchMode? pathPatternList
-	/// keepClause? graphPatternWhereClause?` (GQL.g4:803). The `MATCH` (and
-	/// `OPTIONAL`) keywords must already be consumed; `start` is the span of
-	/// the first of them.
-	async fn parse_match_clause(
+	/// Parse an `OPTIONAL` operand (`optionalOperand`, GQL.g4:591), all three
+	/// grammar forms. The `OPTIONAL` keyword must already be consumed; `start`
+	/// is its span.
+	///
+	/// - plain `OPTIONAL MATCH <pattern…>` ⇒ a block of exactly one item;
+	/// - block `OPTIONAL { matchStatement+ }`;
+	/// - paren `OPTIONAL ( matchStatement+ )`.
+	///
+	/// The brace/paren forms hold a `matchStatementBlock` whose statements may
+	/// themselves be further `OPTIONAL`s; each block delimiter charges the
+	/// object-recursion budget (mirroring nested label/expr parens) so that
+	/// `OPTIONAL { OPTIONAL { … } }` cannot overflow the machine stack.
+	async fn parse_optional_operand(
 		&mut self,
 		stk: &mut Stk,
-		optional: bool,
 		start: Span,
-	) -> ParseResult<MatchClause> {
+	) -> ParseResult<OptionalBlock> {
+		let token = self.peek();
+		match token.kind {
+			t!("MATCH") => {
+				self.pop_peek();
+				let clause = self.parse_match_clause(stk, token.span).await?;
+				Ok(OptionalBlock {
+					span: start.covers(self.last_span()),
+					items: vec![MatchItem::Match(clause)],
+				})
+			}
+			// The `{`/`(` block forms (GQL.g4:593-594). `expect_closing_delimiter`
+			// pairs the close with the recorded open span on a mismatch.
+			t!("{") => {
+				enter_object_recursion!(this = self => {
+					let open = this.pop_peek().span;
+					let items = stk.run(|stk| this.parse_match_statement_block(stk)).await?;
+					this.expect_closing_delimiter(t!("}"), open)?;
+					Ok(OptionalBlock {
+						span: start.covers(this.last_span()),
+						items,
+					})
+				})
+			}
+			t!("(") => {
+				enter_object_recursion!(this = self => {
+					let open = this.pop_peek().span;
+					let items = stk.run(|stk| this.parse_match_statement_block(stk)).await?;
+					this.expect_closing_delimiter(t!(")"), open)?;
+					Ok(OptionalBlock {
+						span: start.covers(this.last_span()),
+						items,
+					})
+				})
+			}
+			_ => unexpected!(self, token, "`MATCH`, `{` or `(`"),
+		}
+	}
+
+	/// Parse a `matchStatementBlock`: one or more `matchStatement`s
+	/// (GQL.g4:597), each a plain `MATCH` clause or a nested `OPTIONAL`
+	/// operand. At least one statement is required.
+	async fn parse_match_statement_block(&mut self, stk: &mut Stk) -> ParseResult<Vec<MatchItem>> {
+		let mut items = Vec::new();
+		loop {
+			let token = self.peek();
+			match token.kind {
+				t!("MATCH") => {
+					self.pop_peek();
+					let clause = self.parse_match_clause(stk, token.span).await?;
+					items.push(MatchItem::Match(clause));
+				}
+				t!("OPTIONAL") => {
+					self.pop_peek();
+					let block = stk.run(|stk| self.parse_optional_operand(stk, token.span)).await?;
+					items.push(MatchItem::Optional(block));
+				}
+				_ if items.is_empty() => unexpected!(self, token, "`MATCH` or `OPTIONAL`"),
+				_ => break,
+			}
+		}
+		Ok(items)
+	}
+
+	/// Parse a `MATCH` clause graph pattern: `matchMode? pathPatternList
+	/// keepClause? graphPatternWhereClause?` (GQL.g4:803). The `MATCH` keyword
+	/// must already be consumed; `start` is its span.
+	async fn parse_match_clause(&mut self, stk: &mut Stk, start: Span) -> ParseResult<MatchClause> {
 		// `REPEATABLE`/`DIFFERENT` are non-reserved words, so they are only a
 		// match mode when followed by their element/edge synonym; otherwise
 		// they can begin a path pattern as a path variable.
@@ -175,7 +234,6 @@ impl Parser<'_> {
 		}
 
 		Ok(MatchClause {
-			optional,
 			patterns,
 			where_clause,
 			span: start.covers(self.last_span()),

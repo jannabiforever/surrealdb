@@ -1,162 +1,106 @@
-//! GQL expression lowering, parameterized by scope.
+//! GQL expression lowering with uniform binding addressing.
 //!
-//! Implements the variable addressing tables of `doc/opengql/LOWERING.md`
-//! §2.2 and the three-valued-logic guard rules of §4. Predicates are
-//! normalized to negation normal form on the fly: a `negated` flag is pushed
-//! through `NOT`/`AND`/`OR` (De Morgan, never distributing ORs) and into the
-//! comparison and truth-test leaves, where each effective comparison is
-//! guarded so that a `NULL`/`NONE` operand excludes the row — matching GQL's
-//! UNKNOWN-excluded `WHERE` semantics under SurrealQL's two-valued
-//! total-order comparisons.
+//! Implements the three-valued-logic guard rules of `doc/opengql/V2_DESIGN.md`
+//! §8 (kept verbatim from the v1 contract): predicates are normalized to
+//! negation normal form on the fly — a `negated` flag is pushed through
+//! `NOT`/`AND`/`OR` (De Morgan, never distributing ORs) and into the comparison
+//! and truth-test leaves, where each effective comparison is guarded so that a
+//! `NULL`/`NONE` operand excludes the row, matching GQL's UNKNOWN-excluded
+//! `WHERE` semantics under SurrealQL's two-valued total-order comparisons.
+//!
+//! The v1 scope tables (Role × ScopeKind, the `__a`/`__m`/`$parent`
+//! rewrites) are gone: every binding is a row field addressed by its name, so
+//! a variable `v` lowers to `Idiom[Field("v")]` and `v.x` to
+//! `Idiom[Field("v"), Field("x")]`, in every position. Group and path bindings
+//! hold composite values (an edge list / an alternating array) with no field
+//! structure, so property access on them is rejected.
 //!
 //! All recursion over expressions runs on a [`reblessive`] stack: the parser
 //! deliberately builds arbitrarily deep *linear* chains (binary operator
 //! spines, property and `NOT` chains) without consuming its nesting budget,
 //! so the lowering must not recurse on the machine stack either.
+//!
+//! Expressions are still built as [`crate::sql::Expr`] here and converted to
+//! [`crate::expr::Expr`] per slot by the caller; the guard and NNF machinery is
+//! unchanged from v1, only the variable-addressing leaf differs.
 
 use reblessive::Stk;
 
+use crate::expr::match_plan::{BindingId, BindingKind};
 use crate::opengql::ast::{
 	BinaryOp, GqlExpr, GqlLiteral, Ident, SetQuantifier, TruthValue, UnaryOp,
 };
+use crate::opengql::lower::binding::Registry;
 use crate::opengql::lower::naming;
 use crate::sql::literal::ObjectEntry;
 use crate::sql::{BinaryOperator, Expr, Idiom, Literal, Param, Part, PrefixOperator};
 use crate::syn::error::{SyntaxError, bail, syntax_error};
 use crate::syn::token::Span;
 
-/// The role a pattern variable plays in the lowered binding shape.
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
-pub(super) enum Role {
-	/// The leftmost (anchor) node: the `FROM` table, bound as `__a`.
-	Anchor,
-	/// The edge of the hop, bound as `__m`.
-	Edge,
-	/// The node at the far end of the hop, derived from the edge.
-	FarNode,
-}
-
-/// The named pattern variables of the lowered path pattern, plus the
-/// structural facts variable addressing depends on.
-pub(super) struct Bindings {
-	/// `name → role`, in pattern order.
-	pub vars: Vec<(String, Role)>,
-	/// The edge field the far node is derived from: `out` for `->`, `in`
-	/// for `<-`.
-	pub far_field: &'static str,
-	/// Whether the hop is variable-length (§6), in which case the `__m`
-	/// elements are RecordIds rather than full edge objects.
-	pub var_length: bool,
-}
-
-impl Bindings {
-	/// Resolves a variable reference to its role.
-	pub fn resolve(&self, ident: &Ident) -> Result<Role, SyntaxError> {
-		self.vars.iter().find(|(name, _)| *name == ident.name).map(|(_, role)| *role).ok_or_else(
-			|| {
-				syntax_error!(
-					"Unknown variable `{}`",
-					ident.name,
-					@ident.span => "variables must be declared in the MATCH pattern"
-				)
-			},
-		)
-	}
-}
-
-/// The scope an expression is lowered in, selecting one of the §2.2
-/// addressing tables.
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
-pub(super) enum ScopeKind {
-	/// The anchor SELECT: its `WHERE` in the hop shapes, and the entire
-	/// single SELECT of the degenerate no-edge shape.
-	Anchor,
-	/// The `cond` of the L1 graph lookup (per-edge filtering).
-	Edge,
-	/// The post-split L3 layer: projections, residual predicates, ORDER BY.
-	PostSplit,
-}
-
+/// The binding context an expression is lowered in: the clause registry, used
+/// to resolve variable references to bindings and to reject property access on
+/// composite (group/path) bindings.
+///
+/// A unit struct in PR-A — every expression lowers against the one clause's
+/// registry — but kept as a named scope so the OPTIONAL-clause scoping of PR-C
+/// has a seam to extend.
 pub(super) struct Scope<'a> {
-	pub kind: ScopeKind,
-	pub bindings: &'a Bindings,
+	pub(super) registry: &'a Registry,
 }
 
 impl Scope<'_> {
+	/// Whether a bare variable reference is optional-bound — declared inside an
+	/// `OPTIONAL` operand (`optional_depth > 0`) — and so can hold `Value::Null`
+	/// on an optional miss (R3). The `nullable()` amendment (V2_DESIGN §8) uses
+	/// this: a bare `Variable(v)` is nullable iff this is `true`. An unknown
+	/// variable is not optional-bound here (the reference is reported elsewhere
+	/// when it is actually lowered).
+	fn variable_is_optional(&self, ident: &Ident) -> bool {
+		self.registry.resolve(ident).map(|id| self.registry.optional_depth(id) > 0).unwrap_or(false)
+	}
+
 	/// Lowers a reference to a pattern variable, optionally suffixed with a
-	/// property chain, per the addressing tables of §2.2.
-	pub(super) fn role_expr(
+	/// property chain, to the binding-row idiom `binding(.prop)*`.
+	fn binding_expr(&self, ident: &Ident, props: &[&Ident]) -> Result<Expr, SyntaxError> {
+		let id = self.registry.resolve(ident)?;
+		let kind = self.registry.kind(id);
+		let prop_span = props.first().map(|p| p.span);
+		self.binding_idiom(&ident.name, kind, props, prop_span)
+	}
+
+	/// Builds the binding-row idiom `binding(.prop)*` for a resolved binding,
+	/// rejecting property access on a group or path binding: those bindings
+	/// hold composite values (an edge list / an alternating node-edge array)
+	/// with no addressable field structure yet.
+	fn binding_idiom(
 		&self,
-		role: Role,
+		name: &str,
+		kind: BindingKind,
 		props: &[&Ident],
-		span: Span,
+		prop_span: Option<Span>,
 	) -> Result<Expr, SyntaxError> {
-		let far = self.bindings.far_field;
-		let parts: Vec<Part> = match (self.kind, role) {
-			(ScopeKind::Anchor, Role::Anchor) => {
-				if props.is_empty() {
-					return Ok(Expr::Param(Param::new("this")));
+		if !props.is_empty() {
+			match kind {
+				BindingKind::EdgeGroup | BindingKind::Path => {
+					bail!(
+						"Property access on a group or path variable is not supported yet",
+						@prop_span.unwrap_or_else(Span::empty) => "return the variable itself"
+					);
 				}
-				field_parts(props)
+				BindingKind::Node | BindingKind::Edge => {}
 			}
-			(ScopeKind::Edge, Role::Edge) if !props.is_empty() => field_parts(props),
-			(ScopeKind::Edge, Role::FarNode) if !props.is_empty() => {
-				let mut parts = vec![Part::Field(far.into())];
-				parts.extend(field_parts(props));
-				parts
-			}
-			(ScopeKind::Edge, Role::Anchor) => {
-				if props.is_empty() {
-					return Ok(Expr::Param(Param::new("parent")));
-				}
-				let mut parts = vec![Part::Start(Expr::Param(Param::new("parent")))];
-				parts.extend(field_parts(props));
-				parts
-			}
-			(ScopeKind::PostSplit, Role::Anchor) => {
-				let mut parts = vec![Part::Field("__a".into())];
-				parts.extend(field_parts(props));
-				parts
-			}
-			(ScopeKind::PostSplit, Role::Edge) => {
-				let mut parts = vec![Part::Field("__m".into())];
-				parts.extend(field_parts(props));
-				parts
-			}
-			(ScopeKind::PostSplit, Role::FarNode) => {
-				let mut parts = vec![Part::Field("__m".into())];
-				if !self.bindings.var_length {
-					parts.push(Part::Field(far.into()));
-				}
-				if props.is_empty() {
-					parts.push(Part::All);
-				} else {
-					parts.extend(field_parts(props));
-				}
-				parts
-			}
-			// The conjunct classifier only routes edge-scope-expressible
-			// conjuncts into the lookup cond; reaching this arm is a
-			// lowering bug, reported as an error rather than a panic.
-			(ScopeKind::Anchor | ScopeKind::Edge, _) => {
-				return Err(syntax_error!(
-					"Internal error: variable is not addressable in this scope",
-					@span
-				));
-			}
-		};
+		}
+		let mut parts = Vec::with_capacity(props.len() + 1);
+		parts.push(Part::Field(name.to_owned().into()));
+		parts.extend(props.iter().map(|p| Part::Field(p.name.clone().into())));
 		Ok(Expr::Idiom(Idiom(parts)))
 	}
 }
 
-fn field_parts(props: &[&Ident]) -> Vec<Part> {
-	props.iter().map(|p| Part::Field(p.name.clone().into())).collect()
-}
-
 /// Lowers a GQL expression in value position (projections, sort keys,
-/// comparison operands): variable references resolve per the scope's
-/// addressing table; comparisons and logical operators lower two-valued —
-/// the §4 guards apply to predicate position only.
+/// comparison operands): variable references resolve to binding-row idioms;
+/// comparisons and logical operators lower two-valued — the §4 guards apply to
+/// predicate position only.
 pub(super) async fn lower_value(
 	stk: &mut Stk,
 	expr: &GqlExpr,
@@ -168,10 +112,7 @@ pub(super) async fn lower_value(
 			name,
 			span,
 		} => lower_param(name, *span),
-		GqlExpr::Variable(ident) => {
-			let role = scope.bindings.resolve(ident)?;
-			scope.role_expr(role, &[], ident.span)
-		}
+		GqlExpr::Variable(ident) => scope.binding_expr(ident, &[]),
 		GqlExpr::Property(..) => lower_property(stk, expr, scope).await,
 		GqlExpr::Unary {
 			op,
@@ -309,21 +250,23 @@ pub(super) async fn lower_predicate(
 
 /// Lowers a property-map entry on a pattern element into the
 /// `<element>.key = value` equality conjunct (§3), with the §4 equality
-/// guards. The element is addressed by role so that elements without a
-/// variable still lower.
+/// guards. The element is addressed by its binding (an anonymous element has a
+/// hidden binding, so it still lowers).
 pub(super) async fn lower_prop_equality(
 	stk: &mut Stk,
-	role: Role,
+	binding: BindingId,
+	binding_name: &str,
 	key: &Ident,
 	value: &GqlExpr,
 	scope: &Scope<'_>,
 ) -> Result<Expr, SyntaxError> {
-	let left = scope.role_expr(role, &[key], key.span)?;
+	let kind = scope.registry.kind(binding);
+	let left = scope.binding_idiom(binding_name, kind, &[key], Some(key.span))?;
 	// The property side is always nullable; guard only when the value side
 	// is nullable too (§4: `x = <literal>` needs no guard).
-	let guards = if nullable(value) {
+	let guards = if nullable(value, scope) {
 		let mut atoms = vec![left.clone()];
-		for atom in nullable_atoms(value) {
+		for atom in nullable_atoms(value, scope) {
 			let atom = stk.run(|stk| lower_value(stk, atom, scope)).await?;
 			if !atoms.contains(&atom) {
 				atoms.push(atom);
@@ -379,23 +322,23 @@ async fn lower_comparison(
 		// Ordering comparisons: SurrealQL's total order sorts NULL/NONE
 		// below numbers, so every nullable operand needs a guard (E8a/E8b).
 		BinaryOp::Lt | BinaryOp::Lte | BinaryOp::Gt | BinaryOp::Gte => {
-			let mut atoms = nullable_atoms(left);
-			atoms.extend(nullable_atoms(right));
+			let mut atoms = nullable_atoms(left, scope);
+			atoms.extend(nullable_atoms(right, scope));
 			atoms
 		}
 		// `=` deviates from GQL only when both sides can be null
 		// (`NULL = NULL` is true in SurrealQL — E8c); a one-sided null
 		// already compares unequal and excludes the row.
-		BinaryOp::Eq if nullable(left) && nullable(right) => {
-			let mut atoms = nullable_atoms(left);
-			atoms.extend(nullable_atoms(right));
+		BinaryOp::Eq if nullable(left, scope) && nullable(right, scope) => {
+			let mut atoms = nullable_atoms(left, scope);
+			atoms.extend(nullable_atoms(right, scope));
 			atoms
 		}
 		// `<>` deviates whenever either side can be null (`NULL != 1` is
 		// true in SurrealQL but UNKNOWN in GQL), so guard one-sided too.
-		BinaryOp::Neq if nullable(left) || nullable(right) => {
-			let mut atoms = nullable_atoms(left);
-			atoms.extend(nullable_atoms(right));
+		BinaryOp::Neq if nullable(left, scope) || nullable(right, scope) => {
+			let mut atoms = nullable_atoms(left, scope);
+			atoms.extend(nullable_atoms(right, scope));
 			atoms
 		}
 		_ => Vec::new(),
@@ -520,10 +463,14 @@ fn equality(left: Expr, literal: Literal, negated: bool) -> Expr {
 
 /// Collects the §4 guard atoms of a comparison operand: the property
 /// accesses and parameters which can evaluate to `NULL`/`NONE`, reachable
-/// through arithmetic, concatenation and sign operators. Literals,
-/// containers, bound variables and boolean-valued sub-expressions are never
-/// guarded.
-fn nullable_atoms(expr: &GqlExpr) -> Vec<&GqlExpr> {
+/// through arithmetic, concatenation and sign operators. Literals, containers
+/// and boolean-valued sub-expressions are never guarded.
+///
+/// Amendment (V2_DESIGN §8): a bare optional-bound variable `v` (one declared
+/// inside an `OPTIONAL`) is also a guard atom — on an optional miss its whole
+/// binding is `Value::Null` (R3), so a comparison reading it must exclude the
+/// pre-null row. A mandatory bare variable still never needs a guard.
+fn nullable_atoms<'a>(expr: &'a GqlExpr, scope: &Scope<'_>) -> Vec<&'a GqlExpr> {
 	let mut out = Vec::new();
 	let mut stack = vec![expr];
 	while let Some(e) = stack.pop() {
@@ -532,6 +479,7 @@ fn nullable_atoms(expr: &GqlExpr) -> Vec<&GqlExpr> {
 			| GqlExpr::Param {
 				..
 			} => out.push(e),
+			GqlExpr::Variable(ident) if scope.variable_is_optional(ident) => out.push(e),
 			GqlExpr::Unary {
 				op: UnaryOp::Neg | UnaryOp::Plus,
 				expr,
@@ -553,7 +501,10 @@ fn nullable_atoms(expr: &GqlExpr) -> Vec<&GqlExpr> {
 }
 
 /// Returns whether a comparison operand can evaluate to `NULL`/`NONE`.
-fn nullable(expr: &GqlExpr) -> bool {
+///
+/// Amendment (V2_DESIGN §8): a bare optional-bound variable is nullable (it is
+/// `Value::Null` on an optional miss, R3); a mandatory bare variable is not.
+fn nullable(expr: &GqlExpr, scope: &Scope<'_>) -> bool {
 	let mut stack = vec![expr];
 	while let Some(e) = stack.pop() {
 		match e {
@@ -562,6 +513,7 @@ fn nullable(expr: &GqlExpr) -> bool {
 				..
 			}
 			| GqlExpr::Literal(GqlLiteral::Null, _) => return true,
+			GqlExpr::Variable(ident) if scope.variable_is_optional(ident) => return true,
 			GqlExpr::Unary {
 				op: UnaryOp::Neg | UnaryOp::Plus,
 				expr,
@@ -639,8 +591,8 @@ fn lower_literal(literal: &GqlLiteral) -> Expr {
 }
 
 /// Lowers a property access chain: a chain rooted at a pattern variable
-/// resolves per the scope's addressing table; any other root lowers as a
-/// value and the chain is appended as idiom fields.
+/// resolves to a binding-row idiom; any other root lowers as a value and the
+/// chain is appended as idiom fields.
 async fn lower_property(
 	stk: &mut Stk,
 	expr: &GqlExpr,
@@ -654,10 +606,7 @@ async fn lower_property(
 	}
 	names.reverse();
 	match base {
-		GqlExpr::Variable(ident) => {
-			let role = scope.bindings.resolve(ident)?;
-			scope.role_expr(role, &names, ident.span)
-		}
+		GqlExpr::Variable(ident) => scope.binding_expr(ident, &names),
 		other => {
 			let start = stk.run(|stk| lower_value(stk, other, scope)).await?;
 			let mut parts = match start {

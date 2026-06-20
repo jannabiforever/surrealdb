@@ -13,7 +13,6 @@ use surrealdb_core::dbs::capabilities::Targets;
 use surrealdb_core::dbs::{Capabilities, Session};
 use surrealdb_core::env::VERSION;
 use surrealdb_core::kvs::{Builder, Datastore};
-use surrealdb_core::opengql;
 
 use crate::cli::{Backend, ColorMode};
 use crate::cmd::bench::stats::{ComparisonData, MeasurementData};
@@ -507,11 +506,18 @@ enum BenchRunResult {
 	Ok(MeasurementData, Option<ComparisonData>),
 }
 
-/// The executable form of a bench case: raw SurrealQL source, or a GraphQL
-/// request executed against the schema generated for the prepared datastore.
+/// The executable form of a bench case: raw SurrealQL source, a lowered OpenGQL
+/// plan, or a GraphQL request executed against the schema generated for the
+/// prepared datastore.
 enum BenchStatement {
 	SurrealQl,
-	OpenGql,
+	/// A parsed-and-lowered OpenGQL plan. Parse + lowering happen once in
+	/// `prepare`, so the timed iterations measure plan execution only (mirroring
+	/// the GraphQL arm, which generates its schema up front). The plan is cloned
+	/// per iteration because `process_opengql` consumes it by value.
+	OpenGql {
+		plan: surrealdb_core::opengql::PreparedGqlQuery,
+	},
 	GraphQl {
 		schema: async_graphql::dynamic::Schema,
 		/// The case source with the config comment blanked out, computed once.
@@ -534,7 +540,26 @@ impl BenchStatement {
 	) -> Result<Self> {
 		match run.case.test.dialect {
 			Dialect::SurrealQl => Ok(Self::SurrealQl),
-			Dialect::OpenGql => Ok(Self::OpenGql),
+			Dialect::OpenGql => {
+				// Parse + lower the `.gql` source once, exactly as the run path
+				// does (see `cmd::run::run_test_with_dbs`), so the timed loop
+				// measures only `process_opengql`.
+				let settings = surrealdb_core::opengql::GqlParserSettings::default();
+				let source = run.case.test.source.as_bytes();
+				let plan = surrealdb_core::opengql::parse_to_plan_with_settings(
+					&run.case.test.source,
+					settings,
+				)
+				.map_err(|e| {
+					anyhow!(
+						"Failed to parse/lower OpenGQL bench statement: {}",
+						e.render_on_bytes(source)
+					)
+				})?;
+				Ok(Self::OpenGql {
+					plan,
+				})
+			}
 			Dialect::GraphQl => {
 				let schema = graphql::generate_schema(dbs, session)
 					.await
@@ -563,20 +588,12 @@ impl BenchStatement {
 			Self::SurrealQl => {
 				let _ = dbs.execute(&run.case.test.source, session, None).await?;
 			}
-			Self::OpenGql => {
-				// Mirror the SurrealQL arm: parse + process inside the timed
-				// loop, so OpenGQL benches measure the same end-to-end pipeline.
-				// OpenGQL has no capability-gated syntax, so default parser
-				// settings apply (matching the run command).
-				let settings = opengql::GqlParserSettings::default();
-				let query = opengql::parse_to_ast_with_settings(&run.case.test.source, settings)
-					.map_err(|e| {
-						anyhow!(
-							"Failed to parse OpenGQL bench statement: {}",
-							e.render_on_bytes(run.case.test.source.as_bytes())
-						)
-					})?;
-				let _ = dbs.process(query, session, None).await?;
+			Self::OpenGql {
+				plan,
+			} => {
+				// `process_opengql` takes the plan by value, so each iteration
+				// executes a fresh clone of the once-lowered plan.
+				let _ = dbs.process_opengql(plan.clone(), session, None).await?;
 			}
 			Self::GraphQl {
 				schema,

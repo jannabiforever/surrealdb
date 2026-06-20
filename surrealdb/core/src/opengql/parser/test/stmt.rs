@@ -5,8 +5,9 @@
 
 use rstest::rstest;
 
-use super::{parse, parse_err, parse_return_items};
-use crate::opengql::ast::{GqlExpr, GqlLiteral, ReturnItems, SetQuantifier};
+use super::{match_clauses, parse, parse_err, parse_return_items};
+use crate::opengql::ast::{GqlExpr, GqlLiteral, MatchItem, ReturnItems, SetQuantifier};
+use crate::opengql::{GqlParserSettings, parse_with_settings};
 
 /// Asserts that a count specification holds the given integer literal.
 #[track_caller]
@@ -183,27 +184,44 @@ fn count_specification_errors(#[case] source: &str, #[case] expected: &str) {
 
 #[test]
 fn multiple_match_clauses() {
+	// A plain MATCH, an `OPTIONAL MATCH`, then a plain MATCH, interleaved.
 	let query = parse("MATCH (a) WHERE a.x OPTIONAL MATCH (b) WHERE b.y MATCH (c) RETURN 1");
-	let optional: Vec<_> = query.matches.iter().map(|x| x.optional).collect();
-	assert_eq!(optional, vec![false, true, false]);
-	assert!(query.matches[0].where_clause.is_some());
-	assert!(query.matches[1].where_clause.is_some());
-	assert!(query.matches[2].where_clause.is_none());
+	assert_eq!(query.items.len(), 3);
+
+	let MatchItem::Match(first) = &query.items[0] else {
+		panic!("expected a plain MATCH item, got {:?}", query.items[0]);
+	};
+	assert!(first.where_clause.is_some());
+
+	let MatchItem::Optional(block) = &query.items[1] else {
+		panic!("expected an OPTIONAL item, got {:?}", query.items[1]);
+	};
+	assert_eq!(block.items.len(), 1);
+	let MatchItem::Match(optional_clause) = &block.items[0] else {
+		panic!("expected a MATCH clause inside the OPTIONAL block");
+	};
+	assert!(optional_clause.where_clause.is_some());
+
+	let MatchItem::Match(third) = &query.items[2] else {
+		panic!("expected a plain MATCH item, got {:?}", query.items[2]);
+	};
+	assert!(third.where_clause.is_none());
 }
 
 #[test]
 fn return_without_match() {
 	let query = parse("RETURN 1");
-	assert!(query.matches.is_empty());
+	assert!(query.items.is_empty());
 }
 
 #[test]
 fn multiple_patterns_per_match() {
 	// `pathPatternList : pathPattern (COMMA pathPattern)*` (GQL.g4:830).
 	let query = parse("MATCH (a), (b)-[k]->(c), p = (d) RETURN 1");
-	assert_eq!(query.matches.len(), 1);
-	assert_eq!(query.matches[0].patterns.len(), 3);
-	assert_eq!(query.matches[0].patterns[2].path_var.as_ref().map(|x| x.name.as_str()), Some("p"));
+	let clauses = match_clauses(&query);
+	assert_eq!(clauses.len(), 1);
+	assert_eq!(clauses[0].patterns.len(), 3);
+	assert_eq!(clauses[0].patterns[2].path_var.as_ref().map(|x| x.name.as_str()), Some("p"));
 }
 
 #[test]
@@ -313,19 +331,152 @@ fn standalone_page_statements_rejected(#[case] source: &str, #[case] expected: &
 	assert!(error.contains(expected), "{error}");
 }
 
-#[rstest]
-#[case::brace("OPTIONAL { MATCH (a) } RETURN 1")]
-#[case::paren("OPTIONAL ( MATCH (a) ) RETURN 1")]
-fn optional_blocks_rejected(#[case] source: &str) {
-	// `optionalOperand` also allows `{`/`(` delimited blocks (GQL.g4:590).
-	let error = parse_err(source);
-	assert!(error.contains("OPTIONAL MATCH blocks are not supported yet"), "{error}");
+/// Asserts an item is a plain MATCH clause and returns it.
+#[track_caller]
+fn as_match(item: &MatchItem) -> &crate::opengql::ast::MatchClause {
+	match item {
+		MatchItem::Match(clause) => clause,
+		MatchItem::Optional(_) => panic!("expected a plain MATCH item, got {item:?}"),
+	}
+}
+
+/// Asserts an item is an OPTIONAL operand and returns its block.
+#[track_caller]
+fn as_optional(item: &MatchItem) -> &crate::opengql::ast::OptionalBlock {
+	match item {
+		MatchItem::Optional(block) => block,
+		MatchItem::Match(_) => panic!("expected an OPTIONAL item, got {item:?}"),
+	}
 }
 
 #[test]
-fn optional_requires_match() {
+fn optional_plain_match() {
+	// `optionalOperand : simpleMatchStatement` (GQL.g4:592): a plain
+	// `OPTIONAL MATCH` is represented as a block of exactly one inner clause.
+	let query = parse("OPTIONAL MATCH (a)-[:knows]->(b) WHERE b.x RETURN 1");
+	assert_eq!(query.items.len(), 1);
+	let block = as_optional(&query.items[0]);
+	assert_eq!(block.items.len(), 1);
+	let clause = as_match(&block.items[0]);
+	assert_eq!(clause.patterns.len(), 1);
+	assert!(clause.where_clause.is_some());
+}
+
+#[test]
+fn optional_brace_block_multi_clause() {
+	// `OPTIONAL LEFT_BRACE matchStatementBlock RIGHT_BRACE` (GQL.g4:593) with
+	// several inner MATCH statements forming one all-or-nothing unit.
+	let query = parse("MATCH (a) OPTIONAL { MATCH (a)-[:r]->(b) MATCH (b)-[:s]->(c) } RETURN 1");
+	assert_eq!(query.items.len(), 2);
+	as_match(&query.items[0]);
+	let block = as_optional(&query.items[1]);
+	assert_eq!(block.items.len(), 2);
+	for inner in &block.items {
+		assert_eq!(as_match(inner).patterns.len(), 1);
+	}
+}
+
+#[test]
+fn optional_paren_block() {
+	// `OPTIONAL LEFT_PAREN matchStatementBlock RIGHT_PAREN` (GQL.g4:594).
+	let query = parse("MATCH (a) OPTIONAL ( MATCH (a)-[:r]->(b) ) RETURN 1");
+	assert_eq!(query.items.len(), 2);
+	let block = as_optional(&query.items[1]);
+	assert_eq!(block.items.len(), 1);
+	as_match(&block.items[0]);
+}
+
+#[rstest]
+#[case::brace_in_brace("MATCH (a) OPTIONAL { OPTIONAL { MATCH (a)-[:r]->(b) } } RETURN 1")]
+#[case::paren_in_brace("MATCH (a) OPTIONAL { OPTIONAL ( MATCH (a)-[:r]->(b) ) } RETURN 1")]
+#[case::brace_in_paren("MATCH (a) OPTIONAL ( OPTIONAL { MATCH (a)-[:r]->(b) } ) RETURN 1")]
+fn optional_nested_blocks(#[case] source: &str) {
+	// `matchStatementBlock : matchStatement+` (GQL.g4:597), and a
+	// `matchStatement` may itself be an `optionalMatchStatement`, so OPTIONAL
+	// blocks nest.
+	let query = parse(source);
+	let outer = as_optional(&query.items[1]);
+	assert_eq!(outer.items.len(), 1);
+	let inner = as_optional(&outer.items[0]);
+	assert_eq!(inner.items.len(), 1);
+	as_match(&inner.items[0]);
+}
+
+#[test]
+fn optional_interleaved_with_plain_match() {
+	// Plain and OPTIONAL items mix freely in the leading `matchStatement+`.
+	let query = parse(
+		"MATCH (a) OPTIONAL MATCH (a)-[:r]->(b) MATCH (b)-[:s]->(c) OPTIONAL { MATCH (c)-[:t]->(d) } \
+		 RETURN 1",
+	);
+	assert_eq!(query.items.len(), 4);
+	as_match(&query.items[0]);
+	assert_eq!(as_optional(&query.items[1]).items.len(), 1);
+	as_match(&query.items[2]);
+	assert_eq!(as_optional(&query.items[3]).items.len(), 1);
+}
+
+#[test]
+fn optional_block_with_inner_optional_and_plain() {
+	// A block whose `matchStatement+` mixes a plain MATCH and a nested OPTIONAL.
+	let query =
+		parse("MATCH (a) OPTIONAL { MATCH (a)-[:r]->(b) OPTIONAL MATCH (b)-[:s]->(c) } RETURN 1");
+	let block = as_optional(&query.items[1]);
+	assert_eq!(block.items.len(), 2);
+	as_match(&block.items[0]);
+	assert_eq!(as_optional(&block.items[1]).items.len(), 1);
+}
+
+#[test]
+fn deeply_nested_optional_blocks_hit_the_recursion_limit() {
+	// Each OPTIONAL block delimiter charges the object-recursion budget, so a
+	// pathological stack of nested OPTIONAL blocks trips the depth limit rather
+	// than overflowing the machine stack. With a budget of 3 the fourth nested
+	// block delimiter exceeds it.
+	let settings = GqlParserSettings {
+		object_recursion_limit: 3,
+		..Default::default()
+	};
+	let source = "OPTIONAL { OPTIONAL { OPTIONAL { OPTIONAL { MATCH (a) } } } } RETURN 1";
+	let error = parse_with_settings(source, settings).expect_err("should exceed the limit");
+	let rendered = format!("{:?}", error.render_on(source));
+	assert!(rendered.contains("Exceeded query expression nesting depth limit"), "{rendered}");
+}
+
+#[test]
+fn pathological_nested_optional_blocks_fail_fast() {
+	// 100k unclosed OPTIONAL braces: the depth limit trips after the default
+	// budget; the parser must error without overflowing the machine stack.
+	let source = format!("{}RETURN 1", "OPTIONAL { ".repeat(100_000));
+	let error = parse_err(&source);
+	assert!(error.contains("Exceeded query expression nesting depth limit"), "{error}");
+}
+
+#[test]
+fn optional_requires_match_or_block() {
+	// `optionalOperand` is a MATCH, a brace block or a paren block; anything
+	// else after OPTIONAL is rejected.
 	let error = parse_err("OPTIONAL RETURN 1");
-	assert!(error.contains("expected `MATCH`"), "{error}");
+	assert!(error.contains("expected `MATCH`, `{` or `(`"), "{error}");
+}
+
+#[rstest]
+#[case::empty_brace("OPTIONAL { } RETURN 1")]
+#[case::empty_paren("OPTIONAL ( ) RETURN 1")]
+fn optional_empty_block_rejected(#[case] source: &str) {
+	// `matchStatementBlock : matchStatement+` (GQL.g4:597) requires at least
+	// one inner statement.
+	let error = parse_err(source);
+	assert!(error.contains("expected `MATCH` or `OPTIONAL`"), "{error}");
+}
+
+#[test]
+fn optional_unclosed_brace_block_rejected() {
+	// The inner block parses the MATCH clause, then the closing `}` is missing:
+	// `RETURN` ends the block loop and the close-delimiter check rejects it,
+	// pointing back at the opening `{`.
+	let error = parse_err("OPTIONAL { MATCH (a) RETURN 1");
+	assert!(error.contains("expected the delimiter `}`"), "{error}");
 }
 
 #[rstest]
@@ -349,7 +500,7 @@ fn match_mode_words_are_valid_path_variables(#[case] source: &str, #[case] expec
 	// element/edge synonym they are ordinary identifiers.
 	let query = parse(source);
 	assert_eq!(
-		query.matches[0].patterns[0].path_var.as_ref().map(|x| x.name.as_str()),
+		match_clauses(&query)[0].patterns[0].path_var.as_ref().map(|x| x.name.as_str()),
 		Some(expected)
 	);
 }

@@ -1,11 +1,16 @@
 //! The GQL abstract syntax tree.
 //!
 //! The AST represents the full parsed surface of the supported grammar subset
-//! (see `doc/opengql/REFERENCE.md`), deliberately wider than what v1
-//! executes: vectors are used where v1 later validates length one, and
-//! constructs such as `OPTIONAL MATCH`, path variables, label expressions and
-//! quantifiers are represented in full so that lowering can reject them with
-//! precise spans rather than the parser producing generic syntax errors.
+//! (see `doc/opengql/REFERENCE.md`), deliberately wider than what the lowering
+//! executes: constructs the lowering does not yet support — label expressions
+//! (`!`/`&`/`|`/`%`), undirected and multi-directional edges, `GROUP BY`,
+//! aggregates, and the like — are represented in full so the lowering can
+//! reject them with precise spans rather than the parser producing generic
+//! syntax errors. (The v2 lowering does execute the constructs an earlier
+//! draft parsed-then-rejected: `OPTIONAL MATCH`, comma-separated and
+//! multi-hop patterns, path variables, repeated node variables and the full
+//! quantifier set — see `doc/opengql/V2_DESIGN.md` and the v1→v2 table in
+//! `doc/opengql/REFERENCE.md`.)
 //!
 //! Every node carries (or can produce) a [`Span`] into the source text.
 
@@ -23,20 +28,50 @@ pub enum GqlStatement {
 	Match(MatchQuery),
 }
 
-/// A linear query: one or more MATCH clauses followed by a RETURN clause.
+/// A linear query: one or more MATCH items followed by a RETURN clause.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MatchQuery {
-	pub matches: Vec<MatchClause>,
+	pub items: Vec<MatchItem>,
 	pub ret: ReturnClause,
 }
 
-/// A single `MATCH` (or `OPTIONAL MATCH`) clause.
+/// A single item in the leading `matchStatement+` of a query
+/// (`matchStatement`, GQL.g4:578): either a plain `MATCH` clause or an
+/// `OPTIONAL` operand.
+///
+/// The `OPTIONAL` operand is its own variant — rather than a `bool` on
+/// [`MatchClause`] — because a brace/paren block (`OPTIONAL { MATCH …; MATCH …
+/// }`) groups *several* inner MATCH statements into one left-outer, all-or-
+/// nothing unit (V2_DESIGN R3); a flat per-clause flag cannot distinguish that
+/// from two independent `OPTIONAL MATCH` clauses.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MatchItem {
+	/// A plain `MATCH <pattern…>` clause.
+	Match(MatchClause),
+	/// An `OPTIONAL` operand: `OPTIONAL MATCH …` (the plain form is an
+	/// [`OptionalBlock`] of a single item), `OPTIONAL { … }` or `OPTIONAL ( …
+	/// )` (`optionalMatchStatement`, GQL.g4:587).
+	Optional(OptionalBlock),
+}
+
+/// The operand of an `OPTIONAL`: one or more inner [`MatchItem`]s forming a
+/// single left-outer, all-or-nothing unit (`matchStatementBlock`,
+/// GQL.g4:597). The plain `OPTIONAL MATCH …` form is a block of exactly one
+/// item; the brace/paren forms hold the block's `matchStatement+`, which may
+/// themselves nest further `OPTIONAL`s.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OptionalBlock {
+	pub items: Vec<MatchItem>,
+	/// The span from the `OPTIONAL` keyword to the end of the operand.
+	pub span: Span,
+}
+
+/// A single `MATCH` clause (`simpleMatchStatement`, GQL.g4:583).
 ///
 /// The `WHERE` clause belongs to the graph pattern of the MATCH clause
 /// (`graphPatternWhereClause`, GQL.g4:847), not to the enclosing statement.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MatchClause {
-	pub optional: bool,
 	pub patterns: Vec<PathPattern>,
 	pub where_clause: Option<GqlExpr>,
 	pub span: Span,

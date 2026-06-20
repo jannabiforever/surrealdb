@@ -42,12 +42,15 @@ documentation; the former is derived from reading the grammar.
 - `GQL.g4` — the full ANTLR4 grammar, verbatim.
 - `LICENSE` — upstream Apache-2.0 license text, verbatim.
 - `README.md` — this file (provenance + license).
-- `REFERENCE.md` — distilled, implementation-ready reference for the v1
-  read-only subset (MATCH / WHERE / RETURN / ORDER BY / SKIP-OFFSET / LIMIT),
-  with the grammar production names each section derives from.
+- `REFERENCE.md` — distilled, implementation-ready reference for the supported
+  read-only GQL surface (MATCH / OPTIONAL MATCH / multi-clause + multi-pattern /
+  variable-length quantifiers / path variables / WHERE / RETURN [DISTINCT] /
+  ORDER BY / SKIP-OFFSET / LIMIT), with the grammar production names each section
+  derives from and a v1 -> v2 behaviour-change table (§(h)).
 - `LOWERING.md` — the normative contract for lowering the parsed GQL AST onto
-  the SurrealQL surface AST, implemented by
-  `surrealdb/core/src/opengql/lower/`.
+  the `MatchPlan` IR (`surrealdb/core/src/expr/match_plan.rs`), embedded into the
+  logical plan as `Expr::Match` and executed by the streaming engine; implemented
+  by `surrealdb/core/src/opengql/lower/`.
 
 ## Updating
 

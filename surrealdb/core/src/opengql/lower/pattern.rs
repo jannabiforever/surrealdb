@@ -1,320 +1,340 @@
-//! Pattern shape analysis, predicate placement and the SELECT scaffolding.
+//! Pattern lowering: from a parsed MATCH clause to the declarative
+//! [`MatchClausePlan`] / [`PatternPlan`].
 //!
-//! Implements `doc/opengql/LOWERING.md` §2.1 (the degenerate single-node
-//! SELECT and the three-level L1 bind / L2 unnest / L3 return shape), §3
-//! (predicate placement), §6 (variable-length hops via `Part::Recurse`) and
-//! the pattern-level rejections of §7.
+//! Implements `doc/opengql/V2_DESIGN.md` §8. Every path pattern of the clause
+//! (comma-separated patterns lower side by side) becomes a [`PatternPlan`] of
+//! [`NodeStep`]/[`EdgeStep`] elements with its full multi-hop chain intact, and
+//! the clause's predicates — the explicit `WHERE`, the inline element `WHERE`s
+//! and the property-map equalities of every pattern — are merged, split into
+//! NNF conjuncts (pushing `NOT` through `AND`/`OR`, never distributing ORs) and
+//! lowered into a flat list of [`MatchPredicate`]s, each carrying the exact set
+//! of bindings it reads (`deps`). The lowering does NOT decide joins: it only
+//! declares the shared [`BindingId`]s (a reused node variable is one binding)
+//! and the dependency sets; the planner owns join construction and conjunct
+//! placement.
+//!
+//! Quantifier validation follows R6: the full set `* + ? {n} {n,m} {n,} {,m}
+//! {,}` is legal; only `max < min` is rejected. A quantified edge binds an
+//! edge group (R4) and may carry an inline predicate that references that edge
+//! alone — a cross-variable reference is rejected because the per-path
+//! traversal has no place to evaluate it.
 
 use reblessive::Stk;
 
+use crate::expr::match_plan::{
+	BindingId, EdgeQuantifier, EdgeStep, ExpandDirection, MatchClausePlan, MatchPredicate,
+	NodeStep, PatternPlan,
+};
+use crate::expr::{BinaryOperator, Expr, Idiom, Part};
 use crate::opengql::ast::{
 	BinaryOp, EdgeDirection, EdgePattern, ElementPredicate, GqlExpr, Ident, LabelExpr, MatchClause,
 	PathPattern, Quantifier, QuantifierKind, UnaryOp,
 };
-use crate::opengql::lower::expr::{self, Bindings, Role, Scope};
-use crate::opengql::lower::naming;
-use crate::sql::field::Selector;
-use crate::sql::lookup::{Lookup, LookupKind, LookupSubject};
-use crate::sql::part::{Recurse, RecurseInstruction};
-use crate::sql::{
-	BinaryOperator, Cond, Dir, Expr, Field, Fields, Function, FunctionCall, Idiom, Literal, Param,
-	Part, SelectStatement, Split, Splits,
-};
-use crate::syn::error::{SyntaxError, bail, syntax_error};
+use crate::opengql::lower::binding::{ClauseBindings, PatternBindings, Registry};
+use crate::opengql::lower::expr::{self, Scope};
+use crate::syn::error::{SyntaxError, bail};
+use crate::syn::token::Span;
 use crate::val::TableName;
 
-/// The validated, lowerable shape of the single path pattern.
-pub(super) struct Shape {
-	/// The anchor table: the label of the leftmost node.
-	pub anchor_table: String,
-	/// The single edge step, if the pattern has one.
-	pub hop: Option<Hop>,
-	/// The variable addressing facts.
-	pub bindings: Bindings,
-}
-
-/// A single validated edge step.
-pub(super) struct Hop {
-	/// The lookup direction: `->` is `Out`, `<-` is `In`.
-	pub dir: Dir,
-	/// The edge table, when the edge pattern is labeled. An unlabeled edge
-	/// scans all edge tables (`?`).
-	pub edge_table: Option<String>,
-	/// The far node's label: the `record::tb` filter for a single hop, or
-	/// the recursion target table for a variable-length hop.
-	pub far_table: Option<String>,
-	/// `Some` for a variable-length hop (§6).
-	pub recurse: Option<Recurse>,
-}
-
-/// Validates the path pattern of a MATCH clause and extracts its shape,
-/// rejecting the §7 pattern constructs.
-pub(super) fn analyze(clause: &MatchClause) -> Result<Shape, SyntaxError> {
-	let pattern = match clause.patterns.as_slice() {
-		[pattern] => pattern,
-		[_, second, ..] => {
-			bail!(
-				"Comma-separated graph patterns are not supported yet",
-				@second.start.span => "match a single path pattern"
-			);
-		}
-		[] => {
-			return Err(syntax_error!(
-				"Internal error: MATCH clause without a pattern",
-				@clause.span
-			));
-		}
-	};
-	if let Some(path_var) = &pattern.path_var {
-		bail!("Path variables are not supported yet", @path_var.span);
+/// Lowers one (flattened) MATCH clause into its [`MatchClausePlan`].
+///
+/// `clause_bindings` carries the AST clause, its OPTIONAL metadata (`optional` /
+/// `optional_group`) and the per-pattern binding ids, all produced by
+/// [`binding::analyze`](crate::opengql::lower::binding::analyze); the
+/// per-element binding ids let the steps and the property-map conjuncts be
+/// built without re-walking the AST for resolution.
+///
+/// R3 conjunct ownership: a clause's predicates are owned by the clause whose
+/// pattern scope introduces their bindings (the PR-B per-clause ownership
+/// contract). For an `OPTIONAL` clause this is structural — a predicate written
+/// inside the optional attaches here and so compiles inside the optional's own
+/// subplan (pre-null), while a later clause's predicate that merely references
+/// an optional binding is owned by THAT later clause (post-null). The lowering
+/// only records the deps; the planner places each predicate at the earliest
+/// stage that binds its deps within its owning clause's subplan.
+pub(super) async fn lower_clause(
+	stk: &mut Stk,
+	clause_bindings: &ClauseBindings<'_>,
+	registry: &Registry,
+) -> Result<MatchClausePlan, SyntaxError> {
+	let clause = clause_bindings.clause;
+	let pattern_bindings = clause_bindings.patterns.as_slice();
+	let mut patterns = Vec::with_capacity(clause.patterns.len());
+	for (pattern, bindings) in clause.patterns.iter().zip(pattern_bindings.iter()) {
+		patterns.push(build_pattern_plan(pattern, bindings)?);
 	}
-	if let [_, second, ..] = pattern.steps.as_slice() {
-		bail!(
-			"Multi-hop path patterns (more than one edge step) are not supported yet",
-			@second.edge.span
-		);
-	}
-
-	let Some(anchor_label) = label_name(&pattern.start.label)? else {
-		bail!(
-			"The anchor (leftmost) node of a path pattern must have a label",
-			@pattern.start.span => "add a label: `(n:label)`"
-		);
-	};
-
-	let mut vars: Vec<(String, Role)> = Vec::new();
-	declare_var(&mut vars, &pattern.start.var, Role::Anchor)?;
-
-	let mut far_field = "out";
-	let hop = match pattern.steps.first() {
-		None => None,
-		Some(step) => {
-			let edge = &step.edge;
-			let dir = match edge.direction {
-				EdgeDirection::Right => Dir::Out,
-				EdgeDirection::Left => {
-					far_field = "in";
-					Dir::In
-				}
-				EdgeDirection::Undirected
-				| EdgeDirection::LeftOrUndirected
-				| EdgeDirection::UndirectedOrRight
-				| EdgeDirection::LeftOrRight
-				| EdgeDirection::Any => {
-					bail!(
-						"Undirected and multi-directional edge patterns are not supported yet",
-						@edge.span => "use a directed edge: `-[…]->` or `<-[…]-`"
-					);
-				}
-			};
-			let recurse = match &edge.quantifier {
-				None => None,
-				Some(quantifier) => Some(validate_quantifier(quantifier, edge)?),
-			};
-			declare_var(&mut vars, &edge.var, Role::Edge)?;
-			declare_var(&mut vars, &step.node.var, Role::FarNode)?;
-			Some(Hop {
-				dir,
-				edge_table: label_name(&edge.label)?.map(|l| l.name.clone()),
-				far_table: label_name(&step.node.label)?.map(|l| l.name.clone()),
-				recurse,
-			})
+	let mut predicates = lower_predicates(stk, clause, registry, pattern_bindings).await?;
+	// A node variable repeated within a single pattern (e.g. the self-loop
+	// `(a)-[…]->(a)`) was rewritten to a fresh hidden binding by `binding`; emit
+	// the implied `id`-equality so the planner enforces it (the chain has no join
+	// to materialise it — see `PatternBindings::node_equalities`).
+	for bindings in pattern_bindings {
+		for &(first, repeat) in &bindings.node_equalities {
+			predicates.push(node_id_equality(registry, first, repeat));
 		}
-	};
-
-	let var_length = hop.as_ref().is_some_and(|hop| hop.recurse.is_some());
-	Ok(Shape {
-		anchor_table: anchor_label.name.clone(),
-		hop,
-		bindings: Bindings {
-			vars,
-			far_field,
-			var_length,
-		},
+	}
+	Ok(MatchClausePlan {
+		optional_group: clause_bindings.optional_group,
+		patterns,
+		predicates,
 	})
 }
 
-/// Extracts the single label name of a node or edge, rejecting label
-/// expressions, which have no table mapping (§7).
-fn label_name(label: &Option<LabelExpr>) -> Result<Option<&Ident>, SyntaxError> {
+/// Builds the `<first>.id = <repeat>.id` equality [`MatchPredicate`] for a node
+/// variable that repeats within one pattern. Both bindings hold full node
+/// objects, so `.id` extracts the record id (no fetch); the planner places it as
+/// a `Filter` at the earliest stage that binds both.
+fn node_id_equality(registry: &Registry, first: BindingId, repeat: BindingId) -> MatchPredicate {
+	let id_idiom = |id: BindingId| {
+		Expr::Idiom(Idiom(vec![
+			Part::Field(registry.name(id).to_owned().into()),
+			Part::Field("id".to_owned().into()),
+		]))
+	};
+	let mut deps = vec![first, repeat];
+	deps.sort_unstable();
+	MatchPredicate {
+		expr: Expr::Binary {
+			left: Box::new(id_idiom(first)),
+			op: BinaryOperator::Equal,
+			right: Box::new(id_idiom(repeat)),
+		},
+		deps,
+	}
+}
+
+/// Assembles the [`PatternPlan`] from the AST pattern and the pre-resolved
+/// binding ids, validating edge directions, labels and quantifiers. Multi-hop
+/// chains are kept whole (the planner chains the Expands).
+fn build_pattern_plan(
+	pattern: &PathPattern,
+	pattern_bindings: &PatternBindings,
+) -> Result<PatternPlan, SyntaxError> {
+	let start = NodeStep {
+		binding: pattern_bindings.start,
+		label: label_table(&pattern.start.label)?,
+	};
+
+	let mut steps = Vec::with_capacity(pattern.steps.len());
+	for (step, &(edge_binding, node_binding)) in
+		pattern.steps.iter().zip(pattern_bindings.steps.iter())
+	{
+		let edge = &step.edge;
+		let direction = edge_direction(edge)?;
+		let quantifier = match &edge.quantifier {
+			None => None,
+			Some(quantifier) => Some(lower_quantifier(quantifier)?),
+		};
+		let edge_step = EdgeStep {
+			binding: edge_binding,
+			label: label_table(&edge.label)?,
+			direction,
+			quantifier,
+		};
+		let node_step = NodeStep {
+			binding: node_binding,
+			label: label_table(&step.node.label)?,
+		};
+		steps.push((edge_step, node_step));
+	}
+
+	Ok(PatternPlan {
+		path_var: pattern_bindings.path_var,
+		start,
+		steps,
+	})
+}
+
+/// Maps an edge pattern's direction onto the lowered [`ExpandDirection`],
+/// rejecting the undirected and multi-directional forms (out of scope).
+fn edge_direction(edge: &EdgePattern) -> Result<ExpandDirection, SyntaxError> {
+	match edge.direction {
+		EdgeDirection::Right => Ok(ExpandDirection::Out),
+		EdgeDirection::Left => Ok(ExpandDirection::In),
+		EdgeDirection::Undirected
+		| EdgeDirection::LeftOrUndirected
+		| EdgeDirection::UndirectedOrRight
+		| EdgeDirection::LeftOrRight
+		| EdgeDirection::Any => bail!(
+			"Undirected and multi-directional edge patterns are not supported yet",
+			@edge.span => "use a directed edge: `-[…]->` or `<-[…]-`"
+		),
+	}
+}
+
+/// Extracts the single label name of a node or edge as a [`TableName`],
+/// rejecting label expressions, which have no table mapping (out of scope).
+fn label_table(label: &Option<LabelExpr>) -> Result<Option<TableName>, SyntaxError> {
 	match label {
 		None => Ok(None),
-		Some(LabelExpr::Name(ident)) => Ok(Some(ident)),
-		Some(other) => {
-			bail!(
-				"Label expressions (`!`, `&`, `|`, `%`) are not supported yet",
-				@other.span() => "use a single label name"
-			);
-		}
+		Some(LabelExpr::Name(ident)) => Ok(Some(TableName::new(ident.name.clone()))),
+		Some(other) => bail!(
+			"Label expressions (`!`, `&`, `|`, `%`) are not supported yet",
+			@other.span() => "use a single label name"
+		),
 	}
 }
 
-/// Declares a pattern variable, validating its name and rejecting repeats
-/// (a repeated variable would be a join, which v1 does not lower).
-fn declare_var(
-	vars: &mut Vec<(String, Role)>,
-	var: &Option<Ident>,
-	role: Role,
-) -> Result<(), SyntaxError> {
-	let Some(ident) = var else {
-		return Ok(());
+/// Lowers a graph-pattern quantifier onto an [`EdgeQuantifier`] per R6: the
+/// full quantifier set is legal, with only `max < min` rejected. `*`/`+`/`?`
+/// expand to their `{min,max}` equivalents.
+fn lower_quantifier(quantifier: &Quantifier) -> Result<EdgeQuantifier, SyntaxError> {
+	let (min, max) = match quantifier.kind {
+		QuantifierKind::Star => (0, None),
+		QuantifierKind::Plus => (1, None),
+		QuantifierKind::Question => (0, Some(1)),
+		QuantifierKind::Fixed(n) => (n, Some(n)),
+		QuantifierKind::Range(min, max) => (min.unwrap_or(0), max),
 	};
-	naming::validate_var(ident)?;
-	if vars.iter().any(|(name, _)| *name == ident.name) {
+	if let Some(max) = max
+		&& max < min
+	{
 		bail!(
-			"Variable `{}` is declared more than once in the pattern",
-			ident.name,
-			@ident.span => "joins on a repeated variable are not supported yet"
+			"The quantifier maximum must not be smaller than its minimum",
+			@quantifier.span
 		);
 	}
-	vars.push((ident.name.clone(), role));
-	Ok(())
+	Ok(EdgeQuantifier {
+		min,
+		max,
+	})
 }
 
-/// Validates a variable-length quantifier per §6: no edge variable, no edge
-/// predicate, a minimum of exactly one and a bounded maximum. Minima above
-/// one are rejected: the collect instruction returns *distinct reachable*
-/// nodes, which for `min == 1` is the documented v1 deviation from GQL's
-/// one-row-per-path semantics, but for `min > 1` has no defensible GQL
-/// reading at all (which paths "count" is unobservable without path rows).
-/// Supporting `min > 1` is deferred to the per-path-semantics work.
-fn validate_quantifier(
-	quantifier: &Quantifier,
-	edge: &EdgePattern,
-) -> Result<Recurse, SyntaxError> {
-	if let Some(var) = &edge.var {
-		bail!(
-			"Variable-length edge patterns cannot declare an edge variable",
-			@var.span => "remove the variable or the quantifier"
-		);
-	}
-	if edge.predicate.is_some() {
-		bail!(
-			"Variable-length edge patterns cannot have a WHERE clause or property map",
-			@edge.span => "remove the predicate or the quantifier"
-		);
-	}
-	match quantifier.kind {
-		QuantifierKind::Star => {
-			bail!(
-				"The `*` quantifier is not supported yet",
-				@quantifier.span => "use a bounded quantifier with a minimum of one: `{{1,n}}`"
-			);
-		}
-		QuantifierKind::Plus => {
-			bail!(
-				"The `+` quantifier is not supported yet",
-				@quantifier.span => "use a bounded quantifier: `{{1,n}}`"
-			);
-		}
-		QuantifierKind::Question => {
-			bail!("The `?` quantifier is not supported yet", @quantifier.span);
-		}
-		QuantifierKind::Fixed(0) => {
-			bail!(
-				"Variable-length quantifiers must have a minimum of at least one",
-				@quantifier.span
-			);
-		}
-		QuantifierKind::Fixed(1) => Ok(Recurse::Fixed(1)),
-		QuantifierKind::Fixed(_) => {
-			bail!(
-				"Variable-length quantifiers with a minimum greater than one are not supported yet",
-				@quantifier.span => "only `{{1}}` and `{{1,n}}` quantifiers are supported"
-			);
-		}
-		QuantifierKind::Range(min, max) => {
-			let Some(min @ 1..) = min else {
-				bail!(
-					"Variable-length quantifiers must have a minimum of at least one",
-					@quantifier.span => "use `{{1,n}}` instead of `{{0,n}}`"
-				);
-			};
-			let Some(max) = max else {
-				bail!(
-					"Unbounded variable-length quantifiers are not supported yet",
-					@quantifier.span => "give the quantifier an upper bound: `{{1,n}}`"
-				);
-			};
-			if max < min {
-				bail!(
-					"The quantifier maximum must not be smaller than its minimum",
-					@quantifier.span
-				);
-			}
-			if min > 1 {
-				bail!(
-					"Variable-length quantifiers with a minimum greater than one are not supported yet",
-					@quantifier.span => "only `{{1}}` and `{{1,n}}` quantifiers are supported"
-				);
-			}
-			Ok(Recurse::Range(Some(min), Some(max)))
-		}
-	}
-}
-
-/// A single predicate conjunct awaiting placement (§3).
-pub(super) enum Conjunct<'a> {
+/// A single predicate conjunct awaiting lowering.
+enum Conjunct<'a> {
 	/// A user-written predicate, with the pending NNF negation.
 	Expr {
 		expr: &'a GqlExpr,
 		negated: bool,
 	},
-	/// A property-map equality attached to a pattern element, kept
-	/// role-addressed so that elements without a variable still lower.
+	/// A property-map equality attached to a pattern element, addressed by the
+	/// element's binding (id + name), so anonymous elements still lower.
 	Prop {
-		role: Role,
+		/// The element's binding id (for `deps`).
+		binding: BindingId,
+		/// The element's binding name (for the lowered idiom field).
+		binding_name: &'a str,
 		key: &'a Ident,
 		value: &'a GqlExpr,
 	},
 }
 
-/// Merges the predicate sources in contract order — the explicit pattern
-/// WHERE, then the inline node/edge WHEREs, then the property-map
-/// equalities — splitting each into top-level conjuncts (§3 steps 1-3).
-pub(super) fn collect_conjuncts<'a>(
-	where_clause: Option<&'a GqlExpr>,
-	pattern: &'a PathPattern,
-) -> Vec<Conjunct<'a>> {
-	let mut elements: Vec<(Role, &ElementPredicate)> = Vec::new();
-	if let Some(predicate) = &pattern.start.predicate {
-		elements.push((Role::Anchor, predicate));
+/// Merges the predicate sources in contract order — the explicit clause
+/// `WHERE`, then the inline node/edge `WHERE`s of every pattern, then the
+/// property-map equalities of every pattern — splits each into NNF conjuncts,
+/// and lowers each into a [`MatchPredicate`] with its dependency set. A
+/// conjunct may reference bindings from several patterns (a cross-pattern
+/// predicate); the planner places it post-join.
+async fn lower_predicates(
+	stk: &mut Stk,
+	clause: &MatchClause,
+	registry: &Registry,
+	pattern_bindings: &[PatternBindings],
+) -> Result<Vec<MatchPredicate>, SyntaxError> {
+	let conjuncts = collect_conjuncts(
+		clause.where_clause.as_ref(),
+		&clause.patterns,
+		pattern_bindings,
+		registry,
+	);
+	let scope = Scope {
+		registry,
+	};
+	let mut out = Vec::with_capacity(conjuncts.len());
+	for conjunct in &conjuncts {
+		let deps = conjunct_deps(conjunct, registry)?;
+		// Cross-variable references inside a quantified edge's inline predicate
+		// have no per-path place to evaluate; reject them (R6).
+		validate_quantified_edge_conjunct(conjunct, &deps, &clause.patterns, pattern_bindings)?;
+		let lowered = match conjunct {
+			Conjunct::Expr {
+				expr: predicate,
+				negated,
+			} => expr::lower_predicate(stk, predicate, *negated, &scope).await?,
+			Conjunct::Prop {
+				binding,
+				binding_name,
+				key,
+				value,
+			} => expr::lower_prop_equality(stk, *binding, binding_name, key, value, &scope).await?,
+		};
+		out.push(MatchPredicate {
+			// The lowering builds `sql::Expr`; the IR is binding-row `expr::Expr`.
+			expr: lowered.into(),
+			deps,
+		});
 	}
-	if let Some(step) = pattern.steps.first() {
-		if let Some(predicate) = &step.edge.predicate {
-			elements.push((Role::Edge, predicate));
-		}
-		if let Some(predicate) = &step.node.predicate {
-			elements.push((Role::FarNode, predicate));
-		}
-	}
+	Ok(out)
+}
 
+/// Merges and NNF-splits the clause's predicate sources into conjuncts: the
+/// explicit `WHERE` first, then — pattern by pattern, in textual order — the
+/// inline element `WHERE`s and finally the property-map equalities. Property
+/// maps are addressed by their element's binding (id + name), recovered from
+/// `pattern_bindings` and the registry, so anonymous elements lower too.
+fn collect_conjuncts<'a>(
+	where_clause: Option<&'a GqlExpr>,
+	patterns: &'a [PathPattern],
+	pattern_bindings: &[PatternBindings],
+	registry: &'a Registry,
+) -> Vec<Conjunct<'a>> {
 	let mut out = Vec::new();
 	if let Some(where_clause) = where_clause {
 		split_conjuncts(where_clause, &mut out);
 	}
-	for (_, predicate) in &elements {
-		if let ElementPredicate::Where(expr) = predicate {
-			split_conjuncts(expr, &mut out);
+	// Inline element WHEREs, pattern by pattern, in element order.
+	for pattern in patterns {
+		collect_element_where(&pattern.start.predicate, &mut out);
+		for step in &pattern.steps {
+			collect_element_where(&step.edge.predicate, &mut out);
+			collect_element_where(&step.node.predicate, &mut out);
 		}
 	}
-	for (role, predicate) in &elements {
-		if let ElementPredicate::Props(props) = predicate {
-			for (key, value) in props {
-				out.push(Conjunct::Prop {
-					role: *role,
-					key,
-					value,
-				});
-			}
+	// Property-map equalities, pattern by pattern, in element order, addressed
+	// by binding.
+	for (pattern, bindings) in patterns.iter().zip(pattern_bindings.iter()) {
+		collect_element_props(&pattern.start.predicate, bindings.start, registry, &mut out);
+		for (step, &(edge_binding, node_binding)) in pattern.steps.iter().zip(bindings.steps.iter())
+		{
+			collect_element_props(&step.edge.predicate, edge_binding, registry, &mut out);
+			collect_element_props(&step.node.predicate, node_binding, registry, &mut out);
 		}
 	}
 	out
 }
 
+/// Pushes an element's inline `WHERE` (if any) into the conjunct list,
+/// NNF-split. Property maps are handled separately.
+fn collect_element_where<'a>(predicate: &'a Option<ElementPredicate>, out: &mut Vec<Conjunct<'a>>) {
+	if let Some(ElementPredicate::Where(expr)) = predicate {
+		split_conjuncts(expr, out);
+	}
+}
+
+/// Pushes an element's property-map equalities (if any) into the conjunct
+/// list, addressed by the element's binding.
+fn collect_element_props<'a>(
+	predicate: &'a Option<ElementPredicate>,
+	binding: BindingId,
+	registry: &'a Registry,
+	out: &mut Vec<Conjunct<'a>>,
+) {
+	if let Some(ElementPredicate::Props(props)) = predicate {
+		let binding_name = registry.name(binding);
+		for (key, value) in props {
+			out.push(Conjunct::Prop {
+				binding,
+				binding_name,
+				key,
+				value,
+			});
+		}
+	}
+}
+
 /// Splits an expression into top-level conjuncts, pushing `NOT` through
 /// `AND`/`OR` (De Morgan) so that conjuncts hidden under negation are
-/// classified independently. ORs are never distributed (§3 step 2).
+/// classified independently. ORs are never distributed.
 fn split_conjuncts<'a>(expr: &'a GqlExpr, out: &mut Vec<Conjunct<'a>>) {
 	let mut stack: Vec<(&'a GqlExpr, bool)> = vec![(expr, false)];
 	while let Some((expr, negated)) = stack.pop() {
@@ -350,82 +370,82 @@ fn split_conjuncts<'a>(expr: &'a GqlExpr, out: &mut Vec<Conjunct<'a>>) {
 	}
 }
 
-/// Where a conjunct is evaluated (§3).
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
-pub(super) enum Placement {
-	/// The anchor `WHERE` (L1, or the single SELECT of the no-edge shape).
-	Anchor,
-	/// The L1 lookup `cond` (per-edge filtering).
-	Edge,
-	/// The residual post-split `WHERE` (L3).
-	PostSplit,
-}
-
-/// Classifies a conjunct by the variables it references: anchor-only
-/// conjuncts filter the anchor scan; conjuncts touching the edge or far
-/// node are pushed into the lookup `cond` when expressible there (property
-/// accesses on any element, plus the anchor itself via `$parent`); anything
-/// else lands in the residual post-split `WHERE`, which is always
-/// semantically valid (§3).
-pub(super) fn classify(
+/// Computes the binding dependencies of a conjunct: the set of bindings every
+/// variable reference in it resolves to, sorted and deduped.
+fn conjunct_deps(
 	conjunct: &Conjunct<'_>,
-	bindings: &Bindings,
-) -> Result<Placement, SyntaxError> {
-	let mut anchor_only = true;
-	let mut edge_ok = true;
-	let expr = match conjunct {
+	registry: &Registry,
+) -> Result<Vec<BindingId>, SyntaxError> {
+	let mut deps: Vec<BindingId> = Vec::new();
+	match conjunct {
 		Conjunct::Expr {
 			expr,
 			..
-		} => *expr,
+		} => {
+			walk_variables(expr, &mut |ident, _| {
+				let id = registry.resolve(ident)?;
+				if !deps.contains(&id) {
+					deps.push(id);
+				}
+				Ok(())
+			})?;
+		}
 		Conjunct::Prop {
-			role,
+			binding,
 			value,
 			..
 		} => {
-			if *role != Role::Anchor {
-				anchor_only = false;
-			}
-			*value
+			deps.push(*binding);
+			walk_variables(value, &mut |ident, _| {
+				let id = registry.resolve(ident)?;
+				if !deps.contains(&id) {
+					deps.push(id);
+				}
+				Ok(())
+			})?;
 		}
-	};
-	walk_variables(expr, &mut |ident, bare| {
-		let role = bindings.resolve(ident)?;
-		if role != Role::Anchor {
-			anchor_only = false;
-			if bare {
-				// A bare edge/far-node reference yields the full record,
-				// which the lookup scope cannot address.
-				edge_ok = false;
-			}
-		}
-		Ok(())
-	})?;
-	if anchor_only {
-		Ok(Placement::Anchor)
-	} else if edge_ok && !bindings.var_length {
-		Ok(Placement::Edge)
-	} else {
-		Ok(Placement::PostSplit)
 	}
+	deps.sort_unstable();
+	Ok(deps)
 }
 
-/// Lowers a conjunct in the scope its placement selected.
-pub(super) async fn lower_conjunct(
-	stk: &mut Stk,
+/// Rejects a conjunct that references a quantified edge group together with any
+/// other binding: the per-path traversal cannot evaluate such a predicate (R6).
+/// A conjunct referencing only the quantified edge is permitted. Every pattern
+/// of the clause is scanned for quantified edges.
+fn validate_quantified_edge_conjunct(
 	conjunct: &Conjunct<'_>,
-	scope: &Scope<'_>,
-) -> Result<Expr, SyntaxError> {
+	deps: &[BindingId],
+	patterns: &[PathPattern],
+	pattern_bindings: &[PatternBindings],
+) -> Result<(), SyntaxError> {
+	for (pattern, bindings) in patterns.iter().zip(pattern_bindings.iter()) {
+		for (step, &(edge_binding, _)) in pattern.steps.iter().zip(bindings.steps.iter()) {
+			if step.edge.quantifier.is_none() {
+				continue;
+			}
+			if deps.contains(&edge_binding) && deps.iter().any(|d| *d != edge_binding) {
+				bail!(
+					"A predicate inside a quantified edge may only reference that edge",
+					@conjunct_span(conjunct) => "remove the references to other variables"
+				);
+			}
+		}
+	}
+	Ok(())
+}
+
+/// The source span of a conjunct, for error reporting.
+fn conjunct_span(conjunct: &Conjunct<'_>) -> Span {
 	match conjunct {
 		Conjunct::Expr {
-			expr: predicate,
-			negated,
-		} => expr::lower_predicate(stk, predicate, *negated, scope).await,
+			expr,
+			..
+		} => expr.span(),
 		Conjunct::Prop {
-			role,
-			key,
 			value,
-		} => expr::lower_prop_equality(stk, *role, key, value, scope).await,
+			..
+		} => value.span(),
 	}
 }
 
@@ -484,155 +504,4 @@ fn walk_variables<'a>(
 		}
 	}
 	Ok(())
-}
-
-/// The b-side label filter `record::tb(out|in) = '<label>'` (§2.1), appended
-/// after the user's edge-scope conjuncts (§8 example 4). Variable-length
-/// hops target the far table in the recursion nest instead.
-pub(super) fn far_label_filter(shape: &Shape) -> Option<Expr> {
-	let hop = shape.hop.as_ref()?;
-	if hop.recurse.is_some() {
-		return None;
-	}
-	let label = hop.far_table.as_ref()?;
-	Some(Expr::Binary {
-		left: Box::new(Expr::FunctionCall(Box::new(FunctionCall {
-			receiver: Function::Normal("record::tb".to_owned()),
-			arguments: vec![Expr::Idiom(Idiom::field(shape.bindings.far_field))],
-		}))),
-		op: BinaryOperator::Equal,
-		right: Box::new(Expr::Literal(Literal::String(label.clone().into()))),
-	})
-}
-
-/// A `SELECT` with the §9 defaults: every clause not driven by the GQL
-/// query matches what the SurrealQL parser produces for a plain SELECT.
-fn select_defaults() -> SelectStatement {
-	SelectStatement {
-		fields: Fields::all(),
-		omit: Vec::new(),
-		only: false,
-		what: Vec::new(),
-		with: None,
-		cond: None,
-		split: None,
-		group: None,
-		order: None,
-		limit: None,
-		start: None,
-		fetch: None,
-		version: Expr::Literal(Literal::None),
-		timeout: Expr::Literal(Literal::None),
-		explain: None,
-		tempfiles: false,
-	}
-}
-
-/// Builds the SELECT scaffolding for the shape and returns the outermost
-/// (projection) layer: the single SELECT of the degenerate no-edge shape,
-/// or the L3 layer wrapping the L1 bind and L2 unnest layers (§2.1).
-pub(super) fn build_frame(
-	shape: &Shape,
-	anchor_cond: Option<Expr>,
-	edge_cond: Option<Expr>,
-	post_cond: Option<Expr>,
-) -> SelectStatement {
-	let anchor = Expr::Table(TableName::new(shape.anchor_table.clone()));
-	let Some(hop) = &shape.hop else {
-		// Without a hop there is no edge or far-node role, so classification
-		// can only have produced anchor conjuncts; a violation here would
-		// silently drop user predicates.
-		debug_assert!(
-			edge_cond.is_none() && post_cond.is_none(),
-			"no-hop shape cannot carry edge or post-split predicates"
-		);
-		let mut select = select_defaults();
-		select.what = vec![anchor];
-		select.cond = anchor_cond.map(Cond);
-		return select;
-	};
-
-	// L1 "bind": one row per anchor, `__m` bound to the matching edges. The
-	// inline all-fields projection makes the lookup yield full edge objects
-	// (E1); a variable-length hop recurses from `id` instead, collecting
-	// the distinct reachable nodes (§6 — a documented deviation from GQL's
-	// one-row-per-path semantics).
-	let hop_value = match &hop.recurse {
-		None => Expr::Idiom(Idiom(vec![Part::Graph(Box::new(Lookup {
-			kind: LookupKind::Graph(hop.dir.clone()),
-			expr: Some(Fields::all()),
-			what: subjects(&hop.edge_table),
-			cond: edge_cond.map(Cond),
-			..Default::default()
-		}))])),
-		Some(recurse) => {
-			let nest = Idiom(vec![
-				Part::Graph(Box::new(Lookup {
-					kind: LookupKind::Graph(hop.dir.clone()),
-					what: subjects(&hop.edge_table),
-					..Default::default()
-				})),
-				Part::Graph(Box::new(Lookup {
-					kind: LookupKind::Graph(hop.dir.clone()),
-					what: subjects(&hop.far_table),
-					..Default::default()
-				})),
-			]);
-			Expr::Idiom(Idiom(vec![
-				Part::Field("id".into()),
-				Part::Recurse(
-					recurse.clone(),
-					Some(nest),
-					Some(RecurseInstruction::Collect {
-						inclusive: false,
-					}),
-				),
-			]))
-		}
-	};
-	let mut bind = select_defaults();
-	bind.fields = Fields::Select(vec![
-		Field::Single(Selector {
-			expr: Expr::Param(Param::new("this")),
-			alias: Some(Idiom::field("__a")),
-		}),
-		Field::Single(Selector {
-			expr: hop_value,
-			alias: Some(Idiom::field("__m")),
-		}),
-	]);
-	bind.what = vec![anchor];
-	bind.cond = anchor_cond.map(Cond);
-
-	// L2 "unnest": one row per (anchor, edge). `SELECT *` so both engines
-	// split the same docs; the `__m != []` guard enforces inner-join
-	// semantics under the streaming engine, which passes empty arrays
-	// through a SPLIT (E2).
-	let mut unnest = select_defaults();
-	unnest.what = vec![Expr::Select(Box::new(bind))];
-	unnest.cond = Some(Cond(Expr::Binary {
-		left: Box::new(Expr::Idiom(Idiom::field("__m"))),
-		op: BinaryOperator::NotEqual,
-		right: Box::new(Expr::Literal(Literal::Array(Vec::new()))),
-	}));
-	unnest.split = Some(Splits(vec![Split(Idiom::field("__m"))]));
-
-	// L3 "return": residual predicates, projection, DISTINCT, ORDER, paging.
-	let mut select = select_defaults();
-	select.what = vec![Expr::Select(Box::new(unnest))];
-	select.cond = post_cond.map(Cond);
-	select
-}
-
-/// The lookup subjects for an optionally labeled element: an unlabeled
-/// element scans all tables (`?`).
-fn subjects(table: &Option<String>) -> Vec<LookupSubject> {
-	table
-		.as_ref()
-		.map(|table| LookupSubject::Table {
-			table: TableName::new(table.clone()),
-			referencing_field: None,
-		})
-		.into_iter()
-		.collect()
 }

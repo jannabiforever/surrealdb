@@ -87,6 +87,8 @@ use crate::kvs::{
 	KVValue, LockType, NORMAL_BATCH_SIZE, TransactionType, is_retryable_transaction_conflict,
 };
 use crate::observe::{ExecutionObserver, NoopObserver};
+#[cfg(feature = "opengql")]
+use crate::opengql::PreparedGqlQuery;
 use crate::sql::Ast;
 #[cfg(feature = "surrealism")]
 use crate::surrealism::cache::SurrealismCache;
@@ -3015,10 +3017,13 @@ impl Datastore {
 		self.process(ast, sess, vars).await
 	}
 
-	/// Parse a GQL query into a SurrealQL AST, checking that the `opengql`
-	/// experimental capability is enabled.
+	/// Parse and lower a GQL query into a [`PreparedGqlQuery`], checking that
+	/// the `opengql` experimental capability is enabled.
 	#[cfg(feature = "opengql")]
-	pub(crate) fn parse_opengql(&self, txt: &str) -> std::result::Result<Ast, TypesError> {
+	pub(crate) fn parse_opengql(
+		&self,
+		txt: &str,
+	) -> std::result::Result<PreparedGqlQuery, TypesError> {
 		// Check if the experimental OpenGQL capability is enabled. The
 		// wording deliberately matches the existing experimental-gate errors
 		// (`surrealism`, `files`) rather than naming the server's
@@ -3030,7 +3035,7 @@ impl Datastore {
 				None,
 			));
 		}
-		// Parse the GQL query text
+		// Parse and lower the GQL query text
 		crate::opengql::parse_with_capabilities(txt, &self.capabilities, &self.config)
 			.map_err(|e| TypesError::validation(e.to_string(), None))
 	}
@@ -3044,10 +3049,71 @@ impl Datastore {
 		sess: &Session,
 		vars: Option<PublicVariables>,
 	) -> std::result::Result<Vec<QueryResult>, TypesError> {
-		// Parse the GQL query text
-		let ast = self.parse_opengql(txt)?;
-		// Process the AST
-		self.process(ast, sess, vars).await
+		// Parse and lower the GQL query text
+		let plan = self.parse_opengql(txt)?;
+		// Process the lowered plan
+		self.process_opengql(plan, sess, vars).await
+	}
+
+	/// Execute a pre-lowered GQL query.
+	///
+	/// Mirrors [`Self::process`] for the GQL dialect: the
+	/// [`PreparedGqlQuery`] already wraps a [`LogicalPlan`], so it is handed
+	/// directly to the shared plan-level executor.
+	#[cfg(feature = "opengql")]
+	#[instrument(level = "debug", target = "surrealdb::core::kvs::ds", skip_all)]
+	pub async fn process_opengql(
+		&self,
+		q: PreparedGqlQuery,
+		sess: &Session,
+		vars: Option<PublicVariables>,
+	) -> std::result::Result<Vec<QueryResult>, TypesError> {
+		self.process_plan_inner(q.0, sess, vars, None).await
+	}
+
+	/// Execute a pre-lowered GQL query with an externally-owned cancellation
+	/// handle. See [`Self::process_with_transaction_and_cancel`] for the
+	/// cancellation semantics.
+	#[cfg(feature = "opengql")]
+	#[instrument(level = "debug", target = "surrealdb::core::kvs::ds", skip_all)]
+	pub(crate) async fn process_opengql_with_cancel(
+		&self,
+		q: PreparedGqlQuery,
+		sess: &Session,
+		vars: Option<PublicVariables>,
+		cancel: CancelHandle,
+	) -> std::result::Result<Vec<QueryResult>, TypesError> {
+		self.process_plan_inner(q.0, sess, vars, Some(cancel)).await
+	}
+
+	/// Execute a pre-lowered GQL query with an existing transaction.
+	#[cfg(feature = "opengql")]
+	#[instrument(level = "debug", target = "surrealdb::core::kvs::ds", skip_all)]
+	pub(crate) async fn process_opengql_with_transaction(
+		&self,
+		q: PreparedGqlQuery,
+		sess: &Session,
+		vars: Option<PublicVariables>,
+		tx: Arc<Transaction>,
+	) -> std::result::Result<Vec<QueryResult>, TypesError> {
+		self.process_plan_with_transaction_inner(q.0, sess, vars, tx, None).await
+	}
+
+	/// Execute a pre-lowered GQL query with an existing transaction and an
+	/// externally-owned cancellation handle. See
+	/// [`Self::process_with_transaction_and_cancel`] for the cancellation
+	/// semantics.
+	#[cfg(feature = "opengql")]
+	#[instrument(level = "debug", target = "surrealdb::core::kvs::ds", skip_all)]
+	pub(crate) async fn process_opengql_with_transaction_and_cancel(
+		&self,
+		q: PreparedGqlQuery,
+		sess: &Session,
+		vars: Option<PublicVariables>,
+		tx: Arc<Transaction>,
+		cancel: CancelHandle,
+	) -> std::result::Result<Vec<QueryResult>, TypesError> {
+		self.process_plan_with_transaction_inner(q.0, sess, vars, tx, Some(cancel)).await
 	}
 
 	/// Execute a SurrealQL query with an externally-owned cancellation
@@ -3139,14 +3205,30 @@ impl Datastore {
 		self.process_with_transaction_inner(ast, sess, vars, tx, Some(cancel)).await
 	}
 
-	/// Shared body for [`Self::process_with_transaction`] and
-	/// [`Self::process_with_transaction_and_cancel`]. The two public
-	/// variants exist to keep the non-cancel API stable for SDK / embedded
-	/// callers; `cancel: None` reproduces the pre-cancellation behaviour
-	/// exactly.
+	/// Ast-level shim over [`Self::process_plan_with_transaction_inner`]: the
+	/// SurrealQL surface AST is converted to a [`LogicalPlan`] before the
+	/// shared plan-level body runs. Keeps the SurrealQL `Ast` entry points
+	/// unchanged while letting GQL (which already lowers to a `LogicalPlan`)
+	/// share the same execution path.
 	async fn process_with_transaction_inner(
 		&self,
 		ast: Ast,
+		sess: &Session,
+		vars: Option<PublicVariables>,
+		tx: Arc<Transaction>,
+		cancel: Option<CancelHandle>,
+	) -> std::result::Result<Vec<QueryResult>, TypesError> {
+		self.process_plan_with_transaction_inner(ast.into(), sess, vars, tx, cancel).await
+	}
+
+	/// Shared body for [`Self::process_with_transaction`],
+	/// [`Self::process_with_transaction_and_cancel`] and the GQL
+	/// `process_opengql` variants. The public Ast variants exist to keep the
+	/// non-cancel API stable for SDK / embedded callers; `cancel: None`
+	/// reproduces the pre-cancellation behaviour exactly.
+	async fn process_plan_with_transaction_inner(
+		&self,
+		plan: LogicalPlan,
 		sess: &Session,
 		vars: Option<PublicVariables>,
 		tx: Arc<Transaction>,
@@ -3211,13 +3293,11 @@ impl Datastore {
 		ctx.set_transaction(tx);
 
 		// Process all statements with the transaction
-		Executor::execute_plan_with_transaction(self, ctx.freeze(), opt, ast.into()).await.map_err(
-			|e| {
-				e.downcast::<Error>()
-					.map(crate::err::into_types_error)
-					.unwrap_or_else(|e| TypesError::internal(e.to_string()))
-			},
-		)
+		Executor::execute_plan_with_transaction(self, ctx.freeze(), opt, plan).await.map_err(|e| {
+			e.downcast::<Error>()
+				.map(crate::err::into_types_error)
+				.unwrap_or_else(|e| TypesError::internal(e.to_string()))
+		})
 	}
 
 	#[instrument(level = "debug", target = "surrealdb::core::kvs::ds", skip_all)]

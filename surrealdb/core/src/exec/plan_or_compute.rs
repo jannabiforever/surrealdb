@@ -336,6 +336,10 @@ pub(crate) fn expr_required_context(expr: &Expr) -> ContextLevel {
 			statement,
 			..
 		} => expr_required_context(statement),
+
+		// GQL MATCH queries the datastore and needs a database.
+		#[cfg(feature = "opengql")]
+		Expr::Match(_) => ContextLevel::Database,
 	}
 }
 

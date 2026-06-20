@@ -149,3 +149,7 @@
 "MATCH (a:person {name: 'x'})-[:knows]->{1,3}(b) WHERE a.age IS NOT NULL RETURN b"
 "MATCH (a) WHERE NOT a.x = $p OR a.y <= 1 AND a.z IS TRUE RETURN a.x || 's', -a.y + 2 * 3"
 "RETURN 1"
+# OPTIONAL MATCH and brace-delimited optional forms (future-proofing for v2)
+"MATCH (a:person) OPTIONAL MATCH (a)-[k:knows]->(b) RETURN a.name, b.name"
+"MATCH (a:person) OPTIONAL { MATCH (a)-[:knows]->(b) } RETURN a, b"
+"OPTIONAL MATCH (a)-[:knows]->(b) RETURN b"
