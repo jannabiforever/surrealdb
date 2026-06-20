@@ -741,23 +741,41 @@ impl Transactable for Transaction {
 			}
 			// Load the inner transaction
 			let mut inner = self.inner.write().await;
-			// Build an index from key bytes to original position so we can
-			// restore order without cloning values out of a HashMap.
-			let key_index: HashMap<&[u8], usize> =
-				keys.iter().enumerate().map(|(i, k)| (k.as_slice(), i)).collect();
+			// Build an index from key bytes to *every* original position that
+			// requested it. `batch_get` collapses duplicate keys to a single
+			// returned pair, so a key repeated in `keys` (common when several
+			// graph rows fetch a shared endpoint/target node in one batch) must
+			// fan its one result out to all of its positions — mirroring the
+			// per-position semantics of the mem/rocksdb engines. Mapping to a
+			// single position would leave the other slots `None`, silently
+			// dropping records.
+			let mut key_index: HashMap<&[u8], Vec<usize>> = HashMap::with_capacity(keys.len());
+			for (i, k) in keys.iter().enumerate() {
+				key_index.entry(k.as_slice()).or_default().push(i);
+			}
 			// Batch get the keys
 			let pairs = inner.tx.batch_get(keys.iter().cloned()).await?;
-			// Place each result directly at the correct position, accumulating
-			// the hit count and value bytes during the same pass so callers do
-			// not need to re-walk the result.
+			// Place each result at every position that requested its key,
+			// accumulating the hit count and value bytes during the same pass so
+			// callers do not need to re-walk the result. The value is cloned into
+			// each duplicate position and moved into the last, so the all-unique
+			// case incurs no extra clone.
 			let mut values: Vec<Option<Val>> = vec![None; keys.len()];
 			let mut records = 0u64;
 			let mut value_bytes = 0u64;
 			for kv in pairs {
-				if let Some(&idx) = key_index.get(Key::from(kv.0).as_slice()) {
+				if let Some(idxs) = key_index.get(Key::from(kv.0).as_slice())
+					&& let Some((&last, rest)) = idxs.split_last()
+				{
+					let len = kv.1.len() as u64;
+					for &i in rest {
+						records += 1;
+						value_bytes += len;
+						values[i] = Some(kv.1.clone());
+					}
 					records += 1;
-					value_bytes += kv.1.len() as u64;
-					values[idx] = Some(kv.1);
+					value_bytes += len;
+					values[last] = Some(kv.1);
 				}
 			}
 			Ok(GetMultiResult {
