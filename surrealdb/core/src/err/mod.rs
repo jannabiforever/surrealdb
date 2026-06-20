@@ -809,6 +809,14 @@ pub(crate) enum Error {
 		value: String,
 	},
 
+	/// The same method appears in more than one `FOR` clause on a single
+	/// `DEFINE API` statement
+	#[error("The method '{method}' is defined in more than one FOR clause on api '{value}'")]
+	ApMethodDuplicate {
+		value: String,
+		method: String,
+	},
+
 	/// The requested analyzer already exists
 	#[error("The analyzer '{name}' already exists")]
 	AzAlreadyExists {

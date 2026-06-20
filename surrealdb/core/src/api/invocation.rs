@@ -71,8 +71,10 @@ pub async fn process_api_request_with_stack(
 	api: &ApiDefinition,
 	req: ApiRequest,
 ) -> Result<ApiResponse> {
-	// TODO: Figure out if it is possible if multiple actions can have the same
-	// method, and if so should they all be run?
+	// `DefineApiStatement::compute` rejects duplicate methods across `FOR`
+	// clauses and `AlterApiStatement::compute` strips a method from any
+	// pre-existing action before adding a new one for it, so at most one
+	// stored action contains a given `ApiMethod`. `find` is the right matcher.
 	let method_action = api.actions.iter().find(|x| x.methods.contains(&req.method));
 
 	let (action_expr, method_config) = match (method_action, &api.fallback) {
