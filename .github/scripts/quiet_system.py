@@ -68,9 +68,11 @@ def runCmd(uid,gid,user, cmd):
         sys.exit(proc.returncode)
     else:
         while True:
-            pid,exit_code = os.wait()
+            pid,status = os.wait()
             if pid == child:
-                return exit_code
+                if os.WIFSIGNALED(status):
+                    return 128 + os.WTERMSIG(status)
+                return os.WEXITSTATUS(status)
 
 
 if __name__ == "__main__":

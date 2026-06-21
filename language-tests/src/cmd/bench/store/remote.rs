@@ -25,6 +25,14 @@ use crate::cmd::bench::store::{BenchDataStore, StoreConfig};
 pub struct RemoteStore {
 	cmd: Option<mpsc::Sender<Cmd>>,
 	task_handle: Option<JoinHandle<()>>,
+	auth: AuthParams,
+}
+
+struct AuthParams {
+	user: String,
+	pass: String,
+	ns: String,
+	db: String,
 }
 
 #[derive(SurrealValue)]
@@ -85,9 +93,15 @@ impl RemoteStore {
 		let this = RemoteStore {
 			cmd: Some(send),
 			task_handle: Some(ws_task),
+			auth: AuthParams {
+				user: cfg.user.clone(),
+				pass: cfg.password.clone(),
+				ns: cfg.ns.clone(),
+				db: cfg.db.clone(),
+			},
 		};
 
-		this.login(cfg).await.context("Failed to login to remote datastore")?;
+		this.login().await.context("Failed to login to remote datastore")?;
 
 		Ok(this)
 	}
@@ -110,15 +124,28 @@ impl RemoteStore {
 		recv.await.unwrap()
 	}
 
-	async fn login(&self, cfg: &StoreConfig<'_>) -> Result<()> {
+	/// Run a command, transparently re-authenticating and retrying once if the
+	/// session expired. A full bench run can outlive the remote session's TTL,
+	/// at which point the next request would otherwise fail outright.
+	async fn cmd_authed(&self, method: &str, params: Vec<Value>) -> Result<Value> {
+		match self.cmd(method, params.clone()).await {
+			Err(e) if is_session_expired(&e) => {
+				self.login().await.context("Re-authentication after session expiry failed")?;
+				self.cmd(method, params).await
+			}
+			other => other,
+		}
+	}
+
+	async fn login(&self) -> Result<()> {
 		let mut params = Object::new();
-		params.insert("user", cfg.user.clone().into_value());
-		params.insert("pass", cfg.password.clone().into_value());
-		params.insert("ns", cfg.ns.clone().into_value());
-		params.insert("db", cfg.db.clone().into_value());
+		params.insert("user", self.auth.user.clone().into_value());
+		params.insert("pass", self.auth.pass.clone().into_value());
+		params.insert("ns", self.auth.ns.clone().into_value());
+		params.insert("db", self.auth.db.clone().into_value());
 
 		self.cmd("signin", vec![params.into_value()]).await.context("Login failed")?;
-		self.cmd("use", vec![cfg.ns.clone().into_value(), cfg.db.clone().into_value()])
+		self.cmd("use", vec![self.auth.ns.clone().into_value(), self.auth.db.clone().into_value()])
 			.await
 			.context("Could not use the right namespace/database")?;
 
@@ -267,6 +294,10 @@ struct QueryResult {
 	status: String,
 }
 
+fn is_session_expired(e: &anyhow::Error) -> bool {
+	e.to_string().to_lowercase().contains("session has expired")
+}
+
 impl BenchDataStore for RemoteStore {
 	async fn add(&mut self, run: super::BenchMarkRun) -> Result<()> {
 		let mut params = Object::new();
@@ -275,7 +306,7 @@ impl BenchDataStore for RemoteStore {
 		params.insert("value", run.measurement.into_value());
 
 		let res = self
-			.cmd(
+			.cmd_authed(
 				"query",
 				vec![
 					"CREATE measurement:[$path,$backend,time::now()] CONTENT $value".into_value(),
@@ -307,7 +338,7 @@ impl BenchDataStore for RemoteStore {
 		params.insert("backend", backend.into_value());
 
 		let res = self
-			.cmd(
+			.cmd_authed(
 				"query",
 				vec!["fn::last_measurement($path,$backend)".into_value(), params.into_value()],
 			)
