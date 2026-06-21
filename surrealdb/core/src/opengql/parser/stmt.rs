@@ -11,8 +11,8 @@
 use reblessive::Stk;
 
 use crate::opengql::ast::{
-	GqlExpr, GqlLiteral, GqlStatement, MatchClause, MatchItem, MatchQuery, OptionalBlock,
-	OrderItem, ReturnClause, ReturnItem, ReturnItems, SetQuantifier,
+	GqlExpr, GqlGroupItem, GqlLiteral, GqlStatement, MatchClause, MatchItem, MatchQuery,
+	OptionalBlock, OrderItem, ReturnClause, ReturnItem, ReturnItems, SetQuantifier,
 };
 use crate::opengql::parser::mac::{enter_object_recursion, expected, unexpected};
 use crate::opengql::parser::{ParseResult, Parser};
@@ -267,17 +267,9 @@ impl Parser<'_> {
 			ReturnItems::Items(items)
 		};
 
-		// An attached `GROUP BY` (`groupByClause`, GQL.g4:1313) parses but is
-		// not supported.
-		let token = self.peek();
-		if let t!("GROUP") = token.kind {
-			self.pop_peek();
-			let mut span = token.span;
-			if let t!("BY") = self.peek_kind() {
-				span = span.covers(self.pop_peek().span);
-			}
-			bail!("GROUP BY is not supported yet", @span);
-		}
+		// An attached `GROUP BY` (`groupByClause`, GQL.g4:1313) sits between the
+		// return items and the trailing `ORDER BY`/`OFFSET`/`LIMIT`.
+		let group_by = self.parse_group_by_clause(stk).await?;
 
 		let mut order_by = Vec::new();
 		if self.eat(t!("ORDER")) {
@@ -306,11 +298,36 @@ impl Parser<'_> {
 		Ok(ReturnClause {
 			quantifier,
 			items,
+			group_by,
 			order_by,
 			skip,
 			limit,
 			span: start.covers(self.last_span()),
 		})
+	}
+
+	/// Parse an optional `GROUP BY` clause (`groupByClause`, GQL.g4:1313): the
+	/// `GROUP BY` keywords followed by a comma-separated list of grouping
+	/// elements. Each element is a full value expression (matching the return
+	/// items and `ORDER BY` keys); the lowering enforces the GQL shape.
+	async fn parse_group_by_clause(&mut self, stk: &mut Stk) -> ParseResult<Vec<GqlGroupItem>> {
+		if !self.eat(t!("GROUP")) {
+			return Ok(Vec::new());
+		}
+		expected!(self, t!("BY"));
+		let mut items = Vec::new();
+		loop {
+			let start = self.peek().span;
+			let expr = stk.run(|stk| self.parse_expr(stk)).await?;
+			items.push(GqlGroupItem {
+				expr,
+				span: start.covers(self.last_span()),
+			});
+			if !self.eat(t!(",")) {
+				break;
+			}
+		}
+		Ok(items)
 	}
 
 	/// Parse a single `RETURN` item: an expression with an optional `AS`
@@ -417,8 +434,8 @@ impl Parser<'_> {
 			}
 			t!("GROUP") => {
 				bail!(
-					"GROUP BY is not supported yet",
-					@token.span => "GROUP BY must directly follow the RETURN items"
+					"Unexpected `GROUP` clause",
+					@token.span => "GROUP BY must directly follow the RETURN items, before ORDER BY"
 				);
 			}
 			_ => Ok(()),

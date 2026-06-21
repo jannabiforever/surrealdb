@@ -188,6 +188,20 @@ fn render_output(plan: &MatchPlan, out: &mut String) {
 		out.push_str(" AS ");
 		out.push_str(&column.name);
 	}
+	if let Some(keys) = &plan.output.group_by {
+		if keys.is_empty() {
+			out.push_str("\nGROUP ALL");
+		} else {
+			out.push_str("\nGROUP BY");
+			for (i, key) in keys.iter().enumerate() {
+				if i > 0 {
+					out.push(',');
+				}
+				out.push(' ');
+				out.push_str(&render_expr(key));
+			}
+		}
+	}
 	if !plan.output.order.is_empty() {
 		out.push_str("\nORDER BY");
 		for (i, order) in plan.output.order.iter().enumerate() {
@@ -1724,29 +1738,117 @@ fn rejects_empty_quantifier_range() {
 }
 
 #[test]
-fn rejects_count_star() {
-	assert_rejects(
-		"MATCH (n:person) RETURN count(*)",
-		"Aggregate functions are not supported yet",
-		"count(*)",
-	);
+fn lowers_count_star_to_group_all() {
+	// A bare `count(*)` with no GROUP BY is GROUP ALL: a zero-argument `count`
+	// folded over a single group.
+	let rendered = render("MATCH (n:person) RETURN count(*)");
+	assert!(rendered.contains("count()"), "{rendered}");
+	assert!(rendered.contains("GROUP ALL"), "{rendered}");
 }
 
 #[test]
-fn rejects_count_distinct() {
+fn lowers_group_by_with_aggregates() {
+	// Each GQL aggregate maps onto its SurrealDB accumulator; the grouping key is
+	// preserved and a GROUP BY clause is emitted.
+	let rendered = render(
+		"MATCH (n:person) RETURN n.city AS c, count(*) AS total, sum(n.age) AS s, \
+		 avg(n.age) AS a, min(n.age) AS lo, max(n.age) AS hi GROUP BY n.city",
+	);
+	assert!(rendered.contains("GROUP BY n.city"), "{rendered}");
+	assert!(rendered.contains("math::sum(n.age)"), "{rendered}");
+	assert!(rendered.contains("math::mean(n.age)"), "{rendered}");
+	assert!(rendered.contains("math::min(n.age)"), "{rendered}");
+	assert!(rendered.contains("math::max(n.age)"), "{rendered}");
+}
+
+#[test]
+fn lowers_collect_to_array_group() {
+	let rendered =
+		render("MATCH (n:person) RETURN n.city AS c, collect(n.name) AS names GROUP BY n.city");
+	assert!(rendered.contains("array::group(n.name)"), "{rendered}");
+}
+
+#[test]
+fn lowers_count_field_with_non_null_guard() {
+	// GQL `count(x)` counts non-null `x`: lowered as `count(x != NONE AND x != NULL)`
+	// so SurrealDB's truthy count yields the non-null count.
+	let rendered = render("MATCH (n:person) RETURN count(n.age) AS c");
+	assert!(rendered.contains("n.age != NONE"), "{rendered}");
+	assert!(rendered.contains("n.age != NULL"), "{rendered}");
+	assert!(rendered.contains("GROUP ALL"), "{rendered}");
+}
+
+#[test]
+fn rejects_distinct_in_aggregate() {
 	assert_rejects(
 		"MATCH (n:person) RETURN count(DISTINCT n)",
-		"Aggregate functions are not supported yet",
+		"DISTINCT/ALL inside an aggregate is not supported yet",
 		"count(DISTINCT n)",
 	);
 }
 
 #[test]
-fn rejects_sum_aggregate() {
+fn rejects_aggregate_in_where() {
 	assert_rejects(
-		"MATCH (n:person) RETURN sum(n.age)",
+		"MATCH (n:person) WHERE count(n) > 0 RETURN n",
+		"Aggregate functions are only allowed in RETURN items and ORDER BY keys",
+		"count(n)",
+	);
+}
+
+#[test]
+fn rejects_ungrouped_non_aggregate_column() {
+	// `n.age` is neither a grouping key, an aggregate, nor determined by `n.name`.
+	assert_rejects(
+		"MATCH (n:person) RETURN n.name, n.age GROUP BY n.name",
+		"must be a GROUP BY key, an aggregate, or determined by the GROUP BY keys",
+		"n.age",
+	);
+}
+
+#[test]
+fn lowers_functionally_dependent_column() {
+	// `GROUP BY a` (the whole node) determines `a.name`, so it projects without
+	// an aggregate (the planner emits its first value per group).
+	let rendered = render("MATCH (a:person) RETURN a AS who, a.name AS nm GROUP BY a");
+	assert!(rendered.contains("GROUP BY a"), "{rendered}");
+	assert!(rendered.contains("a.name AS nm"), "{rendered}");
+}
+
+#[test]
+fn rejects_uncovered_dependent_column() {
+	// Grouping by `a.name` does NOT determine `a.age`.
+	assert_rejects(
+		"MATCH (a:person) RETURN a.name AS nm, a.age AS ag GROUP BY a.name",
+		"must be a GROUP BY key, an aggregate, or determined by the GROUP BY keys",
+		"a.age",
+	);
+}
+
+#[test]
+fn lowers_order_by_non_projected_group_key() {
+	// A non-DISTINCT aggregating query may ORDER BY a grouping key it does not
+	// project; the lowering materialises a hidden sort-only column.
+	let rendered = render("MATCH (a:person) RETURN count(*) AS c GROUP BY a.name ORDER BY a.name");
+	assert!(rendered.contains("a.name AS __order0"), "{rendered}");
+	assert!(rendered.contains("ORDER BY __order0 ASC"), "{rendered}");
+}
+
+#[test]
+fn rejects_distinct_order_by_non_return_item() {
+	assert_rejects(
+		"MATCH (n:person) RETURN DISTINCT n.name ORDER BY n.age",
+		"With RETURN DISTINCT, ORDER BY may only reference returned columns",
+		"n.age",
+	);
+}
+
+#[test]
+fn rejects_unsupported_aggregate() {
+	assert_rejects(
+		"MATCH (n:person) RETURN stddev_pop(n.age)",
 		"Aggregate functions are not supported yet",
-		"sum(n.age)",
+		"stddev_pop(n.age)",
 	);
 }
 
@@ -1912,16 +2014,6 @@ fn rejects_return_star_without_variables() {
 // ------------------------------------------------------------------------
 // Rejections — message change and new rejections (V2_DESIGN §8 ledger).
 // ------------------------------------------------------------------------
-
-#[test]
-fn rejects_distinct_order_by_non_return_item() {
-	// Message changed from v1's "ORDER BY may only reference RETURN items".
-	assert_rejects(
-		"MATCH (n:person) RETURN DISTINCT n.name ORDER BY n.age",
-		"With RETURN DISTINCT, ORDER BY may only reference returned columns",
-		"n.age",
-	);
-}
 
 #[test]
 fn rejects_optional_rebind_in_mandatory_clause() {

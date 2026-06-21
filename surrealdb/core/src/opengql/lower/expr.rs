@@ -32,6 +32,7 @@ use crate::opengql::ast::{
 };
 use crate::opengql::lower::binding::Registry;
 use crate::opengql::lower::naming;
+use crate::sql::function::{Function, FunctionCall};
 use crate::sql::literal::ObjectEntry;
 use crate::sql::{BinaryOperator, Expr, Idiom, Literal, Param, Part, PrefixOperator};
 use crate::syn::error::{SyntaxError, bail, syntax_error};
@@ -46,6 +47,23 @@ use crate::syn::token::Span;
 /// has a seam to extend.
 pub(super) struct Scope<'a> {
 	pub(super) registry: &'a Registry,
+	/// Whether aggregate function calls (`count`, `sum`, …) may appear in this
+	/// position. `true` only for `RETURN` value position (and `ORDER BY` keys of
+	/// an aggregating query); `false` everywhere else (`WHERE` predicates,
+	/// `GROUP BY` keys, and an aggregate's own arguments — so nested aggregates
+	/// are rejected).
+	pub(super) allow_aggregates: bool,
+}
+
+impl<'a> Scope<'a> {
+	/// A copy of this scope that forbids aggregates — used when lowering an
+	/// aggregate's arguments so a nested aggregate is rejected.
+	fn no_aggregates(&self) -> Scope<'a> {
+		Scope {
+			registry: self.registry,
+			allow_aggregates: false,
+		}
+	}
 }
 
 impl Scope<'_> {
@@ -155,9 +173,9 @@ pub(super) async fn lower_value(
 			name,
 			quantifier,
 			star,
+			args,
 			span,
-			..
-		} => reject_function(name, *quantifier, *star, *span),
+		} => lower_function(stk, name, *quantifier, *star, args, *span, scope).await,
 		GqlExpr::List(items, _) => {
 			let mut exprs = Vec::with_capacity(items.len());
 			for item in items {
@@ -619,31 +637,187 @@ async fn lower_property(
 	}
 }
 
-/// §5: the v1 function whitelist is empty — every call is rejected, with a
-/// dedicated message for aggregates (including `count(*)` and
-/// `count(DISTINCT …)` forms).
-const AGGREGATE_FUNCTIONS: &[&str] = &[
-	"avg",
-	"collect_list",
-	"count",
-	"max",
-	"min",
-	"percentile_cont",
-	"percentile_disc",
-	"stddev_pop",
-	"stddev_samp",
-	"sum",
-];
+/// §5: the supported aggregates and how each maps onto a SurrealDB aggregate
+/// function. `count` is special (`count(*)` counts rows, `count(x)` counts
+/// non-null `x`); the rest take a single argument and map straight onto a
+/// `math::*` / `array::*` accumulator the streaming `Aggregate` operator already
+/// knows. Names compare case-insensitively.
+enum AggregateTarget {
+	/// `count` — handled specially (star form vs. single-argument null count).
+	Count,
+	/// A single-argument aggregate that lowers to the named SurrealDB function.
+	Mapped(&'static str),
+}
 
-fn reject_function(
+/// Resolves a (lowercased) GQL aggregate name to its lowering target, or `None`
+/// if the name is not a supported aggregate.
+///
+/// Numeric contract (v1): `sum`/`avg` are numeric by the GQL spec, and `min`/`max`
+/// map onto the numeric `math::*` accumulators, which **silently ignore
+/// non-numeric values** (including `NULL`/`NONE`). So over a non-numeric column
+/// they accumulate nothing and return the empty-accumulator identity (`0` for
+/// `sum`, `±∞` for `min`/`max`) rather than an orderable min/max or an error.
+/// Orderable (datetime/string/duration) `MIN`/`MAX` is a deliberate follow-up;
+/// see `language-tests/tests/opengql/aggregate_min_non_numeric.gql`.
+fn aggregate_target(name: &str) -> Option<AggregateTarget> {
+	Some(match name {
+		"count" => AggregateTarget::Count,
+		"sum" => AggregateTarget::Mapped("math::sum"),
+		"collect" | "collect_list" => AggregateTarget::Mapped("array::group"),
+		"min" => AggregateTarget::Mapped("math::min"),
+		"max" => AggregateTarget::Mapped("math::max"),
+		"avg" => AggregateTarget::Mapped("math::mean"),
+		_ => return None,
+	})
+}
+
+/// GQL aggregate names that are recognised but not implemented yet — reported
+/// with the aggregate-specific message rather than the generic one.
+const UNSUPPORTED_AGGREGATES: &[&str] =
+	&["percentile_cont", "percentile_disc", "stddev_pop", "stddev_samp"];
+
+/// §5: lowers a function call. The only functions supported are the aggregates
+/// (in `RETURN`/aggregating-`ORDER BY` position); every other call is rejected.
+async fn lower_function(
+	stk: &mut Stk,
 	name: &Ident,
 	quantifier: Option<SetQuantifier>,
 	star: Option<Span>,
+	args: &[GqlExpr],
 	span: Span,
+	scope: &Scope<'_>,
 ) -> Result<Expr, SyntaxError> {
 	let lowered = name.name.to_ascii_lowercase();
-	if star.is_some() || quantifier.is_some() || AGGREGATE_FUNCTIONS.contains(&lowered.as_str()) {
-		bail!("Aggregate functions are not supported yet", @span);
+	let Some(target) = aggregate_target(&lowered) else {
+		// `*` and a `DISTINCT`/`ALL` set quantifier are aggregate-only syntax, so
+		// flag such calls as aggregates even when the name is unknown.
+		if star.is_some()
+			|| quantifier.is_some()
+			|| UNSUPPORTED_AGGREGATES.contains(&lowered.as_str())
+		{
+			bail!("Aggregate functions are not supported yet", @span);
+		}
+		bail!("The function `{}` is not supported yet", name.name, @span);
+	};
+
+	if !scope.allow_aggregates {
+		bail!(
+			"Aggregate functions are only allowed in RETURN items and ORDER BY keys",
+			@span => "an aggregate cannot appear in WHERE, GROUP BY, or inside another aggregate"
+		);
 	}
-	bail!("The function `{}` is not supported yet", name.name, @span);
+	if quantifier.is_some() {
+		bail!(
+			"DISTINCT/ALL inside an aggregate is not supported yet",
+			@span => "remove the set quantifier"
+		);
+	}
+
+	match target {
+		AggregateTarget::Count => {
+			if star.is_some() {
+				// `count(*)` counts every row in the group: a zero-argument
+				// SurrealDB `count`.
+				return Ok(function_call("count", Vec::new()));
+			}
+			let arg = single_arg(name, args, span)?;
+			let arg_scope = scope.no_aggregates();
+			let lowered = stk.run(|stk| lower_value(stk, arg, &arg_scope)).await?;
+			// GQL `count(x)` counts rows where `x` is not null. SurrealDB's
+			// `count(<arg>)` counts truthy arguments, so feed it the non-null
+			// guard: `x != NONE AND x != NULL` is `true` exactly when `x` is
+			// present, and the truthy count is then the non-null count.
+			Ok(function_call("count", vec![null_test(lowered, true)]))
+		}
+		AggregateTarget::Mapped(surreal_name) => {
+			if let Some(star) = star {
+				bail!(
+					"`{}(*)` is not supported; only `count(*)` takes `*`",
+					name.name,
+					@star => "pass an expression to aggregate"
+				);
+			}
+			let arg = single_arg(name, args, span)?;
+			let arg_scope = scope.no_aggregates();
+			let lowered = stk.run(|stk| lower_value(stk, arg, &arg_scope)).await?;
+			Ok(function_call(surreal_name, vec![lowered]))
+		}
+	}
+}
+
+/// Returns the single argument of an aggregate call, rejecting any other arity.
+fn single_arg<'a>(
+	name: &Ident,
+	args: &'a [GqlExpr],
+	span: Span,
+) -> Result<&'a GqlExpr, SyntaxError> {
+	match args {
+		[arg] => Ok(arg),
+		_ => bail!(
+			"`{}` takes exactly one argument",
+			name.name,
+			@span => "aggregate over a single expression"
+		),
+	}
+}
+
+/// Builds a normal SurrealDB function-call expression.
+fn function_call(name: &str, arguments: Vec<Expr>) -> Expr {
+	Expr::FunctionCall(Box::new(FunctionCall {
+		receiver: Function::Normal(name.to_owned()),
+		arguments,
+	}))
+}
+
+/// Whether a (parsed, not-yet-lowered) expression contains a supported
+/// aggregate call (`count(*)` or any name in [`aggregate_target`]). Used by the
+/// RETURN-clause lowering to decide whether the query aggregates and to enforce
+/// the "every column is a grouping key or an aggregate" rule. Walks on an
+/// explicit stack so a deep operator spine cannot overflow.
+pub(super) fn gql_contains_aggregate(expr: &GqlExpr) -> bool {
+	let mut stack = vec![expr];
+	while let Some(e) = stack.pop() {
+		match e {
+			GqlExpr::FunctionCall {
+				name,
+				star,
+				args,
+				..
+			} => {
+				if star.is_some() || aggregate_target(&name.name.to_ascii_lowercase()).is_some() {
+					return true;
+				}
+				stack.extend(args.iter());
+			}
+			GqlExpr::Property(inner, _, _) => stack.push(inner),
+			GqlExpr::Unary {
+				expr,
+				..
+			}
+			| GqlExpr::IsBool {
+				expr,
+				..
+			}
+			| GqlExpr::IsNull {
+				expr,
+				..
+			} => stack.push(expr),
+			GqlExpr::Binary {
+				left,
+				right,
+				..
+			} => {
+				stack.push(left);
+				stack.push(right);
+			}
+			GqlExpr::List(items, _) => stack.extend(items.iter()),
+			GqlExpr::Map(fields, _) => stack.extend(fields.iter().map(|(_, v)| v)),
+			GqlExpr::Literal(..)
+			| GqlExpr::Param {
+				..
+			}
+			| GqlExpr::Variable(_) => {}
+		}
+	}
+	false
 }

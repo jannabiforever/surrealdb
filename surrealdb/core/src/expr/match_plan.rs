@@ -141,6 +141,14 @@ pub(crate) struct MatchOutput {
 	/// Explicit output columns; `RETURN *` is pre-expanded by the lowering.
 	pub(crate) columns: Vec<MatchColumn>,
 	pub(crate) distinct: bool,
+	/// Aggregation, if any. `None` means no aggregation (the columns project
+	/// straight from the binding rows). `Some(keys)` means the binding table is
+	/// folded by the (binding-row scoped) group-key expressions before
+	/// projection — an empty `keys` is `GROUP ALL` (a single group over all
+	/// rows, e.g. a bare `RETURN count(*)`). Each non-key column carries an
+	/// aggregate; the planner inserts an `Aggregate` operator in place of the
+	/// projection.
+	pub(crate) group_by: Option<Vec<Expr>>,
 	pub(crate) order: Vec<MatchOrder>,
 	pub(crate) skip: Option<Expr>,
 	pub(crate) limit: Option<Expr>,
@@ -150,6 +158,12 @@ pub(crate) struct MatchOutput {
 pub(crate) struct MatchColumn {
 	pub(crate) name: String,
 	pub(crate) expr: Expr,
+	/// A sort-only column materialised by an aggregating query so a non-projected
+	/// ORDER BY key (a grouping key, functionally-dependent value, or aggregate)
+	/// can be sorted on; the planner emits it from the `Aggregate` operator and
+	/// drops it with a final projection before the rows are returned. Always
+	/// `false` for user-projected columns.
+	pub(crate) hidden: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -240,6 +254,21 @@ impl ToSql for MatchPlan {
 			column.expr.fmt_sql(f, SqlFormat::SingleLine);
 			f.push_str(" AS ");
 			f.push_str(&column.name);
+		}
+
+		// `Some([])` is `GROUP ALL` and renders nothing extra (the aggregates in
+		// the columns already imply it); `Some(keys)` renders `GROUP BY …`.
+		if let Some(keys) = self.output.group_by.as_ref()
+			&& !keys.is_empty()
+		{
+			f.push_str(" GROUP BY");
+			for (i, key) in keys.iter().enumerate() {
+				if i > 0 {
+					f.push(',');
+				}
+				f.push(' ');
+				key.fmt_sql(f, SqlFormat::SingleLine);
+			}
 		}
 
 		if !self.output.order.is_empty() {
@@ -416,13 +445,16 @@ mod tests {
 					MatchColumn {
 						name: "a_name".to_string(),
 						expr: field_path("a", "name"),
+						hidden: false,
 					},
 					MatchColumn {
 						name: "b_name".to_string(),
 						expr: field_path("b", "name"),
+						hidden: false,
 					},
 				],
 				distinct: false,
+				group_by: None,
 				order: Vec::new(),
 				skip: None,
 				limit: None,

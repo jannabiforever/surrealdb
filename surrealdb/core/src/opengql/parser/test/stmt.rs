@@ -250,12 +250,21 @@ fn query_must_end_after_page_clauses() {
 #[rstest]
 #[case::group_after_items("MATCH (a) RETURN a.x GROUP BY a.x")]
 #[case::group_after_star("MATCH (a) RETURN * GROUP BY a.x")]
+#[case::group_multiple_keys("MATCH (a) RETURN a.x GROUP BY a.x, a.y")]
+fn group_by_parses(#[case] source: &str) {
+	// A `groupByClause` (GQL.g4:671) parses directly after the return items; the
+	// lowering enforces the GQL shape (valid keys, aggregates, etc.).
+	parse(source);
+}
+
+#[rstest]
 #[case::group_after_order("MATCH (a) RETURN a.x ORDER BY a.x GROUP BY a.x")]
 #[case::group_after_limit("MATCH (a) RETURN a.x LIMIT 1 GROUP BY a.x")]
-fn group_by_rejected(#[case] source: &str) {
-	// An attached `groupByClause` (GQL.g4:671) parses but is rejected.
+fn group_by_after_page_clauses_rejected(#[case] source: &str) {
+	// GROUP BY must directly follow the return items; after a page clause it is
+	// an out-of-order error.
 	let error = parse_err(source);
-	assert!(error.contains("GROUP BY is not supported yet"), "{error}");
+	assert!(error.contains("Unexpected `GROUP` clause"), "{error}");
 }
 
 #[test]

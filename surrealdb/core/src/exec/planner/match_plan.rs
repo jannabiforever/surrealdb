@@ -57,15 +57,15 @@ use super::Planner;
 use crate::err::Error;
 use crate::exec::ExecOperator;
 use crate::exec::operators::{
-	Bind, Distinct, DistinctEdges, EdgeBinding, EndpointBind, EndpointField, Expand, ExpandDir,
-	FieldSelection, Filter, HashJoin, JoinType, Limit, OrderByField, PathExpand, Project, Sort,
-	SortDirection,
+	Aggregate, AggregateField, Bind, Distinct, DistinctEdges, EdgeBinding, EndpointBind,
+	EndpointField, Expand, ExpandDir, FieldSelection, Filter, HashJoin, JoinType, Limit,
+	OrderByField, PathExpand, Project, Sort, SortDirection,
 };
 use crate::expr::match_plan::{
 	BindingId, BindingKind, EdgeStep, ExpandDirection, MatchClausePlan, MatchPlan, MatchPredicate,
 	NodeStep, PatternPlan,
 };
-use crate::expr::{Cond, Expr, Idiom, Part};
+use crate::expr::{Cond, Expr, Function, Idiom, Literal, Part};
 use crate::val::TableName;
 
 /// A binder stage: the operator built so far, the bindings available on its
@@ -1125,16 +1125,35 @@ impl<'ctx> Planner<'ctx> {
 		Ok(Arc::new(Filter::new(op, predicate)) as Arc<dyn ExecOperator>)
 	}
 
-	/// Build the output tail over the binder-chain body, per the DISTINCT split:
-	/// non-DISTINCT ⇒ Sort → Limit → Project; DISTINCT ⇒ Project → Distinct →
-	/// Sort → Limit.
+	/// Build the output tail over the binder-chain body.
+	///
+	/// - Aggregating (`group_by.is_some()`) ⇒ Aggregate → [Distinct] → Sort → Limit → [drop
+	///   hidden]. The `Aggregate` operator emits the final projected objects (keyed by output
+	///   column name), so it stands in for the Project; the lowering resolved ORDER BY to those
+	///   output columns (materialising hidden sort-only columns for non-projected keys), so the
+	///   Sort runs over them, and a trailing Project drops any hidden column.
+	/// - DISTINCT ⇒ Project → Distinct → Sort → Limit.
+	/// - Plain ⇒ Sort → Limit → Project.
 	async fn plan_match_tail(
 		&self,
 		plan: &MatchPlan,
 		body: Arc<dyn ExecOperator>,
 	) -> Result<Arc<dyn ExecOperator>, Error> {
 		let output = &plan.output;
-		if output.distinct {
+		if let Some(group_keys) = output.group_by.as_ref() {
+			let mut op = self.plan_match_aggregate(body, plan, group_keys).await?;
+			if output.distinct {
+				op = Arc::new(Distinct::new(op)) as Arc<dyn ExecOperator>;
+			}
+			op = self.plan_match_sort(op, plan).await?;
+			op = self.plan_match_limit(op, plan).await?;
+			// Drop any sort-only (hidden) columns the lowering materialised for a
+			// non-projected ORDER BY key.
+			if output.columns.iter().any(|c| c.hidden) {
+				op = self.plan_match_drop_hidden(op, plan).await?;
+			}
+			Ok(op)
+		} else if output.distinct {
 			let mut op = self.plan_match_project(body, plan).await?;
 			op = Arc::new(Distinct::new(op)) as Arc<dyn ExecOperator>;
 			op = self.plan_match_sort(op, plan).await?;
@@ -1146,6 +1165,94 @@ impl<'ctx> Planner<'ctx> {
 			op = self.plan_match_project(op, plan).await?;
 			Ok(op)
 		}
+	}
+
+	/// Build the `Aggregate` operator that folds the binding rows by the GROUP BY
+	/// keys (empty keys ⇒ GROUP ALL, a single group over every row). Classifies
+	/// each column (projected or hidden sort-only) three ways:
+	/// - exactly a grouping key ⇒ pass it through (`is_group_key`);
+	/// - contains an aggregate ⇒ [`Planner::extract_aggregate_info`] (the column carries the fold,
+	///   so the helper's implicit `array::group` fallback never fires);
+	/// - otherwise it is determined by the grouping keys (the lowering guarantees coverage) ⇒ emit
+	///   its first value per group via `fallback_expr`, which is exact because the value is
+	///   constant within a group.
+	async fn plan_match_aggregate(
+		&self,
+		input: Arc<dyn ExecOperator>,
+		plan: &MatchPlan,
+		group_keys: &[Expr],
+	) -> Result<Arc<dyn ExecOperator>, Error> {
+		use surrealdb_types::ToSql;
+
+		// Physical group-key expressions (empty for GROUP ALL — the operator's
+		// `group_by_exprs.is_empty()` check then takes the single-group path).
+		let mut group_by_exprs = Vec::with_capacity(group_keys.len());
+		for key in group_keys {
+			group_by_exprs.push(self.physical_expr(key.clone()).await?);
+		}
+		// Display idioms for EXPLAIN, kept length-aligned with the keys so the
+		// operator renders `GROUP ALL` only when there are genuinely no keys.
+		let group_by_idioms: Vec<Idiom> = group_keys
+			.iter()
+			.map(|key| match key {
+				Expr::Idiom(idiom) => idiom.clone(),
+				other => Idiom::field(other.to_sql()),
+			})
+			.collect();
+
+		let mut aggregates = Vec::with_capacity(plan.output.columns.len());
+		for column in plan.output.columns.iter() {
+			if let Some(idx) = group_keys.iter().position(|k| *k == column.expr) {
+				// A grouping key column: passed through from the group key vector.
+				aggregates.push(AggregateField::new(
+					column.name.clone(),
+					true,
+					Some(idx),
+					None,
+					None,
+				));
+			} else if expr_has_aggregate(self.function_registry(), &column.expr) {
+				let (info, fallback) = self.extract_aggregate_info(column.expr.clone()).await?;
+				aggregates.push(AggregateField::new(
+					column.name.clone(),
+					false,
+					None,
+					info,
+					fallback,
+				));
+			} else {
+				// Determined by the grouping keys (constant within each group): emit
+				// the first value seen. The lowering guarantees coverage.
+				let fallback = self.physical_expr(column.expr.clone()).await?;
+				aggregates.push(AggregateField::new(
+					column.name.clone(),
+					false,
+					None,
+					None,
+					Some(fallback),
+				));
+			}
+		}
+
+		Ok(Arc::new(Aggregate::new(input, group_by_idioms, group_by_exprs, aggregates))
+			as Arc<dyn ExecOperator>)
+	}
+
+	/// Project away the hidden sort-only columns after an aggregating Sort,
+	/// keeping only the user-projected columns (selected by output name, since the
+	/// `Aggregate` already produced each under its name). Only built when the plan
+	/// actually has hidden columns.
+	async fn plan_match_drop_hidden(
+		&self,
+		input: Arc<dyn ExecOperator>,
+		plan: &MatchPlan,
+	) -> Result<Arc<dyn ExecOperator>, Error> {
+		let mut fields = Vec::new();
+		for column in plan.output.columns.iter().filter(|c| !c.hidden) {
+			let expr = self.physical_expr(Expr::Idiom(Idiom::field(column.name.clone()))).await?;
+			fields.push(FieldSelection::new(&column.name, expr));
+		}
+		Ok(Arc::new(Project::new(input, fields, Vec::new(), false)) as Arc<dyn ExecOperator>)
 	}
 
 	/// Build the `Sort` operator from `MatchOutput::order`, or pass through when
@@ -1276,6 +1383,48 @@ fn step_bindings(
 		bound.push(id);
 	}
 	bound
+}
+
+/// Whether an expression contains a call to a registered aggregate function.
+/// Used to classify an aggregating query's columns: a non-key column with an
+/// aggregate folds via `extract_aggregate_info`, one without is a value
+/// determined by the grouping keys (first-value). Walks on an explicit stack.
+fn expr_has_aggregate(registry: &crate::exec::function::FunctionRegistry, expr: &Expr) -> bool {
+	let mut stack = vec![expr];
+	while let Some(e) = stack.pop() {
+		match e {
+			Expr::FunctionCall(call) => {
+				if let Function::Normal(name) = &call.receiver
+					&& registry.get_aggregate(name.as_str()).is_some()
+				{
+					return true;
+				}
+				stack.extend(call.arguments.iter());
+			}
+			Expr::Binary {
+				left,
+				right,
+				..
+			} => {
+				stack.push(left);
+				stack.push(right);
+			}
+			Expr::Prefix {
+				expr,
+				..
+			}
+			| Expr::Postfix {
+				expr,
+				..
+			} => stack.push(expr),
+			Expr::Literal(Literal::Array(items)) => stack.extend(items.iter()),
+			Expr::Literal(Literal::Object(entries)) => {
+				stack.extend(entries.iter().map(|entry| &entry.value));
+			}
+			_ => {}
+		}
+	}
+	false
 }
 
 /// The union of two binding sets, preserving `a`'s order then appending the new
@@ -1543,6 +1692,7 @@ mod tests {
 		MatchColumn {
 			name: name.to_string(),
 			expr,
+			hidden: false,
 		}
 	}
 
@@ -1570,6 +1720,7 @@ mod tests {
 		MatchOutput {
 			columns: cols,
 			distinct: false,
+			group_by: None,
 			order: Vec::new(),
 			skip: None,
 			limit: None,
@@ -1640,6 +1791,7 @@ mod tests {
 			output: MatchOutput {
 				columns: vec![col("p", var("p")), col("b", var("b"))],
 				distinct: false,
+				group_by: None,
 				order: vec![MatchOrder {
 					expr: field_path("a", "age"),
 					ascending: true,

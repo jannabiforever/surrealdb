@@ -32,8 +32,8 @@ use crate::expr::match_plan::{MatchColumn, MatchOrder, MatchOutput, MatchPlan};
 use crate::expr::plan::{LogicalPlan, TopLevelExpr};
 use crate::expr::{Expr, Idiom, Literal, Param};
 use crate::opengql::ast::{
-	GqlExpr, GqlLiteral, GqlQuery, GqlStatement, MatchItem, MatchQuery, OrderItem, ReturnClause,
-	ReturnItems, SetQuantifier,
+	GqlExpr, GqlGroupItem, GqlLiteral, GqlQuery, GqlStatement, MatchItem, MatchQuery, OrderItem,
+	ReturnClause, ReturnItems, SetQuantifier,
 };
 use crate::syn::error::{SyntaxError, bail, syntax_error};
 
@@ -119,6 +119,10 @@ fn reject_leading_optional(query: &MatchQuery) -> Result<(), SyntaxError> {
 struct Column {
 	name: String,
 	expr: Expr,
+	/// A sort-only column materialised so an aggregating query can ORDER BY a
+	/// value it does not project (see [`MatchColumn::hidden`]); dropped before
+	/// the rows are returned. `false` for user-projected columns.
+	hidden: bool,
 }
 
 /// Lowers the RETURN clause into the [`MatchOutput`] spec: the projected
@@ -129,12 +133,21 @@ async fn lower_output(
 	ret: &ReturnClause,
 	registry: &Registry,
 ) -> Result<MatchOutput, SyntaxError> {
-	let columns = lower_return_items(stk, ret, registry).await?;
+	// GROUP BY keys lower first (no aggregates permitted in a key) so the
+	// RETURN-item lowering can validate every non-aggregate column against them.
+	let group_keys = lower_group_keys(stk, &ret.group_by, registry).await?;
+
+	let (mut columns, aggregating) = lower_return_items(stk, ret, registry, &group_keys).await?;
 	let distinct = matches!(ret.quantifier, Some(SetQuantifier::Distinct));
 
+	// ORDER BY resolution may append hidden sort-only columns (an aggregating
+	// query ordering by a value it does not project), so `columns` is mutable.
 	let mut order = Vec::with_capacity(ret.order_by.len());
 	for item in &ret.order_by {
-		order.push(lower_order_item(stk, item, &columns, distinct, registry).await?);
+		order.push(
+			lower_order_item(stk, item, &mut columns, &group_keys, distinct, aggregating, registry)
+				.await?,
+		);
 	}
 
 	let skip = match &ret.skip {
@@ -152,13 +165,37 @@ async fn lower_output(
 			.map(|c| MatchColumn {
 				name: c.name,
 				expr: c.expr,
+				hidden: c.hidden,
 			})
 			.collect(),
 		distinct,
+		// `aggregating` is `any aggregate column || GROUP BY present`. When the
+		// only trigger is an aggregate (no GROUP BY) the key list is empty, which
+		// the planner reads as GROUP ALL.
+		group_by: aggregating.then_some(group_keys),
 		order,
 		skip,
 		limit,
 	})
+}
+
+/// Lowers the GROUP BY grouping elements to binding-row key expressions. A key
+/// may not itself contain an aggregate (rejected by [`expr::lower_value`] under
+/// a non-aggregate scope).
+async fn lower_group_keys(
+	stk: &mut Stk,
+	items: &[GqlGroupItem],
+	registry: &Registry,
+) -> Result<Vec<Expr>, SyntaxError> {
+	let scope = Scope {
+		registry,
+		allow_aggregates: false,
+	};
+	let mut keys = Vec::with_capacity(items.len());
+	for item in items {
+		keys.push(expr::lower_value(stk, &item.expr, &scope).await?.into());
+	}
+	Ok(keys)
 }
 
 /// Lowers the RETURN items into named columns (R8): explicit aliases win,
@@ -169,13 +206,25 @@ async fn lower_return_items(
 	stk: &mut Stk,
 	ret: &ReturnClause,
 	registry: &Registry,
-) -> Result<Vec<Column>, SyntaxError> {
+	group_keys: &[Expr],
+) -> Result<(Vec<Column>, bool), SyntaxError> {
+	// Aggregates are permitted in RETURN value position.
 	let scope = Scope {
 		registry,
+		allow_aggregates: true,
 	};
 	let mut columns: Vec<Column> = Vec::new();
 	match &ret.items {
 		ReturnItems::Star => {
+			// `RETURN *` carries no aggregates, so the only way it could be an
+			// aggregating query is an attached GROUP BY — which has no meaning
+			// over `*`.
+			if !group_keys.is_empty() {
+				bail!(
+					"RETURN * cannot be combined with GROUP BY",
+					@ret.span => "list the grouping keys and aggregates explicitly"
+				);
+			}
 			let mut names: Vec<&str> = registry
 				.bindings()
 				.iter()
@@ -195,10 +244,17 @@ async fn lower_return_items(
 				columns.push(Column {
 					name: name.to_owned(),
 					expr: Expr::Idiom(Idiom::field(name)),
+					hidden: false,
 				});
 			}
+			Ok((columns, false))
 		}
 		ReturnItems::Items(items) => {
+			// The query aggregates when any RETURN item carries an aggregate, or
+			// a GROUP BY is present.
+			let aggregating = !group_keys.is_empty()
+				|| items.iter().any(|i| expr::gql_contains_aggregate(&i.expr));
+
 			for item in items {
 				let (name, name_span) = naming::column_name(item)?;
 				if columns.iter().any(|c| c.name == name) {
@@ -207,52 +263,82 @@ async fn lower_return_items(
 						@name_span => "use `AS` to give the items distinct column names"
 					);
 				}
-				let lowered = expr::lower_value(stk, &item.expr, &scope).await?;
+				let is_aggregate = expr::gql_contains_aggregate(&item.expr);
+				// `lower_value` builds `sql::Expr`; the IR is `expr::Expr`.
+				let lowered: Expr = expr::lower_value(stk, &item.expr, &scope).await?.into();
+
+				// Strict GQL/SQL: when aggregating, a non-aggregate column must be
+				// determined by the GROUP BY keys — either a key itself or a value
+				// built only from grouped keys (e.g. `GROUP BY a; RETURN a.name`,
+				// which is constant within each group). A genuinely ungrouped
+				// column is rejected (no silent first-value).
+				if aggregating && !is_aggregate && !column_is_grouped(&lowered, group_keys) {
+					bail!(
+						"RETURN item `{name}` must be a GROUP BY key, an aggregate, or determined by \
+						 the GROUP BY keys",
+						@item.expr.span() => "add it to GROUP BY or wrap it in an aggregate"
+					);
+				}
+
 				columns.push(Column {
 					name,
-					// `lower_value` builds `sql::Expr`; the IR is `expr::Expr`.
-					expr: lowered.into(),
+					expr: lowered,
+					hidden: false,
 				});
 			}
+			Ok((columns, aggregating))
 		}
 	}
-	Ok(columns)
 }
 
 /// Lowers an ORDER BY item (R7).
 ///
-/// Without DISTINCT the sort key is a full binding-row expression evaluated
-/// pre-projection over all bindings (returned or not). With DISTINCT the key
-/// must name a returned column or lower to the same expression as one — the
-/// sort then references that column by name (Sort runs post-projection in the
-/// DISTINCT pipeline); any other key is rejected.
+/// Three regimes, by where the Sort runs:
+/// - DISTINCT: Sort runs over the projected output, so the key must name a returned column
+///   (standard SQL for `SELECT DISTINCT`); any other key is rejected.
+/// - aggregating (non-DISTINCT): Sort runs after the `Aggregate`. The key may be a returned column,
+///   a grouping key, a value determined by the grouping keys, or an aggregate — a non-projected one
+///   is materialised as a hidden sort-only column (dropped before output).
+/// - plain: Sort runs pre-projection over the binding rows, so any binding-row expression is valid;
+///   a key naming a RETURN column sorts on that column's underlying expression.
 async fn lower_order_item(
 	stk: &mut Stk,
 	item: &OrderItem,
-	columns: &[Column],
+	columns: &mut Vec<Column>,
+	group_keys: &[Expr],
 	distinct: bool,
+	aggregating: bool,
 	registry: &Registry,
 ) -> Result<MatchOrder, SyntaxError> {
 	if item.nulls_first.is_some() {
 		bail!("`NULLS FIRST`/`NULLS LAST` ordering is not supported yet", @item.span);
 	}
 	let ascending = item.ascending.unwrap_or(true);
+	// An aggregate may appear in ORDER BY only when the query already aggregates.
 	let scope = Scope {
 		registry,
+		allow_aggregates: aggregating,
 	};
 
 	if distinct {
-		let column = distinct_order_column(stk, item, columns, &scope).await?;
+		let column = order_output_column(stk, item, columns, &scope).await?;
 		return Ok(MatchOrder {
 			expr: Expr::Idiom(Idiom::field(column)),
 			ascending,
 		});
 	}
 
-	// Non-DISTINCT: Sort runs pre-projection over the binding rows, so a key
-	// naming a RETURN column (its alias, or the verbatim text of an unaliased
-	// item) cannot reference the projected column — it sorts on that column's
-	// underlying binding-row expression instead. Any other key lowers directly.
+	if aggregating {
+		let column = lower_aggregating_order(stk, item, columns, group_keys, &scope).await?;
+		return Ok(MatchOrder {
+			expr: Expr::Idiom(Idiom::field(column)),
+			ascending,
+		});
+	}
+
+	// Plain: a key naming a RETURN column (its alias, or the verbatim text of an
+	// unaliased item) sorts on that column's underlying binding-row expression.
+	// Any other key lowers directly.
 	if let Some(name) = order_key_name(&item.expr)
 		&& let Some(column) = columns.iter().find(|c| c.name == name)
 	{
@@ -268,10 +354,51 @@ async fn lower_order_item(
 	})
 }
 
+/// Resolves an aggregating-query ORDER BY key to the output column name the Sort
+/// references. Reuses a projected column (matched by name or lowered expression);
+/// otherwise materialises a hidden sort-only column for a grouping key, a
+/// value determined by the grouping keys, or an aggregate — rejecting any other
+/// key (a genuinely ungrouped, non-aggregate sort key). Returns the column name.
+async fn lower_aggregating_order(
+	stk: &mut Stk,
+	item: &OrderItem,
+	columns: &mut Vec<Column>,
+	group_keys: &[Expr],
+	scope: &Scope<'_>,
+) -> Result<String, SyntaxError> {
+	// A key naming a projected column by alias / verbatim text.
+	if let Some(name) = order_key_name(&item.expr)
+		&& let Some(column) = columns.iter().find(|c| !c.hidden && c.name == name)
+	{
+		return Ok(column.name.clone());
+	}
+	let is_aggregate = expr::gql_contains_aggregate(&item.expr);
+	let lowered: Expr = expr::lower_value(stk, &item.expr, scope).await?.into();
+	// Reuse a column (projected or already-materialised) with the same expression.
+	if let Some(column) = columns.iter().find(|c| c.expr == lowered) {
+		return Ok(column.name.clone());
+	}
+	// Otherwise it must be a valid aggregating key; materialise a hidden column.
+	if !is_aggregate && !column_is_grouped(&lowered, group_keys) {
+		bail!(
+			"ORDER BY key must be a returned column, a GROUP BY key, an aggregate, or determined by \
+			 the GROUP BY keys",
+			@item.span => "order by a returned column, a grouping key, or an aggregate"
+		);
+	}
+	let name = format!("__order{}", columns.iter().filter(|c| c.hidden).count());
+	columns.push(Column {
+		name: name.clone(),
+		expr: lowered,
+		hidden: true,
+	});
+	Ok(name)
+}
+
 /// Resolves a DISTINCT ORDER BY key to the name of the RETURN column it
 /// references — by dotted name, or by lowering to the same expression as a
 /// column — rejecting any key that is not a returned column.
-async fn distinct_order_column(
+async fn order_output_column(
 	stk: &mut Stk,
 	item: &OrderItem,
 	columns: &[Column],
@@ -292,6 +419,56 @@ async fn distinct_order_column(
 		"With RETURN DISTINCT, ORDER BY may only reference returned columns",
 		@item.span => "return the sort expression under an alias and order by the alias"
 	);
+}
+
+/// Whether an aggregating-query value expression is determined by the GROUP BY
+/// keys: it equals a key, or every leaf is a constant or an idiom prefixed by a
+/// grouping-key idiom (so the value is constant within each group and the
+/// `Aggregate`'s first-value fold is exact). Walks on an explicit stack so a deep
+/// operator spine cannot overflow.
+fn column_is_grouped(expr: &Expr, keys: &[Expr]) -> bool {
+	let mut stack = vec![expr];
+	while let Some(e) = stack.pop() {
+		// A sub-expression equal to a whole grouping key is covered outright.
+		if keys.contains(e) {
+			continue;
+		}
+		match e {
+			Expr::Literal(Literal::Array(items)) => stack.extend(items.iter()),
+			Expr::Literal(Literal::Object(entries)) => {
+				stack.extend(entries.iter().map(|entry| &entry.value));
+			}
+			Expr::Literal(_) | Expr::Param(_) | Expr::Constant(_) => {}
+			Expr::Idiom(idiom) => {
+				let covered = keys.iter().any(
+					|key| matches!(key, Expr::Idiom(key) if !key.0.is_empty() && idiom.0.starts_with(&key.0)),
+				);
+				if !covered {
+					return false;
+				}
+			}
+			Expr::Binary {
+				left,
+				right,
+				..
+			} => {
+				stack.push(left);
+				stack.push(right);
+			}
+			Expr::Prefix {
+				expr,
+				..
+			}
+			| Expr::Postfix {
+				expr,
+				..
+			} => stack.push(expr),
+			// Anything else (function calls, subqueries, tables, …) is not a value
+			// determined by the grouping keys.
+			_ => return false,
+		}
+	}
+	true
 }
 
 /// The dotted name of a sort key that is a plain variable or property chain,

@@ -242,17 +242,30 @@ impl Drop for LabelExpr {
 	}
 }
 
-/// The `RETURN` clause, including the trailing `ORDER BY`/`OFFSET`/`LIMIT`
-/// page statement.
+/// The `RETURN` clause, including the trailing `GROUP BY` and
+/// `ORDER BY`/`OFFSET`/`LIMIT` page statement.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReturnClause {
 	pub quantifier: Option<SetQuantifier>,
 	pub items: ReturnItems,
+	/// The `GROUP BY` grouping elements (`groupByClause`, GQL.g4:1313), empty
+	/// when absent. They sit between the return items and `ORDER BY`.
+	pub group_by: Vec<GqlGroupItem>,
 	pub order_by: Vec<OrderItem>,
 	/// The `OFFSET`/`SKIP` count: an unsigned integer or a parameter.
 	pub skip: Option<GqlExpr>,
 	/// The `LIMIT` count: an unsigned integer or a parameter.
 	pub limit: Option<GqlExpr>,
+	pub span: Span,
+}
+
+/// A single `GROUP BY` grouping element. The GQL grammar restricts these to
+/// binding variable references; we parse the same value-expression grammar as
+/// the return items and `ORDER BY` keys (so `a.name` is accepted) and let the
+/// lowering enforce the shape.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GqlGroupItem {
+	pub expr: GqlExpr,
 	pub span: Span,
 }
 

@@ -239,6 +239,8 @@ async fn lower_predicates(
 	);
 	let scope = Scope {
 		registry,
+		// Aggregates are not allowed in WHERE predicates or property equalities.
+		allow_aggregates: false,
 	};
 	let mut out = Vec::with_capacity(conjuncts.len());
 	for conjunct in &conjuncts {

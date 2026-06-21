@@ -504,7 +504,13 @@ fn targeted_errors() {
 			.contains("GQL write statements are not supported in this version (read-only)")
 	);
 	assert!(parse_err("MATCH (a) RETURN a UNION MATCH (b) RETURN b").contains("Composite queries"));
-	assert!(parse_err("MATCH (a) RETURN a.x GROUP BY a.x").contains("GROUP BY is not supported"));
+	// GROUP BY now parses (the lowering enforces its shape); a misplaced GROUP
+	// after a page clause is still rejected.
+	parse("MATCH (a) RETURN a.x GROUP BY a.x");
+	assert!(
+		parse_err("MATCH (a) RETURN a.x LIMIT 1 GROUP BY a.x")
+			.contains("Unexpected `GROUP` clause")
+	);
 	assert!(parse_err("RETURN $$x").contains("Substituted parameters"));
 	assert!(parse_err("MATCH (a:MATCH) RETURN 1").contains("`MATCH` is a reserved word"));
 	assert!(parse_err("MATCH SHORTEST (a)->(b) RETURN 1").contains("Path pattern prefixes"));
