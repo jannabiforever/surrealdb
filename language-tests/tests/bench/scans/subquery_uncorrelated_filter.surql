@@ -1,13 +1,13 @@
 /**
 [env]
-imports = ["bench/util/records-100000.surql"]
+imports = ["bench/util/records-10000.surql"]
 
 [bench]
 reason = "Filter records against an uncorrelated aggregate subquery"
 run = true
 rebuild = false
 warmup = "2s"
-sample-size = 50
+sample-size = 20
 measurement-time = "20s"
 
 [test]

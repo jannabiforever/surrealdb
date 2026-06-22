@@ -83,7 +83,7 @@ pub enum Tails {
 }
 
 /// An estimate of a measured value
-#[derive(SurrealValue)]
+#[derive(Clone, SurrealValue)]
 pub struct Estimate {
 	/// The confidence level with which the upper_bound and lower_bound where created.
 	pub confidence_level: f64,
@@ -107,7 +107,7 @@ impl Estimate {
 	}
 }
 
-#[derive(SurrealValue)]
+#[derive(Clone, SurrealValue)]
 pub struct MeasurementData {
 	pub iterations: Vec<f64>,
 	pub times: Vec<f64>,

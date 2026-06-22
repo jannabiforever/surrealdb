@@ -5,7 +5,7 @@ run = true
 rebuild = true
 datasets = { off = "bench/util/records-100000.surql", on = "bench/util/records-100000-changefeed.surql", original = "bench/util/records-100000-changefeed-original.surql" }
 warmup = "2s"
-sample-size = 50
+sample-size = 10
 measurement-time = "20s"
 
 [test]

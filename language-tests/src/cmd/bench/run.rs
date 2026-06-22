@@ -334,6 +334,24 @@ pub async fn run(color: ColorMode, parent: &ArgMatches, current: &ArgMatches) ->
 				);
 			}
 			BenchRunResult::Ok(measurement, compare) => {
+				// Persist each result the moment its bench finishes, not in a trailing
+				// pass over the whole suite, so a run killed partway (job timeout,
+				// runner eviction, panic) keeps every completed bench instead of
+				// discarding the lot. The store is a per-bench time series, so a
+				// partial run is well-formed. Non-fatal: a transient store error must
+				// not sink an otherwise-good run.
+				if cfg.save {
+					if let Err(e) = store
+						.add(BenchMarkRun {
+							measurement: measurement.clone(),
+							path: i.name(),
+							backend: cfg.backend,
+						})
+						.await
+					{
+						eprintln!("Warning: could not store measurement for {}: {e:#}", i.name());
+					}
+				}
 				measurements.push((i, measurement, compare));
 			}
 		}
@@ -347,7 +365,7 @@ pub async fn run(color: ColorMode, parent: &ArgMatches, current: &ArgMatches) ->
 		}
 	}
 
-	for (i, m, compare) in measurements {
+	for (i, m, compare) in &measurements {
 		println!(" - {}", i.name());
 
 		if let Some(compare) = compare {
@@ -455,18 +473,6 @@ pub async fn run(color: ColorMode, parent: &ArgMatches, current: &ArgMatches) ->
 				"    High severe {}",
 				m.labels.iter().filter(|x| x.is_high() && x.is_severe()).count()
 			);
-		}
-
-		if cfg.save {
-			store
-				.add(BenchMarkRun {
-					measurement: m,
-					// Match the variant-aware key used by `fetch_latest` above.
-					path: i.name(),
-					backend: cfg.backend,
-				})
-				.await
-				.context("Could not store latest measurement data")?;
 		}
 	}
 
@@ -738,6 +744,8 @@ async fn run_bench(
 	// import + warmup) samples only the timed statements.
 	bench_marker("__BENCH_MEASURE_START__");
 
+	let max_time = bench_config.max_time.0;
+	let measure_start = Instant::now();
 	let mut iterations = Vec::new();
 	let mut samples = Vec::new();
 	for _ in 0..bench_config.sample_size {
@@ -761,6 +769,19 @@ async fn run_bench(
 		}
 		iterations.push(iterations_per_samples as f64);
 		samples.push(sample_duration);
+
+		// Wall-clock backstop: a bench whose real per-iteration cost dwarfs the
+		// warmup estimate would otherwise collect every sample no matter how long
+		// it takes, so one mis-scoped bench can consume the whole run. Stop once we
+		// pass the cap; the sample we're in always completes, so we keep at least one.
+		if measure_start.elapsed() >= max_time {
+			println!(
+				"Exceeded max_time of {max_time:?}; stopping after {} of {} samples",
+				samples.len(),
+				bench_config.sample_size
+			);
+			break;
+		}
 	}
 
 	bench_marker("__BENCH_MEASURE_END__");

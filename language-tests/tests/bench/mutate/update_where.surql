@@ -7,7 +7,7 @@ reason = "Update all records matching an indexed-less predicate"
 run = true
 rebuild = true
 warmup = "2s"
-sample-size = 50
+sample-size = 10
 measurement-time = "20s"
 
 [test]

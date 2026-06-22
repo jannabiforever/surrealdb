@@ -905,6 +905,15 @@ pub struct BenchDetails {
 	/// takes roughly this long. Defaults to 100s.
 	#[serde(default = "default_duration::<100000>")]
 	pub measurement_time: TestDuration,
+	/// Hard wall-clock backstop on the sample-collection loop. `measurement_time`
+	/// only sizes the iteration count from the warmup estimate; it does not cap
+	/// the loop, so a mis-scoped bench whose per-iteration cost dwarfs the warmup
+	/// estimate (e.g. an O(n²) query) collects all `sample_size` samples no matter
+	/// how long that takes. This caps the collection so no single bench can consume
+	/// the whole run: the harness always keeps at least one sample, then stops once
+	/// cumulative measured time exceeds this. Defaults to 600s.
+	#[serde(default = "default_duration::<600000>")]
+	pub max_time: TestDuration,
 
 	#[serde(skip_serializing)]
 	#[serde(flatten)]

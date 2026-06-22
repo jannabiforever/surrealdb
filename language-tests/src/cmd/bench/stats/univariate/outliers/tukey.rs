@@ -186,6 +186,7 @@ impl<'a> Iterator for Iter<'a> {
 }
 
 /// Labels used to classify outliers
+#[derive(Clone)]
 pub enum Label {
 	/// A "mild" outlier in the "high" spectrum
 	HighMild,
