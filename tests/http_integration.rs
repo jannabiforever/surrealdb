@@ -410,6 +410,105 @@ mod http_integration {
 	}
 
 	#[test(tokio::test)]
+	async fn client_ip_extractor() -> Result<(), Box<dyn std::error::Error>> {
+		// Verify that each `--client-ip` extractor mode maps an incoming HTTP
+		// request to the right `$session.ip`. The mode is fixed at server
+		// startup, so every sub-scenario needs its own server.
+		async fn extracted_ip(
+			client_ip_mode: &str,
+			request_headers: &[(&'static str, &'static str)],
+		) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+			let (addr, _server) = common::start_server(StartServerArguments {
+				args: format!("--allow-guests --client-ip {client_ip_mode}"),
+				..Default::default()
+			})
+			.await?;
+			let url = format!("http://{addr}/sql");
+
+			let ns = Ulid::new().to_string();
+			let db = Ulid::new().to_string();
+
+			// Guest request that runs `session::ip()` with the headers under test.
+			let mut headers = reqwest::header::HeaderMap::new();
+			headers.insert("surreal-ns", ns.parse()?);
+			headers.insert("surreal-db", db.parse()?);
+			headers.insert(header::ACCEPT, "application/json".parse()?);
+			for (name, value) in request_headers {
+				headers.insert(*name, value.parse()?);
+			}
+			let client = reqwest::Client::builder()
+				.connect_timeout(Duration::from_millis(10))
+				.default_headers(headers)
+				.build()?;
+
+			// Bootstrap NS/DB with root auth so the guest query has somewhere to land.
+			ensure_namespace_and_database(&client, &addr, &ns, &db).await?;
+
+			let res = client.post(&url).body("RETURN session::ip()").send().await?;
+			assert_eq!(res.status(), 200);
+			let body: serde_json::Value = res.json().await?;
+			Ok(body[0]["result"].clone())
+		}
+
+		// Default mode (Socket): the raw socket peer IP becomes the session IP.
+		// Headers are ignored.
+		let ip = extracted_ip("socket", &[("X-Forwarded-For", "203.0.113.7")]).await?;
+		assert_eq!(ip, serde_json::json!("127.0.0.1"), "socket mode");
+
+		// Disabled mode (None): no IP is attached even when headers are present.
+		let ip = extracted_ip("none", &[("X-Forwarded-For", "203.0.113.7")]).await?;
+		assert_eq!(ip, serde_json::Value::Null, "none mode ignores headers");
+
+		// X-Forwarded-For: the raw header value is forwarded into the session.
+		let ip = extracted_ip("X-Forwarded-For", &[("X-Forwarded-For", "203.0.113.7")]).await?;
+		assert_eq!(ip, serde_json::json!("203.0.113.7"), "X-Forwarded-For mode");
+
+		// X-Forwarded-For with no header: nothing to extract, so the IP is unset.
+		let ip = extracted_ip("X-Forwarded-For", &[]).await?;
+		assert_eq!(ip, serde_json::Value::Null, "X-Forwarded-For missing header");
+
+		// X-Forwarded-For with a proxy chain: the extractor stores the raw
+		// header verbatim and does not split the list.
+		let ip = extracted_ip(
+			"X-Forwarded-For",
+			&[("X-Forwarded-For", "203.0.113.7, 198.51.100.1, 192.0.2.1")],
+		)
+		.await?;
+		assert_eq!(
+			ip,
+			serde_json::json!("203.0.113.7, 198.51.100.1, 192.0.2.1"),
+			"X-Forwarded-For stores raw header value"
+		);
+
+		// X-Real-IP: nginx-style single-IP header.
+		let ip = extracted_ip("X-Real-IP", &[("X-Real-IP", "198.51.100.42")]).await?;
+		assert_eq!(ip, serde_json::json!("198.51.100.42"), "X-Real-IP mode");
+
+		// CF-Connecting-IP: Cloudflare-specific header.
+		let ip = extracted_ip("CF-Connecting-IP", &[("CF-Connecting-IP", "203.0.113.10")]).await?;
+		assert_eq!(ip, serde_json::json!("203.0.113.10"), "CF-Connecting-IP mode");
+
+		// Fly-Client-IP: Fly.io-specific header.
+		let ip = extracted_ip("Fly-Client-IP", &[("Fly-Client-IP", "203.0.113.20")]).await?;
+		assert_eq!(ip, serde_json::json!("203.0.113.20"), "Fly-Client-IP mode");
+
+		// True-Client-IP: Akamai / Cloudflare true-client header.
+		let ip = extracted_ip("True-Client-IP", &[("True-Client-IP", "203.0.113.30")]).await?;
+		assert_eq!(ip, serde_json::json!("203.0.113.30"), "True-Client-IP mode");
+
+		// RFC 7239 `Forwarded`: parse the `for=` identifier from the first element,
+		// ignoring later elements appended by intermediaries closer to the origin.
+		let ip = extracted_ip(
+			"Forwarded",
+			&[("Forwarded", "for=192.0.2.43;by=203.0.113.43, for=198.51.100.17")],
+		)
+		.await?;
+		assert_eq!(ip, serde_json::json!("192.0.2.43"), "Forwarded mode picks first for=");
+
+		Ok(())
+	}
+
+	#[test(tokio::test)]
 	async fn client_ip_none() -> Result<(), Box<dyn std::error::Error>> {
 		// `--client-ip none` short-circuits the extractor regardless of what
 		// headers (or socket address) are visible.
