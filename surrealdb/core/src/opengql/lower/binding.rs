@@ -35,6 +35,7 @@
 use crate::expr::match_plan::{BindingDef, BindingId, BindingKind};
 use crate::opengql::ast::{
 	EdgePattern, Ident, MatchClause, MatchItem, NodePattern, OptionalBlock, PathPattern,
+	PathSearchKind,
 };
 use crate::opengql::lower::naming;
 use crate::syn::error::{SyntaxError, bail, syntax_error};
@@ -370,6 +371,11 @@ fn analyze_pattern(
 		);
 	}
 
+	// A path-search / path-mode prefix only attaches to a single variable-length
+	// segment, and the selective forms additionally reject a self-loop start==end
+	// (see `validate_path_prefix`).
+	validate_path_prefix(pattern)?;
+
 	// Node bindings already placed on THIS pattern's chain, with the implied
 	// `.id` equalities a repeat within the chain produces (see
 	// `PatternBindings::node_equalities`).
@@ -405,6 +411,53 @@ fn analyze_pattern(
 		steps,
 		node_equalities,
 	})
+}
+
+/// Validate a path pattern carrying a `pathPatternPrefix`. Any prefix requires a
+/// single variable-length segment (`(a)-[:e]->{m,n}(b)`) — the only shape the
+/// `PathExpand` / `ShortestPathExpand` operators realise. The selective forms
+/// (everything but plain `ALL` / a bare path mode) additionally reject a
+/// self-loop `start == end` binding, which collapses the per-endpoint partition
+/// and trips the hidden-binding + id-equality self-loop rewrite. A reverse
+/// anchor (the pattern bound on its far node) IS allowed: per-endpoint grouping
+/// and path length are symmetric, and the operator flips the emitted path/group
+/// back to written order.
+fn validate_path_prefix(pattern: &PathPattern) -> Result<(), SyntaxError> {
+	let Some(prefix) = pattern.prefix.as_ref() else {
+		return Ok(());
+	};
+	let single_segment =
+		matches!(pattern.steps.as_slice(), [step] if step.edge.quantifier.is_some());
+	if !single_segment {
+		bail!(
+			"A path search prefix requires a single variable-length segment, e.g. \
+			 `(a)-[:edge]->{{1,3}}(b)`",
+			@prefix.span => "quantify exactly one edge (`{{m,n}}`, `+`, `*`)"
+		);
+	}
+	if matches!(prefix.kind, PathSearchKind::All) {
+		return Ok(());
+	}
+	let [step] = pattern.steps.as_slice() else {
+		return Ok(());
+	};
+	if same_node_variable(&pattern.start, &step.node) {
+		bail!(
+			"A path search does not support a pattern whose start and end are the same node",
+			@prefix.span => "use distinct start and end nodes"
+		);
+	}
+	Ok(())
+}
+
+/// Whether two node elements name the same user-written variable — the self-loop
+/// test for a path search. Anonymous nodes are always distinct bindings, so they
+/// never count as the same node.
+fn same_node_variable(a: &NodePattern, b: &NodePattern) -> bool {
+	match (a.var.as_ref(), b.var.as_ref()) {
+		(Some(a), Some(b)) => a.name == b.name,
+		_ => false,
+	}
 }
 
 /// Whether a pattern is anchorable given the bindings declared before it: it

@@ -28,8 +28,10 @@ pub(crate) mod distinct_edges;
 pub(crate) mod endpoint;
 pub(crate) mod expand;
 pub(crate) mod path_expand;
+pub(crate) mod shortest_path_expand;
 
 pub use distinct_edges::DistinctEdges;
 pub use endpoint::{EndpointBind, EndpointField};
 pub use expand::{EdgeBinding, Expand, ExpandDir};
-pub use path_expand::PathExpand;
+pub use path_expand::{PathExpand, PathMode};
+pub use shortest_path_expand::{ShortestPathExpand, ShortestSelector};

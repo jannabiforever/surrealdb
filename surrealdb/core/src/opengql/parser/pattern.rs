@@ -8,8 +8,8 @@
 use reblessive::Stk;
 
 use crate::opengql::ast::{
-	EdgeDirection, EdgePattern, ElementPredicate, Ident, LabelExpr, NodePattern, PathPattern,
-	PathStep, Quantifier, QuantifierKind,
+	EdgeDirection, EdgePattern, ElementPredicate, Ident, LabelExpr, NodePattern, PathMode,
+	PathPattern, PathPatternPrefix, PathSearchKind, PathStep, Quantifier, QuantifierKind,
 };
 use crate::opengql::parser::mac::{enter_object_recursion, expected, unexpected};
 use crate::opengql::parser::{ParseResult, Parser};
@@ -33,25 +33,14 @@ impl Parser<'_> {
 			None
 		};
 
+		// `pathPatternPrefix` (GQL.g4:896-962): an optional path-search selector
+		// and/or path mode. WALK/TRAIL/SIMPLE/ACYCLIC are non-reserved words but
+		// cannot start a path pattern expression, so a leading one is
+		// unambiguously a prefix here (a path variable was handled above).
+		let prefix = self.parse_path_pattern_prefix()?;
+
 		let token = self.peek();
 		match token.kind {
-			// `pathPatternPrefix` (GQL.g4:898-962): path modes and path
-			// searches. WALK/TRAIL/SIMPLE/ACYCLIC are non-reserved words but
-			// cannot start a path pattern expression, so they are
-			// unambiguously a prefix here (a path variable was handled
-			// above).
-			t!("WALK")
-			| t!("TRAIL")
-			| t!("SIMPLE")
-			| t!("ACYCLIC")
-			| t!("ALL")
-			| t!("ANY")
-			| t!("SHORTEST") => {
-				bail!(
-					"Path pattern prefixes (path modes and path searches) are not supported yet",
-					@token.span
-				);
-			}
 			// A path pattern starting with an edge pattern has no source
 			// node; reject it before node parsing produces a generic error.
 			kind if edge_pattern_starts(kind) => {
@@ -114,9 +103,134 @@ impl Parser<'_> {
 
 		Ok(PathPattern {
 			path_var,
+			prefix,
 			start,
 			steps,
 		})
+	}
+
+	/// Parse an optional `pathPatternPrefix` (GQL.g4:896-962): a path-search
+	/// selector (`ALL`/`ANY`/`SHORTEST` forms) and/or a path mode
+	/// (`WALK`/`TRAIL`/`SIMPLE`/`ACYCLIC`). Returns `None` when the next token
+	/// does not begin a prefix. The full ISO surface is accepted here; the
+	/// lowering rejects the combinations it does not yet execute, so syntax
+	/// errors stay limited to genuinely malformed prefixes (a bare `SHORTEST`
+	/// with neither a count nor `GROUP`, or a zero count).
+	fn parse_path_pattern_prefix(&mut self) -> ParseResult<Option<PathPatternPrefix>> {
+		let first = self.peek();
+		let start = first.span;
+		let kind = match first.kind {
+			// A bare path mode (no search word) ⇒ every path in that mode.
+			t!("WALK") | t!("TRAIL") | t!("SIMPLE") | t!("ACYCLIC") => {
+				let mode = self.parse_optional_path_mode()?;
+				self.eat_path_or_paths();
+				return Ok(Some(PathPatternPrefix {
+					kind: PathSearchKind::All,
+					mode,
+					span: start.covers(self.last_span()),
+				}));
+			}
+			// `allPathSearch` / `allShortestPathSearch`.
+			t!("ALL") => {
+				self.pop_peek();
+				if self.eat(t!("SHORTEST")) {
+					PathSearchKind::AllShortest
+				} else {
+					PathSearchKind::All
+				}
+			}
+			// `anyPathSearch` / `anyShortestPathSearch`.
+			t!("ANY") => {
+				self.pop_peek();
+				if self.eat(t!("SHORTEST")) {
+					PathSearchKind::AnyShortest
+				} else {
+					PathSearchKind::Any {
+						count: self.parse_optional_path_count()?,
+					}
+				}
+			}
+			// `countedShortestPathSearch` / `countedShortestGroupSearch`. The
+			// optional count, mode and `PATH(S)` all precede the optional
+			// `GROUP(S)`; a trailing `GROUP(S)` selects the group form.
+			t!("SHORTEST") => {
+				self.pop_peek();
+				let count = self.parse_optional_path_count()?;
+				let mode = self.parse_optional_path_mode()?;
+				self.eat_path_or_paths();
+				let kind = if self.eat(t!("GROUP")) || self.eat(t!("GROUPS")) {
+					PathSearchKind::ShortestGroups {
+						count,
+					}
+				} else {
+					match count {
+						Some(count) => PathSearchKind::ShortestCounted {
+							count,
+						},
+						None => bail!(
+							"`SHORTEST` requires a path count (`SHORTEST k`) or `GROUP`",
+							@start.covers(self.last_span())
+						),
+					}
+				};
+				return Ok(Some(PathPatternPrefix {
+					kind,
+					mode,
+					span: start.covers(self.last_span()),
+				}));
+			}
+			_ => return Ok(None),
+		};
+
+		// Shared tail for `ALL` / `ANY` / `ALL SHORTEST` / `ANY SHORTEST`: an
+		// optional path mode then the optional `PATH`/`PATHS` noise word.
+		let mode = self.parse_optional_path_mode()?;
+		self.eat_path_or_paths();
+		Ok(Some(PathPatternPrefix {
+			kind,
+			mode,
+			span: start.covers(self.last_span()),
+		}))
+	}
+
+	/// Parse an optional path mode (`pathMode`, GQL.g4:907-912), consuming the
+	/// keyword when present.
+	fn parse_optional_path_mode(&mut self) -> ParseResult<Option<PathMode>> {
+		let mode = match self.peek_kind() {
+			t!("WALK") => PathMode::Walk,
+			t!("TRAIL") => PathMode::Trail,
+			t!("SIMPLE") => PathMode::Simple,
+			t!("ACYCLIC") => PathMode::Acyclic,
+			_ => return Ok(None),
+		};
+		self.pop_peek();
+		Ok(Some(mode))
+	}
+
+	/// Eat an optional `PATH` / `PATHS` keyword (`pathOrPaths`, GQL.g4:924-927).
+	fn eat_path_or_paths(&mut self) -> bool {
+		self.eat(t!("PATH")) || self.eat(t!("PATHS"))
+	}
+
+	/// Parse an optional positive path/group count (`nonNegativeIntegerSpecification`,
+	/// GQL.g4:933-935/960-962) — an unsigned integer literal. Returns `None` when
+	/// the next token is not an integer; rejects a zero count.
+	fn parse_optional_path_count(&mut self) -> ParseResult<Option<u32>> {
+		let token = self.peek();
+		let TokenKind::Number {
+			kind:
+				kind @ (NumberKind::Integer | NumberKind::Hex | NumberKind::Octal | NumberKind::Binary),
+			suffix: None,
+		} = token.kind
+		else {
+			return Ok(None);
+		};
+		self.pop_peek();
+		let count = self.parse_u32_token(token, kind)?;
+		if count == 0 {
+			bail!("A path search count must be a positive integer", @token.span);
+		}
+		Ok(Some(count))
 	}
 
 	/// Parse a node pattern: `LEFT_PAREN elementPatternFiller RIGHT_PAREN`

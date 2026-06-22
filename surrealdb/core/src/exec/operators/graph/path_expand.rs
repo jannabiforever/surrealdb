@@ -100,7 +100,7 @@ use crate::val::{Array, Object, RecordId, TableName, Value};
 /// The storage-layer [`Dir`] scanned from a source vertex for an expand
 /// direction. `ExpandDir`'s own mapping is private to `expand.rs`, so
 /// `PathExpand` keeps its own copy of the two trivial mappings.
-fn scan_dir(direction: ExpandDir) -> Dir {
+pub(crate) fn scan_dir(direction: ExpandDir) -> Dir {
 	match direction {
 		ExpandDir::Out => Dir::Out,
 		ExpandDir::In => Dir::In,
@@ -110,36 +110,111 @@ fn scan_dir(direction: ExpandDir) -> Dir {
 /// The edge-record field naming the far endpoint for an expand direction:
 /// following `->` (Out) the target is the edge's `out` vertex; following `<-`
 /// (In) it is the edge's `in` vertex.
-fn target_field(direction: ExpandDir) -> &'static str {
+pub(crate) fn target_field(direction: ExpandDir) -> &'static str {
 	match direction {
 		ExpandDir::Out => "out",
 		ExpandDir::In => "in",
 	}
 }
 
+/// The ISO path mode of a quantified traversal, as the operators execute it.
+///
+/// SurrealDB's MATCH mode is fixed to DIFFERENT EDGES (V2_DESIGN R2: no edge
+/// record binds twice within a path), so edge-uniqueness is always enforced by
+/// the adjacency scan regardless of mode — `Walk` and `Trail` are therefore
+/// identical here. `Acyclic` additionally forbids any repeated node; `Simple`
+/// forbids repeated nodes except a single close back onto the path's start.
+/// Shared by [`PathExpand`] (DFS) and `ShortestPathExpand` (BFS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathMode {
+	Walk,
+	Trail,
+	Simple,
+	Acyclic,
+}
+
+impl PathMode {
+	/// The EXPLAIN label, or `None` for the default (`Walk`) which renders
+	/// nothing — keeping plans without an explicit mode byte-identical.
+	pub(crate) fn attr(self) -> Option<&'static str> {
+		match self {
+			PathMode::Walk => None,
+			PathMode::Trail => Some("trail"),
+			PathMode::Simple => Some("simple"),
+			PathMode::Acyclic => Some("acyclic"),
+		}
+	}
+}
+
+/// What a candidate hop to a target node is allowed to do under a path mode,
+/// once edge-uniqueness has already been satisfied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StepKind {
+	/// The hop revisits a node it may not — drop the branch entirely.
+	Reject,
+	/// The hop may be emitted (a valid terminal) but the branch must not extend
+	/// past it — a `Simple` path closing back onto its start.
+	EmitOnly,
+	/// The hop may be both emitted and extended.
+	EmitAndExtend,
+}
+
+/// Decide whether a hop landing on `target` is admissible for `mode`, given the
+/// nodes already on `path`. Edge-uniqueness is enforced elsewhere (the adjacency
+/// scan skips edges already on the path), so this only governs node repetition.
+pub(crate) fn step_kind(mode: PathMode, path_nodes: &[Value], target: &RecordId) -> StepKind {
+	match mode {
+		PathMode::Walk | PathMode::Trail => StepKind::EmitAndExtend,
+		PathMode::Acyclic => {
+			if nodes_contain(path_nodes, target) {
+				StepKind::Reject
+			} else {
+				StepKind::EmitAndExtend
+			}
+		}
+		PathMode::Simple => {
+			let is_start = path_nodes.first().and_then(node_id).as_ref() == Some(target);
+			if is_start {
+				// A single close back onto the start is the one repeat SIMPLE
+				// permits; the closed path is a valid terminal but cannot extend.
+				StepKind::EmitOnly
+			} else if nodes_contain(path_nodes, target) {
+				StepKind::Reject
+			} else {
+				StepKind::EmitAndExtend
+			}
+		}
+	}
+}
+
+/// Whether any node object in `nodes` has the record id `target`.
+fn nodes_contain(nodes: &[Value], target: &RecordId) -> bool {
+	nodes.iter().filter_map(node_id).any(|id| &id == target)
+}
+
 /// One partial path in the DFS: a tip vertex plus the edges and nodes traversed
 /// to reach it. `nodes.len() == edges.len() + 1` always holds — every edge is
 /// flanked by the node before it and the node after it, and `nodes[0]` is the
 /// source.
-struct PartialPath {
+pub(crate) struct PartialPath {
 	/// The vertex the next extension expands from.
-	tip: RecordId,
+	pub(crate) tip: RecordId,
 	/// `(edge id, edge object)` per hop, in path order. The id is kept alongside
 	/// the fetched object so the edge-uniqueness check (and the group value)
 	/// need not re-read it from the object.
-	edges: Vec<(RecordId, Value)>,
+	pub(crate) edges: Vec<(RecordId, Value)>,
 	/// Full node objects in path order, including the source at index 0.
-	nodes: Vec<Value>,
+	pub(crate) nodes: Vec<Value>,
 }
 
 impl PartialPath {
 	/// Depth = number of edges traversed.
-	fn depth(&self) -> u32 {
+	pub(crate) fn depth(&self) -> u32 {
 		self.edges.len() as u32
 	}
 
 	/// `true` if `id` is already an edge of this path (DIFFERENT-EDGES).
-	fn contains_edge(&self, id: &RecordId) -> bool {
+	pub(crate) fn contains_edge(&self, id: &RecordId) -> bool {
 		self.edges.iter().any(|(eid, _)| eid == id)
 	}
 }
@@ -171,6 +246,13 @@ pub struct PathExpand {
 	pub(crate) group_binding: Option<String>,
 	/// Binding name for the whole-path array (kind `Path`), when present.
 	pub(crate) path_binding: Option<String>,
+	/// The path mode (node/edge repetition discipline). `Walk`/`Trail` keep the
+	/// default edge-unique traversal; `Simple`/`Acyclic` add node-uniqueness.
+	pub(crate) mode: PathMode,
+	/// `true` when the pattern was anchored on its far node, so the traversal runs
+	/// the segment backwards (`source` is the pattern's *end*); the emitted group
+	/// and path arrays are reversed to read in the pattern's written order.
+	pub(crate) reversed: bool,
 	/// Per-operator runtime metrics for EXPLAIN ANALYZE.
 	pub(crate) metrics: Arc<OperatorMetrics>,
 }
@@ -188,6 +270,8 @@ impl PathExpand {
 		target_label: Option<TableName>,
 		group_binding: Option<String>,
 		path_binding: Option<String>,
+		mode: PathMode,
+		reversed: bool,
 	) -> Self {
 		Self {
 			input,
@@ -200,6 +284,8 @@ impl PathExpand {
 			target_label,
 			group_binding,
 			path_binding,
+			mode,
+			reversed,
 			metrics: Arc::new(OperatorMetrics::new()),
 		}
 	}
@@ -245,7 +331,7 @@ impl PathExpand {
 /// (V2_DESIGN §3). A bare `RecordId` slot is tolerated defensively. A missing
 /// slot, a `Null`/`None` slot (source dropped — the OPTIONAL interplay arrives
 /// in PR-C), or any other value yields `None` and the operator drops the row.
-fn source_record_id(row: &Value, source: &str) -> Option<RecordId> {
+pub(crate) fn source_record_id(row: &Value, source: &str) -> Option<RecordId> {
 	let Value::Object(obj) = row else {
 		return None;
 	};
@@ -261,7 +347,7 @@ fn source_record_id(row: &Value, source: &str) -> Option<RecordId> {
 
 /// Read the far-endpoint `RecordId` from a fetched edge object's `out`/`in`
 /// field.
-fn edge_target(edge_obj: &Value, field: &str) -> Option<RecordId> {
+pub(crate) fn edge_target(edge_obj: &Value, field: &str) -> Option<RecordId> {
 	let Value::Object(obj) = edge_obj else {
 		return None;
 	};
@@ -272,7 +358,7 @@ fn edge_target(edge_obj: &Value, field: &str) -> Option<RecordId> {
 }
 
 /// The `id` `RecordId` of a node object, if present.
-fn node_id(node_obj: &Value) -> Option<RecordId> {
+pub(crate) fn node_id(node_obj: &Value) -> Option<RecordId> {
 	let Value::Object(obj) = node_obj else {
 		return None;
 	};
@@ -284,7 +370,7 @@ fn node_id(node_obj: &Value) -> Option<RecordId> {
 
 /// Does this node object's table match the `target_label` filter? A `None`
 /// filter always passes; a non-object never matches a label.
-fn node_passes_label(node_obj: &Value, target_label: Option<&TableName>) -> bool {
+pub(crate) fn node_passes_label(node_obj: &Value, target_label: Option<&TableName>) -> bool {
 	let Some(label) = target_label else {
 		return true;
 	};
@@ -323,6 +409,12 @@ impl ExecOperator for PathExpand {
 		}
 		if let Some(path) = self.path_binding.as_ref() {
 			attrs.push(("path".to_string(), path.clone()));
+		}
+		if let Some(mode) = self.mode.attr() {
+			attrs.push(("mode".to_string(), mode.to_string()));
+		}
+		if self.reversed {
+			attrs.push(("reversed".to_string(), "true".to_string()));
 		}
 		attrs
 	}
@@ -371,6 +463,8 @@ impl ExecOperator for PathExpand {
 		let target_label = self.target_label.clone();
 		let group_binding = self.group_binding.clone();
 		let path_binding = self.path_binding.clone();
+		let mode = self.mode;
+		let reversed = self.reversed;
 		// Window predicates captured as closures so the stream body stays terse.
 		let emits_at = move |d: u32| d >= min && max.is_none_or(|m| d <= m);
 		let extends_past = move |d: u32| max.is_none_or(|m| d < m);
@@ -555,6 +649,20 @@ impl ExecOperator for PathExpand {
 								// branch (permission-prune semantics).
 								continue;
 							};
+							let target_id = node_id(&node_obj);
+
+							// Path-mode admissibility (edge-uniqueness is already
+							// enforced by the adjacency scan): drop a disallowed node
+							// repeat, or allow a SIMPLE close that may emit but not
+							// extend. A node without an id cannot be deduplicated or
+							// extended from, so it is a leaf candidate (emit only).
+							let kind = match target_id.as_ref() {
+								Some(tid) => step_kind(mode, &path.nodes, tid),
+								None => StepKind::EmitOnly,
+							};
+							if matches!(kind, StepKind::Reject) {
+								continue;
+							}
 
 							// Extend the path by this hop.
 							let mut edges = path.edges.clone();
@@ -562,8 +670,8 @@ impl ExecOperator for PathExpand {
 							let mut nodes = path.nodes.clone();
 							nodes.push(node_obj.clone());
 
-							// Emit at this depth when in window and the terminal
-							// node passes the label filter.
+							// Emit at this depth when in window and the terminal node
+							// passes the label filter.
 							if emits_at(new_depth)
 								&& node_passes_label(&node_obj, target_label.as_ref())
 							{
@@ -571,9 +679,8 @@ impl ExecOperator for PathExpand {
 								if path_count > path_row_limit {
 									Err(path_rows_exceeded(path_row_limit))?;
 								}
-								let group: Vec<Value> =
-									edges.iter().map(|(_, o)| o.clone()).collect();
-								let path_arr = build_path_array(&nodes, &edges);
+								let (group, path_arr) =
+									build_group_and_path(&nodes, &edges, reversed);
 								let assembled = assemble_row(
 									&row,
 									&target_binding,
@@ -590,9 +697,11 @@ impl ExecOperator for PathExpand {
 								}
 							}
 
-							// Keep extending while another hop is allowed.
-							if extends_past(new_depth)
-								&& let Some(tip) = node_id(&node_obj)
+							// Keep extending only when the mode permits it (a SIMPLE
+							// close does not) and another hop is allowed.
+							if matches!(kind, StepKind::EmitAndExtend)
+								&& extends_past(new_depth)
+								&& let Some(tip) = target_id
 							{
 								path_count += 1;
 								if path_count > path_row_limit {
@@ -623,7 +732,7 @@ impl ExecOperator for PathExpand {
 }
 
 /// The `SURREAL_GQL_MAX_PATH_ROWS` guard error, naming the knob.
-fn path_rows_exceeded(limit: usize) -> ControlFlow {
+pub(crate) fn path_rows_exceeded(limit: usize) -> ControlFlow {
 	ControlFlow::Err(anyhow::anyhow!(
 		"GQL MATCH path traversal exceeded SURREAL_GQL_MAX_PATH_ROWS ({limit}); the quantified \
 		 pattern produced too many paths from a single source row"
@@ -633,7 +742,7 @@ fn path_rows_exceeded(limit: usize) -> ControlFlow {
 /// Build the R5 alternating path array `[n0, e1, n1, … , ed, nd]`.
 ///
 /// `nodes.len() == edges.len() + 1`. A single-node path is `[n0]`.
-fn build_path_array(nodes: &[Value], edges: &[(RecordId, Value)]) -> Vec<Value> {
+pub(crate) fn build_path_array(nodes: &[Value], edges: &[(RecordId, Value)]) -> Vec<Value> {
 	let mut arr = Vec::with_capacity(nodes.len() + edges.len());
 	for (i, node) in nodes.iter().enumerate() {
 		arr.push(node.clone());
@@ -644,9 +753,32 @@ fn build_path_array(nodes: &[Value], edges: &[(RecordId, Value)]) -> Vec<Value> 
 	arr
 }
 
+/// Build the edge-group list (R4) and the R5 path array for an emitted path,
+/// both in traversal order (`source → terminal`).
+///
+/// When `reversed` the pattern was anchored on its far node and the traversal
+/// ran the segment backwards (`source` is the pattern's *end*), so the arrays
+/// are reversed to read in the pattern's written order (`start → end`).
+/// Reversing the alternating `[n0, e1, … , nd]` array yields the
+/// correctly-alternating `[nd, ed, … , n0]`; a single-node / empty group is a
+/// no-op.
+pub(crate) fn build_group_and_path(
+	nodes: &[Value],
+	edges: &[(RecordId, Value)],
+	reversed: bool,
+) -> (Vec<Value>, Vec<Value>) {
+	let mut group: Vec<Value> = edges.iter().map(|(_, o)| o.clone()).collect();
+	let mut path_arr = build_path_array(nodes, edges);
+	if reversed {
+		group.reverse();
+		path_arr.reverse();
+	}
+	(group, path_arr)
+}
+
 /// Assemble an output binding row: the input row extended with the target node
 /// and the optional group / path bindings.
-fn assemble_row(
+pub(crate) fn assemble_row(
 	input_row: &Value,
 	target_binding: &str,
 	target_obj: Value,
@@ -721,6 +853,8 @@ mod tests {
 			None,
 			None,
 			None,
+			PathMode::Walk,
+			false,
 		)
 	}
 
@@ -881,6 +1015,8 @@ mod tests {
 			Some(TableName::new("person")),
 			Some("g".to_string()),
 			Some("p".to_string()),
+			PathMode::Trail,
+			false,
 		);
 		assert_eq!(pe.name(), "PathExpand");
 		let attrs = pe.attrs();
@@ -891,6 +1027,27 @@ mod tests {
 		assert!(attrs.iter().any(|(k, v)| k == "group" && v == "g"));
 		assert!(attrs.iter().any(|(k, v)| k == "path" && v == "p"));
 		assert!(attrs.iter().any(|(k, v)| k == "target_label" && v == "person"));
+		assert!(attrs.iter().any(|(k, v)| k == "mode" && v == "trail"));
+	}
+
+	#[test]
+	fn step_kind_enforces_path_modes() {
+		// nodes a -> b; consider a hop landing on various targets.
+		let nodes = vec![node("hub", "a"), node("hub", "b")];
+		let start = rid("hub", "a");
+		let other = rid("hub", "c");
+		let mid = rid("hub", "b");
+		// WALK/TRAIL: every hop extends (edge-uniqueness handles termination).
+		assert_eq!(step_kind(PathMode::Walk, &nodes, &start), StepKind::EmitAndExtend);
+		assert_eq!(step_kind(PathMode::Trail, &nodes, &mid), StepKind::EmitAndExtend);
+		// ACYCLIC: any revisited node (including the start) is rejected.
+		assert_eq!(step_kind(PathMode::Acyclic, &nodes, &start), StepKind::Reject);
+		assert_eq!(step_kind(PathMode::Acyclic, &nodes, &mid), StepKind::Reject);
+		assert_eq!(step_kind(PathMode::Acyclic, &nodes, &other), StepKind::EmitAndExtend);
+		// SIMPLE: only a close back onto the start is allowed (emit, don't extend).
+		assert_eq!(step_kind(PathMode::Simple, &nodes, &start), StepKind::EmitOnly);
+		assert_eq!(step_kind(PathMode::Simple, &nodes, &mid), StepKind::Reject);
+		assert_eq!(step_kind(PathMode::Simple, &nodes, &other), StepKind::EmitAndExtend);
 	}
 
 	#[test]

@@ -83,8 +83,65 @@ pub struct MatchClause {
 pub struct PathPattern {
 	/// The declared path variable: `p = (a)-[k]->(b)`.
 	pub path_var: Option<Ident>,
+	/// The path-search / path-mode prefix (`pathPatternPrefix`, GQL.g4:896-962),
+	/// or `None` when the pattern carries no prefix (the default: every path,
+	/// `WALK` mode).
+	pub prefix: Option<PathPatternPrefix>,
 	pub start: NodePattern,
 	pub steps: Vec<PathStep>,
+}
+
+/// A parsed path-pattern prefix (`pathPatternPrefix`, GQL.g4:896-962): a
+/// path-search selector together with an optional path mode. The full ISO
+/// surface is represented so the lowering can reject the unsupported
+/// combinations with precise spans.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PathPatternPrefix {
+	pub kind: PathSearchKind,
+	/// The explicit path mode (`WALK`/`TRAIL`/`SIMPLE`/`ACYCLIC`), or `None` when
+	/// omitted (the ISO default is `WALK`).
+	pub mode: Option<PathMode>,
+	pub span: Span,
+}
+
+/// The path-search selector of a [`PathPatternPrefix`]. A bare path-mode prefix
+/// (`WALK`/`TRAIL`/… with no search word) is represented as
+/// [`PathSearchKind::All`] (every path), carrying only its mode.
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+pub enum PathSearchKind {
+	/// `ALL` (or a bare path-mode prefix): every path.
+	All,
+	/// `ANY [k]`: any `k` paths (`None` ⇒ 1).
+	Any {
+		count: Option<u32>,
+	},
+	/// `ALL SHORTEST`: every minimum-length path.
+	AllShortest,
+	/// `ANY SHORTEST`: one minimum-length path.
+	AnyShortest,
+	/// `SHORTEST k`: the `k` shortest paths.
+	ShortestCounted {
+		count: u32,
+	},
+	/// `SHORTEST [k] GROUP(S)`: every path in the `k` smallest length groups
+	/// (`None` ⇒ 1).
+	ShortestGroups {
+		count: Option<u32>,
+	},
+}
+
+/// An ISO path mode (`pathMode`, GQL.g4:907-912): the node/edge repetition
+/// discipline of a matched path.
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+pub enum PathMode {
+	/// `WALK`: nodes and edges may repeat (the ISO default).
+	Walk,
+	/// `TRAIL`: no repeated edge.
+	Trail,
+	/// `SIMPLE`: no repeated node, except the path may close on its start.
+	Simple,
+	/// `ACYCLIC`: no repeated node.
+	Acyclic,
 }
 
 /// A single hop in a path pattern: an edge pattern and the node it leads to.

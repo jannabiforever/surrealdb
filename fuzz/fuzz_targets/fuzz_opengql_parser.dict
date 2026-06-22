@@ -153,3 +153,11 @@
 "MATCH (a:person) OPTIONAL MATCH (a)-[k:knows]->(b) RETURN a.name, b.name"
 "MATCH (a:person) OPTIONAL { MATCH (a)-[:knows]->(b) } RETURN a, b"
 "OPTIONAL MATCH (a)-[:knows]->(b) RETURN b"
+# Path-search / path-mode prefixes (16.6)
+"MATCH ANY SHORTEST (a:person)-[:knows]->+(b:person) RETURN b"
+"MATCH ALL SHORTEST (a:person)-[:knows]->{1,3}(b) RETURN a, b"
+"MATCH SHORTEST 2 (a:person)-[:knows]->*(b:person) RETURN b"
+"MATCH SHORTEST 2 GROUPS (a:person)-[:knows]->+(b) RETURN b"
+"MATCH ANY 3 (a:person)-[:knows]->+(b) RETURN b"
+"MATCH ACYCLIC (a:person)-[:knows]->+(b:person) RETURN b"
+"MATCH WALK p = (a:person)-[:knows]->*(b) RETURN p"

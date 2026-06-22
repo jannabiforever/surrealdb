@@ -250,9 +250,35 @@ graphPatternWhereClause : WHERE searchCondition ;
 
 Key fact: **the MATCH-level WHERE belongs to the graph pattern**, not to a
 separate clause — `MATCH (a)-[k]->(b) WHERE …` parses inside `graphPattern`.
-`matchMode` (`REPEATABLE ELEMENTS` / `DIFFERENT EDGES`, lines 807–828),
-`keepClause`, and `pathPatternPrefix` (path modes `WALK|TRAIL|SIMPLE|ACYCLIC`,
-path search `ALL|ANY|SHORTEST …`, lines 898–962) — all v1 reject.
+`matchMode` (`REPEATABLE ELEMENTS` / `DIFFERENT EDGES`, lines 807–828) and
+`keepClause` — v1 reject. `pathPatternPrefix` (path modes
+`WALK|TRAIL|SIMPLE|ACYCLIC`, path search `ALL|ANY|SHORTEST …`, lines 896–962) is
+**supported** on a single variable-length segment — see "Path search & path
+modes" below.
+
+### Path search & path modes (16.6, lines 896–962)
+
+The full ISO path-search matrix is supported on a pattern with exactly one
+quantified segment (`(a)-[:e]->{m,n}(b)`): `ALL` (every path — the default),
+`ANY [k]` (any `k`), `ALL SHORTEST`, `ANY SHORTEST`, `SHORTEST k`, and
+`SHORTEST [k] GROUP(S)`. Selection partitions by the endpoint pair `(a, b)`.
+Shortest is by **hop count** (unweighted).
+
+Two semantic pins matter:
+
+- **Path modes under DIFFERENT EDGES.** SurrealDB's match mode is fixed to
+  DIFFERENT EDGES (R2; `REPEATABLE ELEMENTS` is rejected), which already forbids
+  an edge binding twice within a path. So `WALK` (the ISO default) and `TRAIL`
+  both reduce to today's edge-unique traversal — the default needs no extra
+  enforcement and stays finite on cyclic graphs. Only `SIMPLE` (no repeated node
+  except a close back onto the start) and `ACYCLIC` (no repeated node) add a new
+  constraint.
+- **Anchoring.** Selection partitions per `(start, end)` endpoint pair. A pattern
+  bound only on its far node (a reverse anchor, e.g. `MATCH (b:T), ANY SHORTEST
+  (a)-[:e]->+(b)`) traverses the segment backwards; grouping and path length are
+  symmetric so selection is unaffected, and the path/group are flipped back to
+  written order. A self-loop `start == end` and a prefix on a non-single
+  variable-length pattern are rejected.
 
 ### Path pattern expression (16.7, lines 966–991)
 
@@ -641,10 +667,13 @@ edge patterns are not supported yet"*), label expressions beyond a single name
 aggregates (*"Aggregate functions are not supported yet"*) and every other
 function call (*"The function `{}` is not supported yet"*), `NULLS FIRST|LAST`
 (*"`NULLS FIRST`/`NULLS LAST` ordering is not supported yet"*), `XOR` (*"`XOR`
-is not supported yet"*), `KEEP`, `YIELD`, `EXISTS`/`CASE`/`CAST`, mutations,
-path-search and path-mode prefixes (`SHORTEST`, `TRAIL`, …), and all the
-`UNION`/`EXCEPT`/`INTERSECT`/`OTHERWISE` composition and `USE`-graph forms. v2
-adds five *new* rejections that did not exist in v1 because the constructs they
-guard were wholly rejected before: repeated edge variable, kind-mismatched
-reuse, optional-rebind, cross-variable quantified-edge predicate, and
-property-access-on-group/path-var (all quoted above or in `LOWERING.md`).
+is not supported yet"*), `KEEP`, `YIELD`, `EXISTS`/`CASE`/`CAST`, mutations, and
+all the `UNION`/`EXCEPT`/`INTERSECT`/`OTHERWISE` composition and `USE`-graph
+forms. (Path-search and path-mode prefixes are now **supported** — see "Path
+search & path modes" above.) v2 adds five *new* rejections that did not exist in
+v1 because the constructs they guard were wholly rejected before: repeated edge
+variable, kind-mismatched reuse, optional-rebind, cross-variable
+quantified-edge predicate, and property-access-on-group/path-var (all quoted
+above or in `LOWERING.md`). Path search adds its own: a prefix on a
+non-single-variable-length pattern, a self-loop start==end selective search, a
+bare `SHORTEST` (no count or `GROUP`), and a zero count.

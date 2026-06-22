@@ -53,6 +53,7 @@ pub use foreach::ForeachPlan;
 #[cfg_attr(not(feature = "opengql"), allow(unused_imports))]
 pub use graph::{
 	DistinctEdges, EdgeBinding, EndpointBind, EndpointField, Expand, ExpandDir, PathExpand,
+	PathMode, ShortestPathExpand, ShortestSelector,
 };
 pub use ifelse::IfElsePlan;
 pub use info::{

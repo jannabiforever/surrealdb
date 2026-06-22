@@ -36,3 +36,47 @@ INSERT RELATION INTO link [
 	{ id: link:l56, in: hub:5, out: hub:6, since: 2015 },
 	{ id: link:l64, in: hub:6, out: hub:4, since: 2016 }
 ] RETURN NONE;
+
+-- A directed acyclic "diamond" over a SEPARATE `wp` (waypoint) node table joined
+-- by `road` edges, again fully disjoint from the other components so existing
+-- expectations stay byte-identical. From X there are two shortest (length-2)
+-- routes to Z — X→Y1→Z and X→Y2→Z — and one longer (length-3) route
+-- X→Y3→Y4→Z. This is what distinguishes the path-search selectors: ALL vs ANY
+-- (multiplicity), ALL SHORTEST ties (two length-2 paths to Z), SHORTEST k /
+-- k GROUP (how many of the {2,2,3}-length paths to Z survive), and an
+-- asymmetric (directed) graph for the partition / reverse-anchor checks.
+CREATE wp:x SET name = 'X' RETURN NONE;
+CREATE wp:y1 SET name = 'Y1' RETURN NONE;
+CREATE wp:y2 SET name = 'Y2' RETURN NONE;
+CREATE wp:y3 SET name = 'Y3' RETURN NONE;
+CREATE wp:y4 SET name = 'Y4' RETURN NONE;
+CREATE wp:z SET name = 'Z' RETURN NONE;
+INSERT RELATION INTO road [
+	{ id: road:xy1, in: wp:x, out: wp:y1 },
+	{ id: road:xy2, in: wp:x, out: wp:y2 },
+	{ id: road:xy3, in: wp:x, out: wp:y3 },
+	{ id: road:y1z, in: wp:y1, out: wp:z },
+	{ id: road:y2z, in: wp:y2, out: wp:z },
+	{ id: road:y3y4, in: wp:y3, out: wp:y4 },
+	{ id: road:y4z, in: wp:y4, out: wp:z }
+] RETURN NONE;
+
+-- A "converging" DAG over a SEPARATE `cv` node table joined by `cvedge`, again
+-- disjoint from everything above. From S there are two equal-length routes that
+-- RECONVERGE at J before continuing to T: S→P→J→T and S→Q→J→T. This is the
+-- shape the diamond cannot express — J is reached by two shortest sub-paths
+-- (depth 2) that then share the J→T suffix — so it exercises the ALL-SHORTEST
+-- tie-extension through a shared intermediate (and the SHORTEST-k per-node
+-- bound).
+CREATE cv:s SET name = 'S' RETURN NONE;
+CREATE cv:p SET name = 'P' RETURN NONE;
+CREATE cv:q SET name = 'Q' RETURN NONE;
+CREATE cv:j SET name = 'J' RETURN NONE;
+CREATE cv:t SET name = 'T' RETURN NONE;
+INSERT RELATION INTO cvedge [
+	{ id: cvedge:sp, in: cv:s, out: cv:p },
+	{ id: cvedge:sq, in: cv:s, out: cv:q },
+	{ id: cvedge:pj, in: cv:p, out: cv:j },
+	{ id: cvedge:qj, in: cv:q, out: cv:j },
+	{ id: cvedge:jt, in: cv:j, out: cv:t }
+] RETURN NONE;

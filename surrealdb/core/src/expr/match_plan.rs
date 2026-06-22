@@ -97,6 +97,12 @@ impl MatchClausePlan {
 pub(crate) struct PatternPlan {
 	/// Binding for the whole path value (kind == [`BindingKind::Path`]).
 	pub(crate) path_var: Option<BindingId>,
+	/// The lowered path-search / path-mode prefix, or `None` when the pattern
+	/// carried no prefix (the default: every path, edge-unique `WALK`). A search
+	/// other than `All`/`None` is only ever set on a pattern with exactly one
+	/// quantified segment, anchored forward on its start (the lowering enforces
+	/// both), so the executing operator's source is the pattern's start node.
+	pub(crate) search: Option<PathPrefixPlan>,
 	pub(crate) start: NodeStep,
 	/// Multi-hop chain: each step is an edge followed by the node it reaches.
 	pub(crate) steps: Vec<(EdgeStep, NodeStep)>,
@@ -127,6 +133,51 @@ pub(crate) enum ExpandDirection {
 pub(crate) struct EdgeQuantifier {
 	pub(crate) min: u32,
 	pub(crate) max: Option<u32>,
+}
+
+/// The lowered path-search prefix of a [`PatternPlan`] (`doc/opengql/V2_DESIGN.md`).
+/// `None` on the pattern means no prefix was written (the default: every path,
+/// edge-unique `WALK`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PathPrefixPlan {
+	pub(crate) search: PathSearch,
+	pub(crate) mode: PathMode,
+}
+
+/// The lowered path-search selector. The AST's optional path/group counts are
+/// resolved here (omitted ⇒ 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum PathSearch {
+	/// Every path (explicit `ALL`, or a bare path-mode prefix).
+	All,
+	/// Any `count` paths (`ANY [k]`).
+	Any {
+		count: u32,
+	},
+	/// Every minimum-length path (`ALL SHORTEST`).
+	AllShortest,
+	/// One minimum-length path (`ANY SHORTEST`).
+	AnyShortest,
+	/// The `count` shortest paths (`SHORTEST k`).
+	ShortestCounted {
+		count: u32,
+	},
+	/// Every path in the `count` smallest length groups (`SHORTEST [k] GROUP(S)`).
+	ShortestGroups {
+		count: u32,
+	},
+}
+
+/// The lowered path mode. `Walk` and `Trail` are equivalent under SurrealDB's
+/// fixed DIFFERENT EDGES match mode (R2 forbids an edge binding twice within a
+/// path), so the planner maps both to edge-unique traversal; `Simple`/`Acyclic`
+/// additionally forbid repeated nodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum PathMode {
+	Walk,
+	Trail,
+	Simple,
+	Acyclic,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -305,11 +356,59 @@ impl MatchPlan {
 			f.push_str(self.binding_name(path_var));
 			f.push_str(" = ");
 		}
+		if let Some(prefix) = pattern.search.as_ref() {
+			Self::render_prefix(f, prefix);
+		}
 		self.render_node(f, &pattern.start);
 		for (edge, node) in pattern.steps.iter() {
 			self.render_edge(f, edge);
 			self.render_node(f, node);
 		}
+	}
+
+	/// Render a path-search / path-mode prefix in canonical form, trailing a
+	/// single space (so it abuts the start node). The default mode (`Walk`)
+	/// renders implicitly; an `ANY 1` / `SHORTEST 1 GROUP` count renders its
+	/// canonical short form.
+	fn render_prefix(f: &mut String, prefix: &PathPrefixPlan) {
+		match prefix.search {
+			PathSearch::All => f.push_str("ALL"),
+			PathSearch::Any {
+				count,
+			} => {
+				f.push_str("ANY");
+				if count != 1 {
+					f.push(' ');
+					f.push_str(&count.to_string());
+				}
+			}
+			PathSearch::AllShortest => f.push_str("ALL SHORTEST"),
+			PathSearch::AnyShortest => f.push_str("ANY SHORTEST"),
+			PathSearch::ShortestCounted {
+				count,
+			} => {
+				f.push_str("SHORTEST ");
+				f.push_str(&count.to_string());
+			}
+			PathSearch::ShortestGroups {
+				count,
+			} => {
+				f.push_str("SHORTEST ");
+				f.push_str(&count.to_string());
+				f.push_str(if count == 1 {
+					" GROUP"
+				} else {
+					" GROUPS"
+				});
+			}
+		}
+		match prefix.mode {
+			PathMode::Walk => {}
+			PathMode::Trail => f.push_str(" TRAIL"),
+			PathMode::Simple => f.push_str(" SIMPLE"),
+			PathMode::Acyclic => f.push_str(" ACYCLIC"),
+		}
+		f.push(' ');
 	}
 
 	/// Render a node element as `(a:person)`, `(a)`, or `(:person)`.
@@ -416,6 +515,7 @@ mod tests {
 		};
 		let pattern = PatternPlan {
 			path_var: None,
+			search: None,
 			start: NodeStep {
 				binding: 0,
 				label: Some(TableName::new("person".to_string())),
@@ -502,6 +602,62 @@ mod tests {
 			plan.to_sql(),
 			"MATCH p = (a:person)-[k:knows]->{1,3}(b:person) RETURN DISTINCT a.name AS a_name, \
 			 b.name AS b_name ORDER BY a.age DESC SKIP 5 LIMIT 10"
+		);
+	}
+
+	#[test]
+	fn to_sql_renders_path_search_prefix() {
+		let mut plan = sample_plan();
+		// Promote to a quantified, prefixed pattern: `ANY SHORTEST SIMPLE`.
+		plan.bindings[1].kind = BindingKind::EdgeGroup;
+		plan.clauses[0].patterns[0].steps[0].0.quantifier = Some(EdgeQuantifier {
+			min: 1,
+			max: None,
+		});
+		plan.clauses[0].patterns[0].search = Some(PathPrefixPlan {
+			search: PathSearch::AnyShortest,
+			mode: PathMode::Simple,
+		});
+		plan.clauses[0].predicates.clear();
+		plan.output.columns.truncate(1);
+		assert_eq!(
+			plan.to_sql(),
+			"MATCH ANY SHORTEST SIMPLE (a:person)-[k:knows]->{1,}(b:person) RETURN a.name AS a_name"
+		);
+	}
+
+	#[test]
+	fn to_sql_omits_default_search_prefix() {
+		// `search: None` (no prefix written) renders nothing — keeping unprefixed
+		// plans byte-identical.
+		let plan = sample_plan();
+		assert!(plan.clauses[0].patterns[0].search.is_none());
+		let rendered = plan.to_sql();
+		assert!(!rendered.contains("SHORTEST"), "{rendered}");
+		assert!(!rendered.contains("ANY"), "{rendered}");
+		assert!(rendered.starts_with("MATCH (a:person)"), "{rendered}");
+	}
+
+	#[test]
+	fn to_sql_renders_shortest_group_count() {
+		let mut plan = sample_plan();
+		plan.bindings[1].kind = BindingKind::EdgeGroup;
+		plan.clauses[0].patterns[0].steps[0].0.quantifier = Some(EdgeQuantifier {
+			min: 1,
+			max: None,
+		});
+		plan.clauses[0].patterns[0].search = Some(PathPrefixPlan {
+			search: PathSearch::ShortestGroups {
+				count: 2,
+			},
+			mode: PathMode::Walk,
+		});
+		plan.clauses[0].predicates.clear();
+		plan.output.columns.truncate(1);
+		// `WALK` (the default mode) renders implicitly; `GROUPS` is plural for k > 1.
+		assert_eq!(
+			plan.to_sql(),
+			"MATCH SHORTEST 2 GROUPS (a:person)-[k:knows]->{1,}(b:person) RETURN a.name AS a_name"
 		);
 	}
 

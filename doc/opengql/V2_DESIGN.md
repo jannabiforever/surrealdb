@@ -30,6 +30,21 @@ OPTIONAL, polish). Read together with `REFERENCE.md` (grammar) and `LOWERING.md`
   pre-projection on binding rows. With DISTINCT — returned columns only; error:
   "With RETURN DISTINCT, ORDER BY may only reference returned columns".
 - **R8** `RETURN *` = all user-named bindings (incl. group/path vars), alphabetical.
+- **R9** Path search (`pathPatternPrefix`, added after the v2 program): the prefix
+  `ALL | ANY [k] | ALL SHORTEST | ANY SHORTEST | SHORTEST k | SHORTEST [k] GROUP(S)`
+  on a single variable-length segment selects, per endpoint pair `(start, end)`,
+  which paths survive; shortest is by hop count (unweighted). It routes to
+  `PathExpand` (every path / `ANY [k]` per-terminal cap) or the BFS
+  `ShortestPathExpand` (the SHORTEST family). Path modes: because R2 (DIFFERENT
+  EDGES) already forbids an edge repeating within a path, `WALK` (the ISO default)
+  and `TRAIL` both reduce to the existing edge-unique traversal; only `SIMPLE`
+  (no repeated node bar a close onto the start) and `ACYCLIC` (no repeated node)
+  add a constraint. A selective search (`ANY`/`*SHORTEST`) bound on its far node
+  (a reverse anchor) traverses the segment backwards; per-endpoint grouping and
+  path length are symmetric so selection is unaffected, and the operator flips
+  the emitted path/group back to the pattern's written order (`reversed`). A
+  self-loop (`start == end` binding) and a prefix on a non-single-segment
+  pattern are rejected.
 - **Joins & null**: a Null binding never equi-joins (excluded from hash build; for
   Inner also from probe); Left passes null-keyed probe rows through null-filled.
 - **Anchorability**: every pattern needs ≥1 labeled element OR ≥1 variable already

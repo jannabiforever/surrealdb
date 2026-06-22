@@ -23,12 +23,12 @@ use reblessive::Stk;
 
 use crate::expr::match_plan::{
 	BindingId, EdgeQuantifier, EdgeStep, ExpandDirection, MatchClausePlan, MatchPredicate,
-	NodeStep, PatternPlan,
+	NodeStep, PathMode as IrPathMode, PathPrefixPlan, PathSearch, PatternPlan,
 };
 use crate::expr::{BinaryOperator, Expr, Idiom, Part};
 use crate::opengql::ast::{
 	BinaryOp, EdgeDirection, EdgePattern, ElementPredicate, GqlExpr, Ident, LabelExpr, MatchClause,
-	PathPattern, Quantifier, QuantifierKind, UnaryOp,
+	PathMode, PathPattern, PathPatternPrefix, PathSearchKind, Quantifier, QuantifierKind, UnaryOp,
 };
 use crate::opengql::lower::binding::{ClauseBindings, PatternBindings, Registry};
 use crate::opengql::lower::expr::{self, Scope};
@@ -73,11 +73,47 @@ pub(super) async fn lower_clause(
 			predicates.push(node_id_equality(registry, first, repeat));
 		}
 	}
+	// A selective path search (`ANY` / `*SHORTEST`) picks among the paths to each
+	// endpoint by count/length; a predicate over its edge-group or path value
+	// cannot be honoured by that per-terminal selection (it would post-filter the
+	// already-chosen representative and silently drop endpoints), so reject it.
+	// Property access on group/path vars is already rejected upstream; this guards
+	// the residual bare-reference forms.
+	reject_selective_group_predicates(clause, pattern_bindings, &predicates)?;
 	Ok(MatchClausePlan {
 		optional_group: clause_bindings.optional_group,
 		patterns,
 		predicates,
 	})
+}
+
+/// Rejects a predicate that reads the edge-group or path binding of a pattern
+/// carrying a selective (`ANY` / `*SHORTEST`) path search — see the call site.
+fn reject_selective_group_predicates(
+	clause: &MatchClause,
+	pattern_bindings: &[PatternBindings],
+	predicates: &[MatchPredicate],
+) -> Result<(), SyntaxError> {
+	for (pattern, bindings) in clause.patterns.iter().zip(pattern_bindings.iter()) {
+		let Some(prefix) = pattern.prefix.as_ref() else {
+			continue;
+		};
+		if matches!(prefix.kind, PathSearchKind::All) {
+			continue;
+		}
+		let group_binding = bindings.steps.first().map(|&(edge, _)| edge);
+		for predicate in predicates {
+			let touches_group = group_binding.is_some_and(|g| predicate.deps.contains(&g));
+			let touches_path = bindings.path_var.is_some_and(|p| predicate.deps.contains(&p));
+			if touches_group || touches_path {
+				bail!(
+					"A path search does not support a predicate over its edge group or path value",
+					@prefix.span => "constrain the endpoint nodes instead"
+				);
+			}
+		}
+	}
+	Ok(())
 }
 
 /// Builds the `<first>.id = <repeat>.id` equality [`MatchPredicate`] for a node
@@ -140,9 +176,47 @@ fn build_pattern_plan(
 
 	Ok(PatternPlan {
 		path_var: pattern_bindings.path_var,
+		search: pattern.prefix.as_ref().map(lower_path_prefix),
 		start,
 		steps,
 	})
+}
+
+/// Lowers an AST path-pattern prefix to the IR [`PathPrefixPlan`], resolving the
+/// optional path/group counts (omitted ⇒ 1) and defaulting the path mode to
+/// `WALK`. The structural / anchoring rules a prefix must satisfy are enforced
+/// in `binding.rs` (`validate_path_prefix`).
+fn lower_path_prefix(prefix: &PathPatternPrefix) -> PathPrefixPlan {
+	let search = match prefix.kind {
+		PathSearchKind::All => PathSearch::All,
+		PathSearchKind::Any {
+			count,
+		} => PathSearch::Any {
+			count: count.unwrap_or(1),
+		},
+		PathSearchKind::AllShortest => PathSearch::AllShortest,
+		PathSearchKind::AnyShortest => PathSearch::AnyShortest,
+		PathSearchKind::ShortestCounted {
+			count,
+		} => PathSearch::ShortestCounted {
+			count,
+		},
+		PathSearchKind::ShortestGroups {
+			count,
+		} => PathSearch::ShortestGroups {
+			count: count.unwrap_or(1),
+		},
+	};
+	let mode = match prefix.mode {
+		None | Some(PathMode::Walk) => IrPathMode::Walk,
+		Some(PathMode::Trail) => IrPathMode::Trail,
+		Some(PathMode::Simple) => IrPathMode::Simple,
+		Some(PathMode::Acyclic) => IrPathMode::Acyclic,
+	};
+	PathPrefixPlan {
+		search,
+		mode,
+	}
 }
 
 /// Maps an edge pattern's direction onto the lowered [`ExpandDirection`],

@@ -513,7 +513,9 @@ fn targeted_errors() {
 	);
 	assert!(parse_err("RETURN $$x").contains("Substituted parameters"));
 	assert!(parse_err("MATCH (a:MATCH) RETURN 1").contains("`MATCH` is a reserved word"));
-	assert!(parse_err("MATCH SHORTEST (a)->(b) RETURN 1").contains("Path pattern prefixes"));
+	// Path-search prefixes now parse (the lowering enforces what it executes); a
+	// bare `SHORTEST` without a count or `GROUP` is still a syntax error.
+	assert!(parse_err("MATCH SHORTEST (a)->(b) RETURN 1").contains("requires a path count"));
 	assert!(
 		parse_err("MATCH ((a)-[k]->(b)) RETURN 1")
 			.contains("Parenthesized path pattern expressions")

@@ -59,14 +59,69 @@ use crate::exec::ExecOperator;
 use crate::exec::operators::{
 	Aggregate, AggregateField, Bind, Distinct, DistinctEdges, EdgeBinding, EndpointBind,
 	EndpointField, Expand, ExpandDir, FieldSelection, Filter, HashJoin, JoinType, Limit,
-	OrderByField, PathExpand, Project, Sort, SortDirection,
+	OrderByField, PathExpand, PathMode, Project, ShortestPathExpand, ShortestSelector, Sort,
+	SortDirection,
 };
 use crate::expr::match_plan::{
 	BindingId, BindingKind, EdgeStep, ExpandDirection, MatchClausePlan, MatchPlan, MatchPredicate,
-	NodeStep, PatternPlan,
+	NodeStep, PathMode as IrPathMode, PathPrefixPlan, PathSearch, PatternPlan,
 };
 use crate::expr::{Cond, Expr, Function, Idiom, Literal, Part};
 use crate::val::TableName;
+
+/// How a quantified step's path-search selector routes to a physical operator.
+enum SearchRouting {
+	/// Every matching path (`None` / `ALL`), via the `PathExpand` DFS.
+	Every,
+	/// A bounded path search (`ANY [k]` / the `SHORTEST` family), via the
+	/// `ShortestPathExpand` BFS. `ANY [k]` rides the same per-node-bounded
+	/// traversal because a shortest representative is a valid arbitrary path.
+	Shortest {
+		selector: ShortestSelector,
+	},
+}
+
+/// Resolve a pattern's lowered path-search prefix into the executing path mode
+/// and the operator routing. `None` (no prefix) is the default: every path, the
+/// edge-unique `WALK` mode.
+fn resolve_path_search(search: Option<PathPrefixPlan>) -> (PathMode, SearchRouting) {
+	let Some(prefix) = search else {
+		return (PathMode::Walk, SearchRouting::Every);
+	};
+	let mode = match prefix.mode {
+		IrPathMode::Walk => PathMode::Walk,
+		IrPathMode::Trail => PathMode::Trail,
+		IrPathMode::Simple => PathMode::Simple,
+		IrPathMode::Acyclic => PathMode::Acyclic,
+	};
+	let routing = match prefix.search {
+		PathSearch::All => SearchRouting::Every,
+		PathSearch::Any {
+			count,
+		} => SearchRouting::Shortest {
+			selector: ShortestSelector::Any {
+				count,
+			},
+		},
+		PathSearch::AllShortest => SearchRouting::Shortest {
+			selector: ShortestSelector::AllShortest,
+		},
+		PathSearch::AnyShortest => SearchRouting::Shortest {
+			selector: ShortestSelector::AnyShortest,
+		},
+		PathSearch::ShortestCounted {
+			count,
+		} => SearchRouting::Shortest {
+			selector: ShortestSelector::Counted(count),
+		},
+		PathSearch::ShortestGroups {
+			count,
+		} => SearchRouting::Shortest {
+			selector: ShortestSelector::CountedGroups(count),
+		},
+	};
+	(mode, routing)
+}
 
 /// A binder stage: the operator built so far, the bindings available on its
 /// rows, and the current "tip" node (what the next step expands from).
@@ -748,7 +803,7 @@ impl<'ctx> Planner<'ctx> {
 				}
 			});
 			stage = self
-				.plan_step(plan, pattern, stage, edge, node, step_predicates, edge.direction)
+				.plan_step(plan, pattern, stage, edge, node, step_predicates, edge.direction, false)
 				.await?;
 		}
 		Ok(stage)
@@ -845,14 +900,25 @@ impl<'ctx> Planner<'ctx> {
 				let step_bound = step_bindings(&stage.bound, pattern, edge, node);
 				let step_predicates = drain_satisfiable(pending, &step_bound);
 				stage = self
-					.plan_step(plan, pattern, stage, edge, node, step_predicates, edge.direction)
+					.plan_step(
+						plan,
+						pattern,
+						stage,
+						edge,
+						node,
+						step_predicates,
+						edge.direction,
+						false,
+					)
 					.await?;
 			}
 			return Ok(stage);
 		}
 
 		// Reverse: only the far node of a single-hop pattern is the shared anchor
-		// — expand far → start with the edge direction reversed.
+		// — expand far → start with the edge direction reversed. A quantified hop
+		// here is a reverse-anchored path search: the traversal source is the far
+		// node, so `reversed` tells the operator to flip the emitted path/group.
 		if let [(edge, far_node)] = pattern.steps.as_slice()
 			&& visible.contains(&far_node.binding)
 		{
@@ -872,6 +938,7 @@ impl<'ctx> Planner<'ctx> {
 					&pattern.start,
 					step_predicates,
 					edge.direction.reverse(),
+					true,
 				)
 				.await;
 		}
@@ -1004,7 +1071,9 @@ impl<'ctx> Planner<'ctx> {
 	/// conjuncts whose deps first become satisfied at this step. An `Expand`
 	/// carries them in its predicate slot; a `PathExpand` (no predicate slot)
 	/// gets them as a `Filter` above the step. `direction` is passed explicitly
-	/// so a reverse-anchored bound-variable chain can flip the arrow.
+	/// so a reverse-anchored bound-variable chain can flip the arrow; `reversed`
+	/// is `true` for that reverse-anchored case so a quantified step's path-search
+	/// operator emits its path/group in the pattern's written order.
 	#[allow(clippy::too_many_arguments)]
 	async fn plan_step(
 		&self,
@@ -1015,6 +1084,7 @@ impl<'ctx> Planner<'ctx> {
 		node: &NodeStep,
 		predicates: Vec<Expr>,
 		direction: ExpandDirection,
+		reversed: bool,
 	) -> Result<ChainStage, Error> {
 		let source = binding_name(plan, prev.tip).to_string();
 		let dir = expand_dir(direction);
@@ -1067,18 +1137,52 @@ impl<'ctx> Planner<'ctx> {
 				let group_binding = Some(binding_name(plan, edge.binding).to_string());
 				let path_binding = pattern.path_var.map(|id| binding_name(plan, id).to_string());
 
-				let operator = Arc::new(PathExpand::new(
-					prev.operator,
-					source,
-					dir,
-					edge_tables,
-					quantifier.min,
-					quantifier.max,
-					target_binding,
-					target_label,
-					group_binding,
-					path_binding,
-				)) as Arc<dyn ExecOperator>;
+				// Path-search routing (V2_DESIGN path-search): `None`/`ALL` → every
+				// path (the `PathExpand` DFS); `ANY [k]` and the SHORTEST family →
+				// the bounded `ShortestPathExpand` BFS.
+				let (exec_mode, routing) = resolve_path_search(pattern.search);
+				// A reverse-anchored selective search (`reversed`) expands from the
+				// pattern's far node; per-endpoint grouping and path length are
+				// symmetric so selection is unaffected, and the operator flips the
+				// emitted path/group back to written order. A forward anchor has
+				// `source == pattern.start`.
+				debug_assert!(
+					reversed || source == binding_name(plan, pattern.start.binding),
+					"a forward-anchored quantified step must expand from the pattern's start",
+				);
+				let operator: Arc<dyn ExecOperator> = match routing {
+					SearchRouting::Every => Arc::new(PathExpand::new(
+						prev.operator,
+						source,
+						dir,
+						edge_tables,
+						quantifier.min,
+						quantifier.max,
+						target_binding,
+						target_label,
+						group_binding,
+						path_binding,
+						exec_mode,
+						reversed,
+					)) as Arc<dyn ExecOperator>,
+					SearchRouting::Shortest {
+						selector,
+					} => Arc::new(ShortestPathExpand::new(
+						prev.operator,
+						source,
+						dir,
+						edge_tables,
+						quantifier.min,
+						quantifier.max,
+						target_binding,
+						target_label,
+						group_binding,
+						path_binding,
+						exec_mode,
+						selector,
+						reversed,
+					)) as Arc<dyn ExecOperator>,
+				};
 				if let Some(id) = pattern.path_var {
 					bound.push(id);
 				}
@@ -1736,6 +1840,7 @@ mod tests {
 				optional_group: None,
 				patterns: vec![PatternPlan {
 					path_var: None,
+					search: None,
 					start: nodestep(0, Some("person")),
 					steps: vec![(
 						edgestep(1, Some("knows"), ExpandDirection::Out),
@@ -1772,6 +1877,7 @@ mod tests {
 				optional_group: None,
 				patterns: vec![PatternPlan {
 					path_var: Some(3),
+					search: None,
 					start: nodestep(0, Some("person")),
 					steps: vec![(
 						EdgeStep {
@@ -1820,6 +1926,7 @@ mod tests {
 					// (a)-[:x]->(b)
 					PatternPlan {
 						path_var: None,
+						search: None,
 						start: nodestep(0, None),
 						steps: vec![(
 							edgestep(1, Some("x"), ExpandDirection::Out),
@@ -1829,6 +1936,7 @@ mod tests {
 					// (c)-[:y]->(b)
 					PatternPlan {
 						path_var: None,
+						search: None,
 						start: nodestep(3, None),
 						steps: vec![(
 							edgestep(4, Some("y"), ExpandDirection::Out),
@@ -1853,6 +1961,7 @@ mod tests {
 				patterns: vec![
 					PatternPlan {
 						path_var: None,
+						search: None,
 						start: nodestep(0, Some("person")),
 						steps: vec![(
 							edgestep(1, Some("knows"), ExpandDirection::Out),
@@ -1861,6 +1970,7 @@ mod tests {
 					},
 					PatternPlan {
 						path_var: None,
+						search: None,
 						start: nodestep(3, Some("person")),
 						steps: vec![(
 							edgestep(4, Some("knows"), ExpandDirection::Out),
@@ -1897,6 +2007,7 @@ mod tests {
 					// (a:person)-[__e0:knows]->{1,1}(b:person)
 					PatternPlan {
 						path_var: None,
+						search: None,
 						start: nodestep(0, Some("person")),
 						steps: vec![(
 							EdgeStep {
@@ -1914,6 +2025,7 @@ mod tests {
 					// (a)-[k2:knows]->(c:person)
 					PatternPlan {
 						path_var: None,
+						search: None,
 						start: nodestep(0, None),
 						steps: vec![(
 							edgestep(3, Some("knows"), ExpandDirection::Out),
@@ -1938,6 +2050,7 @@ mod tests {
 					optional_group: None,
 					patterns: vec![PatternPlan {
 						path_var: None,
+						search: None,
 						start: nodestep(0, Some("person")),
 						steps: vec![(
 							edgestep(1, Some("knows"), ExpandDirection::Out),
@@ -1950,6 +2063,7 @@ mod tests {
 					optional_group: None,
 					patterns: vec![PatternPlan {
 						path_var: None,
+						search: None,
 						start: nodestep(2, Some("person")),
 						steps: vec![(
 							edgestep(3, Some("likes"), ExpandDirection::Out),
@@ -2047,6 +2161,39 @@ Project [ctx: Db]
                 TableScan [ctx: Db] [table: person, direction: Forward]
 ";
 		assert_eq!(rendered, expected, "\n--- got ---\n{rendered}");
+	}
+
+	#[tokio::test]
+	async fn explain_shortest_routes_to_shortest_path_expand() {
+		// A SHORTEST selector routes the quantified step to `ShortestPathExpand`,
+		// carrying the selector and (non-default) path mode.
+		let mut plan = plan_tree_iv();
+		plan.clauses[0].patterns[0].search = Some(PathPrefixPlan {
+			search: PathSearch::AllShortest,
+			mode: IrPathMode::Acyclic,
+		});
+		let rendered = explain(plan).await;
+		assert!(rendered.contains("ShortestPathExpand"), "\n--- got ---\n{rendered}");
+		assert!(rendered.contains("search: all shortest"), "\n--- got ---\n{rendered}");
+		assert!(rendered.contains("mode: acyclic"), "\n--- got ---\n{rendered}");
+	}
+
+	#[tokio::test]
+	async fn explain_any_routes_to_shortest_path_expand() {
+		// `ANY [k]` routes to the bounded `ShortestPathExpand` (a shortest
+		// representative is a valid arbitrary path), labelled `search: any`.
+		let mut plan = plan_tree_iv();
+		plan.clauses[0].patterns[0].search = Some(PathPrefixPlan {
+			search: PathSearch::Any {
+				count: 3,
+			},
+			mode: IrPathMode::Walk,
+		});
+		let rendered = explain(plan).await;
+		assert!(rendered.contains("ShortestPathExpand"), "\n--- got ---\n{rendered}");
+		assert!(rendered.contains("search: any 3"), "\n--- got ---\n{rendered}");
+		// Default `WALK` mode renders no `mode:` attr.
+		assert!(!rendered.contains("mode:"), "\n--- got ---\n{rendered}");
 	}
 
 	/// Pin worked tree (ii): edge-anchored multi-pattern. Each pattern scans its
@@ -2150,6 +2297,7 @@ Project [ctx: Db]
 					optional_group: None,
 					patterns: vec![PatternPlan {
 						path_var: None,
+						search: None,
 						start: nodestep(0, Some("person")),
 						steps: Vec::new(),
 					}],
@@ -2159,6 +2307,7 @@ Project [ctx: Db]
 					optional_group: Some(0),
 					patterns: vec![PatternPlan {
 						path_var: None,
+						search: None,
 						start: nodestep(0, None),
 						steps: vec![(
 							edgestep(1, Some("knows"), ExpandDirection::Out),
@@ -2194,6 +2343,7 @@ Project [ctx: Db]
 					optional_group: None,
 					patterns: vec![PatternPlan {
 						path_var: None,
+						search: None,
 						start: nodestep(0, Some("person")),
 						steps: Vec::new(),
 					}],
@@ -2204,6 +2354,7 @@ Project [ctx: Db]
 					optional_group: Some(0),
 					patterns: vec![PatternPlan {
 						path_var: None,
+						search: None,
 						start: nodestep(0, None),
 						steps: vec![(
 							edgestep(1, Some("knows"), ExpandDirection::Out),
@@ -2218,6 +2369,7 @@ Project [ctx: Db]
 					optional_group: Some(0),
 					patterns: vec![PatternPlan {
 						path_var: None,
+						search: None,
 						start: nodestep(2, None),
 						steps: vec![(
 							edgestep(3, None, ExpandDirection::Out),
@@ -2255,6 +2407,7 @@ Project [ctx: Db]
 					optional_group: None,
 					patterns: vec![PatternPlan {
 						path_var: None,
+						search: None,
 						start: nodestep(0, Some("person")),
 						steps: Vec::new(),
 					}],
@@ -2264,6 +2417,7 @@ Project [ctx: Db]
 					optional_group: Some(0),
 					patterns: vec![PatternPlan {
 						path_var: None,
+						search: None,
 						start: nodestep(0, None),
 						steps: vec![(
 							edgestep(1, Some("knows"), ExpandDirection::Out),
@@ -2276,6 +2430,7 @@ Project [ctx: Db]
 					optional_group: Some(1),
 					patterns: vec![PatternPlan {
 						path_var: None,
+						search: None,
 						start: nodestep(0, None),
 						steps: vec![(
 							edgestep(3, Some("likes"), ExpandDirection::Out),
@@ -2312,11 +2467,13 @@ Project [ctx: Db]
 					patterns: vec![
 						PatternPlan {
 							path_var: None,
+							search: None,
 							start: nodestep(0, Some("person")),
 							steps: Vec::new(),
 						},
 						PatternPlan {
 							path_var: None,
+							search: None,
 							start: nodestep(1, Some("person")),
 							steps: Vec::new(),
 						},
@@ -2328,6 +2485,7 @@ Project [ctx: Db]
 					patterns: vec![
 						PatternPlan {
 							path_var: None,
+							search: None,
 							start: nodestep(0, None),
 							steps: vec![(
 								edgestep(2, Some("knows"), ExpandDirection::Out),
@@ -2336,6 +2494,7 @@ Project [ctx: Db]
 						},
 						PatternPlan {
 							path_var: None,
+							search: None,
 							start: nodestep(1, None),
 							steps: vec![(
 								edgestep(4, Some("likes"), ExpandDirection::Out),
@@ -2478,6 +2637,7 @@ Project [ctx: Db]
 	fn shared_node_anchor_picks_start_then_far() {
 		let pattern = PatternPlan {
 			path_var: None,
+			search: None,
 			start: nodestep(0, None),
 			steps: vec![(edgestep(1, Some("e"), ExpandDirection::Out), nodestep(2, None))],
 		};

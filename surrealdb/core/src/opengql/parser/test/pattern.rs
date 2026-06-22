@@ -7,7 +7,8 @@ use rstest::rstest;
 
 use super::{label_str, match_clauses, parse, parse_err};
 use crate::opengql::ast::{
-	EdgeDirection, ElementPredicate, GqlExpr, LabelExpr, PathPattern, PathStep, QuantifierKind,
+	EdgeDirection, ElementPredicate, GqlExpr, LabelExpr, PathMode, PathPattern, PathSearchKind,
+	PathStep, QuantifierKind,
 };
 
 /// Parses a query with a single MATCH clause holding a single path pattern
@@ -380,17 +381,53 @@ fn pattern_alternations_rejected() {
 }
 
 #[rstest]
-#[case::walk("MATCH WALK (a)->(b) RETURN 1")]
-#[case::trail("MATCH TRAIL (a)->(b) RETURN 1")]
-#[case::simple("MATCH SIMPLE (a)->(b) RETURN 1")]
-#[case::acyclic("MATCH ACYCLIC (a)->(b) RETURN 1")]
-#[case::all("MATCH ALL (a)->(b) RETURN 1")]
-#[case::any("MATCH ANY (a)->(b) RETURN 1")]
-#[case::shortest("MATCH ALL SHORTEST (a)->(b) RETURN 1")]
-fn path_pattern_prefixes_rejected(#[case] source: &str) {
-	// `pathPatternPrefix` (GQL.g4:898-962): path modes and path searches.
+// Bare path modes (`pathModePrefix`): search defaults to ALL.
+#[case::walk("WALK", PathSearchKind::All, Some(PathMode::Walk))]
+#[case::trail("TRAIL", PathSearchKind::All, Some(PathMode::Trail))]
+#[case::simple("SIMPLE", PathSearchKind::All, Some(PathMode::Simple))]
+#[case::acyclic("ACYCLIC", PathSearchKind::All, Some(PathMode::Acyclic))]
+// `allPathSearch` / `anyPathSearch`.
+#[case::all("ALL", PathSearchKind::All, None)]
+#[case::all_trail("ALL TRAIL", PathSearchKind::All, Some(PathMode::Trail))]
+#[case::all_paths("ALL PATHS", PathSearchKind::All, None)]
+#[case::any("ANY", PathSearchKind::Any { count: None }, None)]
+#[case::any_count("ANY 3", PathSearchKind::Any { count: Some(3) }, None)]
+#[case::any_paths("ANY 2 PATHS", PathSearchKind::Any { count: Some(2) }, None)]
+#[case::any_simple("ANY SIMPLE", PathSearchKind::Any { count: None }, Some(PathMode::Simple))]
+// `allShortestPathSearch` / `anyShortestPathSearch`.
+#[case::all_shortest("ALL SHORTEST", PathSearchKind::AllShortest, None)]
+#[case::any_shortest("ANY SHORTEST", PathSearchKind::AnyShortest, None)]
+#[case::all_shortest_simple(
+	"ALL SHORTEST SIMPLE",
+	PathSearchKind::AllShortest,
+	Some(PathMode::Simple)
+)]
+// `countedShortestPathSearch` / `countedShortestGroupSearch`.
+#[case::shortest_k("SHORTEST 3", PathSearchKind::ShortestCounted { count: 3 }, None)]
+#[case::shortest_k_trail_paths("SHORTEST 3 TRAIL PATHS", PathSearchKind::ShortestCounted { count: 3 }, Some(PathMode::Trail))]
+#[case::shortest_group("SHORTEST GROUP", PathSearchKind::ShortestGroups { count: None }, None)]
+#[case::shortest_k_groups("SHORTEST 2 GROUPS", PathSearchKind::ShortestGroups { count: Some(2) }, None)]
+fn path_pattern_prefix_parses(
+	#[case] prefix_src: &str,
+	#[case] kind: PathSearchKind,
+	#[case] mode: Option<PathMode>,
+) {
+	// `pathPatternPrefix` (GQL.g4:896-962) now parses into the AST; the lowering,
+	// not the parser, rejects the combinations it does not yet execute.
+	let source = format!("MATCH {prefix_src} (a)->(b) RETURN 1");
+	let pattern = single_pattern(&source);
+	let parsed = pattern.prefix.unwrap_or_else(|| panic!("expected a parsed prefix in {source:?}"));
+	assert_eq!(parsed.kind, kind, "{source}");
+	assert_eq!(parsed.mode, mode, "{source}");
+}
+
+#[rstest]
+#[case::bare_shortest("MATCH SHORTEST (a)->(b) RETURN 1", "requires a path count")]
+#[case::shortest_zero("MATCH SHORTEST 0 (a)->(b) RETURN 1", "must be a positive integer")]
+#[case::any_zero("MATCH ANY 0 (a)->(b) RETURN 1", "must be a positive integer")]
+fn path_pattern_prefix_parse_errors(#[case] source: &str, #[case] needle: &str) {
 	let error = parse_err(source);
-	assert!(error.contains("Path pattern prefixes"), "{error}");
+	assert!(error.contains(needle), "{error}");
 }
 
 #[test]
