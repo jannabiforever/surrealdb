@@ -17,6 +17,7 @@ pub mod ml;
 pub mod opengql;
 pub(crate) mod output;
 mod params;
+mod ready;
 pub mod rpc;
 mod signals;
 pub mod signin;
@@ -29,6 +30,7 @@ pub mod version;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -134,6 +136,7 @@ impl RouterFactory for CommunityComposer {
 			.route("/", get(|| async { Redirect::temporary(cnf::APP_ENDPOINT) }))
 			.route("/status", get(|| async {}))
 			.merge(health::router())
+			.merge(ready::router())
 			.merge(export::router())
 			.merge(import::router())
 			.merge(rpc::router())
@@ -170,6 +173,25 @@ pub struct AppState {
 	/// metrics reader is attached, in which case the recording sites
 	/// short-circuit.
 	pub metrics_observer: Option<Arc<crate::observe::metrics::MetricsObserver>>,
+	/// Readiness signals (the startup-complete flag and heartbeat staleness
+	/// limit) read by the `/ready` handler.
+	pub readiness: Readiness,
+}
+
+/// Readiness signals shared with the HTTP layer to gate traffic during startup.
+#[derive(Clone)]
+pub struct Readiness {
+	/// Whether the instance has finished starting up and is ready to serve
+	/// user-facing queries. Flipped to `true` once the deferred startup work
+	/// (import + credentials) has completed; read by the readiness gate and the
+	/// `/ready` handler.
+	pub ready: Arc<AtomicBool>,
+	/// Maximum age of the current node's cluster heartbeat for `/ready` to
+	/// consider the node healthy, derived from the node-membership refresh
+	/// interval (see `start::init`). `None` disables the heartbeat check — used
+	/// by embedder entrypoints that do not run the membership refresh task, so
+	/// `/ready` reflects only the `ready` flag.
+	pub max_heartbeat_age: Option<Duration>,
 }
 
 /// Configuration options for building a [`SurrealRouter`].
@@ -306,7 +328,16 @@ impl SurrealRouter {
 		ct: CancellationToken,
 		router_state: F::RouterState,
 	) -> Result<Self> {
-		Self::build_with_metrics::<F>(opt, ds, notifications, ct, router_state, None).await
+		// Embedders that build the router directly are responsible for their own
+		// startup sequencing, so the readiness gate is open from the start. The
+		// heartbeat check is disabled (`None`): this path does not start the
+		// node-membership refresh task, so the heartbeat would never refresh.
+		let readiness = Readiness {
+			ready: Arc::new(AtomicBool::new(true)),
+			max_heartbeat_age: None,
+		};
+		Self::build_with_metrics::<F>(opt, ds, notifications, ct, router_state, None, readiness)
+			.await
 	}
 
 	/// Build a fully-configured [`SurrealRouter`], optionally mounting the
@@ -325,12 +356,17 @@ impl SurrealRouter {
 		ct: CancellationToken,
 		router_state: F::RouterState,
 		metrics: Option<MetricsState>,
+		readiness: Readiness,
 	) -> Result<Self> {
 		let opt = opt.into();
+		// Clone the readiness flag for the gate layer before moving `readiness`
+		// into the shared app state.
+		let gate_ready = Arc::clone(&readiness.ready);
 		let app_state = AppState {
 			client_ip: opt.client_ip,
 			datastore: Arc::clone(&ds),
 			metrics_observer: metrics.as_ref().map(|m| Arc::clone(&m.observer)),
+			readiness,
 		};
 
 		// Specify headers to be obfuscated from all requests/responses
@@ -432,6 +468,10 @@ impl SurrealRouter {
 			)
 			.layer(HttpMetricsLayer::new(events_observer))
 			.layer(SetSensitiveResponseHeadersLayer::from_shared(headers))
+			// Gate user-facing endpoints with 503 until startup completes. Sits
+			// ahead of auth so gated requests short-circuit before authentication
+			// touches the (still-initialising) datastore.
+			.layer(middleware::from_fn_with_state(gate_ready, ready::readiness_gate))
 			.layer(auth::SurrealAuthLayer)
 			.layer(headers::add_server_header(!opt.no_identification_headers)?)
 			.layer(headers::add_version_header(!opt.no_identification_headers)?)
@@ -584,7 +624,13 @@ pub async fn init<F: RouterFactory>(
 	ct: CancellationToken,
 	router_state: F::RouterState,
 ) -> Result<()> {
-	init_with_metrics::<F>(opt, ds, recv, ct, router_state, None).await
+	// No separate startup phase via this entrypoint: serve immediately, with the
+	// heartbeat check disabled (no membership refresh task runs here).
+	let readiness = Readiness {
+		ready: Arc::new(AtomicBool::new(true)),
+		max_heartbeat_age: None,
+	};
+	init_with_metrics::<F>(opt, ds, recv, ct, router_state, None, readiness).await
 }
 
 /// Initialize and run the SurrealDB HTTP server with optional Prometheus
@@ -602,10 +648,12 @@ pub async fn init_with_metrics<F: RouterFactory>(
 	ct: CancellationToken,
 	router_state: F::RouterState,
 	metrics: Option<MetricsState>,
+	readiness: Readiness,
 ) -> Result<()> {
 	// Build the fully-configured router
 	let surreal =
-		SurrealRouter::build_with_metrics::<F>(opt, ds, recv, ct, router_state, metrics).await?;
+		SurrealRouter::build_with_metrics::<F>(opt, ds, recv, ct, router_state, metrics, readiness)
+			.await?;
 
 	// Get a new server handler
 	let handle = Handle::new();

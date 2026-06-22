@@ -668,6 +668,135 @@ mod http_integration {
 	}
 
 	#[test(tokio::test)]
+	async fn readiness_gate_during_startup_import() -> Result<(), Box<dyn std::error::Error>> {
+		// A sleeping import keeps the instance "starting" long enough to observe the
+		// readiness gate: the listener binds immediately and `/health` (backend
+		// reachability) answers throughout, while `/ready` and query endpoints are
+		// gated with 503 until the import completes and the node is able to serve.
+		let import_file = common::tmp_file("readiness_import.surql");
+		std::fs::write(&import_file, "SLEEP 5s;")?;
+
+		// `wait_is_ready: false` hands back the server immediately, before it is
+		// ready, so the test can observe the in-progress state itself.
+		let (addr, _server) = common::start_server(StartServerArguments {
+			import_file: Some(import_file),
+			wait_is_ready: false,
+			..Default::default()
+		})
+		.await
+		.unwrap();
+
+		let client = Client::builder().build()?;
+		let status_url = format!("http://{addr}/status");
+		let health_url = format!("http://{addr}/health");
+		let ready_url = format!("http://{addr}/ready");
+		let sql_url = format!("http://{addr}/sql");
+
+		// The listener binds straight away (before the import), so `/status` starts
+		// answering well before the import finishes.
+		let mut bound = false;
+		for _ in 0..150 {
+			if let Ok(res) = client.get(&status_url).send().await
+				&& res.status() == 200
+			{
+				bound = true;
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+		assert!(bound, "the listener should bind before the startup import completes");
+
+		// While the import is still running: liveness and backend reachability are
+		// OK, but readiness is not, and user-facing query endpoints are gated.
+		assert_eq!(client.get(&status_url).send().await?.status(), 200, "/status during import");
+		assert_eq!(client.get(&health_url).send().await?.status(), 200, "/health during import");
+		assert_eq!(client.get(&ready_url).send().await?.status(), 503, "/ready during import");
+		let sql_during = client
+			.post(&sql_url)
+			.basic_auth(USER, Some(PASS))
+			.header(header::ACCEPT, "application/json")
+			.body("INFO FOR ROOT")
+			.send()
+			.await?;
+		assert_eq!(sql_during.status(), 503, "queries should be gated during the import");
+
+		// Wait for the import to complete; the instance then reports ready.
+		let mut ready = false;
+		for _ in 0..150 {
+			if client.get(&ready_url).send().await?.status() == 200 {
+				ready = true;
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+		assert!(ready, "/ready should return 200 once the startup import completes");
+
+		// Once ready, `/health` still answers and queries are actually served.
+		assert_eq!(client.get(&health_url).send().await?.status(), 200, "/health after import");
+		let sql_after = client
+			.post(&sql_url)
+			.basic_auth(USER, Some(PASS))
+			.header(header::ACCEPT, "application/json")
+			.body("INFO FOR ROOT")
+			.send()
+			.await?;
+		assert_eq!(sql_after.status(), 200, "queries should be served once ready");
+
+		Ok(())
+	}
+
+	#[test(tokio::test)]
+	async fn no_import_server_is_ready_at_bind() -> Result<(), Box<dyn std::error::Error>> {
+		// A server without a startup import has no deferred work, so it must be
+		// ready the instant its listener binds. Clients that connect immediately
+		// (without polling `/ready`, as the SDKs do) must not be gated with 503.
+		let (addr, _server) = common::start_server(StartServerArguments {
+			wait_is_ready: false,
+			..Default::default()
+		})
+		.await
+		.unwrap();
+
+		let client = Client::builder().build()?;
+		let status_url = format!("http://{addr}/status");
+
+		// Wait only for the listener to bind — not for readiness.
+		let mut bound = false;
+		for _ in 0..150 {
+			if let Ok(res) = client.get(&status_url).send().await
+				&& res.status() == 200
+			{
+				bound = true;
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+		assert!(bound, "server did not bind its listener");
+
+		// `ready` is set synchronously before binding for a no-import server, so
+		// `/ready` is already 200 and queries are served the moment it binds.
+		assert_eq!(
+			client.get(format!("http://{addr}/ready")).send().await?.status(),
+			200,
+			"a no-import server should be ready as soon as it binds"
+		);
+		let sql = client
+			.post(format!("http://{addr}/sql"))
+			.basic_auth(USER, Some(PASS))
+			.header(header::ACCEPT, "application/json")
+			.body("INFO FOR ROOT")
+			.send()
+			.await?;
+		assert_eq!(
+			sql.status(),
+			200,
+			"queries should be served immediately for a no-import server"
+		);
+
+		Ok(())
+	}
+
+	#[test(tokio::test)]
 	async fn no_server_id_headers() -> Result<(), Box<dyn std::error::Error>> {
 		// default server has the id headers
 		{

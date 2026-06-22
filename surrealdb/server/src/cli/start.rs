@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -306,10 +307,46 @@ pub async fn init<
 	if *METRICS_ENABLED || otlp_metrics_active() {
 		spawn_process_snapshot_refresh(canceller.clone());
 	}
-	// Start the datastore
-	let (datastore, recv, router_state) =
+	// Start the datastore. The startup import and credential initialisation are
+	// returned rather than run here, so the web server can bind before they run.
+	let (datastore, recv, router_state, pending_startup) =
 		dbs::init::<C>(composer, &config, canceller.clone(), combined_observer, dbs).await?;
 	let datastore = Arc::new(datastore);
+	// Tracks whether the instance has finished starting up (import + credentials)
+	// and is ready to serve user-facing queries. The HTTP listener binds
+	// immediately; until this flips to `true`, query/auth endpoints return 503
+	// and `/ready` reports not-ready.
+	let ready = Arc::new(AtomicBool::new(false));
+	if pending_startup.has_work() {
+		// Run the deferred startup work (import, then credentials) concurrently
+		// so the listener comes up right away, flipping `ready` once it succeeds.
+		let ds = Arc::clone(&datastore);
+		let ready = Arc::clone(&ready);
+		let startup_canceller = canceller.clone();
+		tokio::spawn(async move {
+			tokio::select! {
+				biased;
+				// Stop promptly if the server is shutting down; leave `ready`
+				// unset so we never flip to ready mid-shutdown.
+				_ = startup_canceller.cancelled() => {
+					debug!("Startup aborted before completion due to shutdown");
+				}
+				res = dbs::finish_startup(&ds, &pending_startup) => match res {
+					Ok(()) => {
+						ready.store(true, Ordering::SeqCst);
+						info!("Startup complete; instance is now ready to serve");
+					}
+					Err(err) => {
+						error!("Startup failed; instance will not become ready: {err}");
+					}
+				}
+			}
+		});
+	} else {
+		// Nothing deferred (no import, credentials already initialised): ready to
+		// serve as soon as the listener binds.
+		ready.store(true, Ordering::SeqCst);
+	}
 	// Eagerly load surrealism modules in the background unless opted out
 	#[cfg(feature = "surrealism")]
 	if !datastore.is_lazy_surrealism() {
@@ -329,6 +366,23 @@ pub async fn init<
 	}
 	// Start the node agent
 	let nodetasks = tasks::init(Arc::clone(&datastore), canceller.clone(), &config.engine);
+	// The `/ready` probe treats the node as unhealthy if its cluster heartbeat
+	// hasn't refreshed within a few cycles of the node-membership refresh task
+	// (which also confirms the storage read and write paths are working).
+	const READINESS_HEARTBEAT_STALENESS_FACTOR: u32 = 3;
+	// `checked_mul` guards against overflow from an extreme configured interval;
+	// `Duration::MAX` degrades to "heartbeat never considered stale".
+	let max_heartbeat_age = config
+		.engine
+		.node_membership_refresh_interval
+		.checked_mul(READINESS_HEARTBEAT_STALENESS_FACTOR)
+		.unwrap_or(Duration::MAX);
+	let readiness = ntw::Readiness {
+		ready: Arc::clone(&ready),
+		// The heartbeat freshness check applies on the server path, where the
+		// node-membership refresh task keeps the heartbeat current.
+		max_heartbeat_age: Some(max_heartbeat_age),
+	};
 	// Build and run the HTTP server using the provided RouterFactory implementation
 	ntw::init_with_metrics::<C>(
 		&config,
@@ -337,6 +391,7 @@ pub async fn init<
 		canceller.clone(),
 		router_state,
 		metrics_state,
+		readiness,
 	)
 	.await?;
 	// Shutdown and stop closed tasks

@@ -719,6 +719,9 @@ where
 }
 
 #[instrument(level = "trace", target = "surreal::dbs", skip_all)]
+// The return tuple is the established shape of this internal startup
+// entrypoint; the pending import is just one more element on it.
+#[allow(clippy::type_complexity)]
 /// Initialise the database server
 ///
 /// Creates and configures the datastore with the provided options.
@@ -753,7 +756,7 @@ pub async fn init<C: TransactionBuilderFactory + BucketStoreProvider>(
 		#[cfg_attr(not(feature = "surrealism"), allow(unused_variables))]
 		lazy_surrealism,
 	}: StartCommandDbsOptions,
-) -> Result<(Datastore, Receiver<Notification>, C::RouterState)> {
+) -> Result<(Datastore, Receiver<Notification>, C::RouterState, PendingStartup)> {
 	// Warn about the strict mode flag being unused.
 	if let Some(true) = strict_mode {
 		warn!(
@@ -850,28 +853,36 @@ pub async fn init<C: TransactionBuilderFactory + BucketStoreProvider>(
 		})
 		.await?;
 	}
-	// Import file at start, if provided
-	if let Some(file) = import_file {
-		// Log the startup import path
-		info!(target: TARGET, file = ?file, "Importing data from file");
-		// Read the full file contents
-		let sql = fs::read_to_string(file)?;
-		// Execute the SurrealQL file
-		retry_with_timeout("startup", startup_operation_timeout, || async {
-			dbs.startup(&sql, &Session::owner()).await
-		})
-		.await?;
-	}
-	// Setup initial server auth credentials
-	if let (Some(user), Some(pass)) = (opt.user.as_ref(), opt.pass.as_ref()) {
-		// Log the initialisation of credentials
-		info!(target: TARGET, user = %user, "Initialising credentials");
-		// Initialise the credentials
-		retry_with_timeout("initialise_credentials", startup_operation_timeout, || async {
-			dbs.initialise_credentials(user, pass).await
-		})
-		.await?;
-	}
+	// Defer the startup import so the caller can bind the HTTP listener first and
+	// run it concurrently (see [`finish_startup`]). A large or slow import no
+	// longer blocks the listener, so a pathological import cannot starve the
+	// liveness probe at startup.
+	//
+	// Credentials are created synchronously here when there is *no* import, so a
+	// plain server is fully ready the instant it starts serving (no readiness
+	// window for clients that don't poll `/ready`). When an import *is* present,
+	// credential creation is deferred to run after it, preserving the historical
+	// ordering: an import that supplies root users still suppresses creation of
+	// the CLI bootstrap user.
+	let credentials = opt.user.clone().zip(opt.pass.clone());
+	let deferred_credentials = match &import_file {
+		Some(_) => credentials,
+		None => {
+			if let Some((user, pass)) = &credentials {
+				info!(target: TARGET, user = %user, "Initialising credentials");
+				retry_with_timeout("initialise_credentials", startup_operation_timeout, || async {
+					dbs.initialise_credentials(user, pass).await
+				})
+				.await?;
+			}
+			None
+		}
+	};
+	let pending_startup = PendingStartup {
+		import_file,
+		credentials: deferred_credentials,
+		timeout: startup_operation_timeout,
+	};
 	// Bootstrap the datastore
 	retry_with_timeout("Insert node", startup_operation_timeout, || async {
 		dbs.insert_node().await
@@ -886,7 +897,55 @@ pub async fn init<C: TransactionBuilderFactory + BucketStoreProvider>(
 	})
 	.await?;
 	// All ok
-	Ok((dbs, recv, router_state))
+	Ok((dbs, recv, router_state, pending_startup))
+}
+
+/// Startup work deferred out of [`init`] so the caller can bind the HTTP
+/// listener first and run it concurrently (via [`finish_startup`]). While this
+/// is running the instance is not yet ready to serve queries (see the readiness
+/// gate in `ntw`).
+pub(crate) struct PendingStartup {
+	/// SurrealQL file to import on startup, if one was provided.
+	import_file: Option<PathBuf>,
+	/// Root credentials (user, pass) to create if no root user already exists.
+	credentials: Option<(String, String)>,
+	/// Per-operation retry budget (from `SURREAL_STARTUP_OPERATION_TIMEOUT`).
+	timeout: Duration,
+}
+
+impl PendingStartup {
+	/// Whether there is any deferred work to run. When `false`, the caller can
+	/// mark the instance ready before binding (no startup window).
+	pub(crate) fn has_work(&self) -> bool {
+		self.import_file.is_some() || self.credentials.is_some()
+	}
+}
+
+/// Run the deferred startup work: execute the import file (if any), then
+/// initialise the root credentials (if provided).
+///
+/// The import runs *before* credential initialisation so that an import which
+/// supplies root users suppresses creation of the CLI bootstrap user, matching
+/// the historical (pre-early-bind) ordering.
+pub(crate) async fn finish_startup(ds: &Datastore, pending: &PendingStartup) -> Result<()> {
+	// Import the startup file, discarding the per-statement results.
+	if let Some(file) = &pending.import_file {
+		info!(target: TARGET, file = ?file, "Importing data from file");
+		let sql = fs::read_to_string(file)?;
+		retry_with_timeout("startup", pending.timeout, || async {
+			ds.startup(&sql, &Session::owner()).await
+		})
+		.await?;
+	}
+	// Create the CLI-provided root user if no root user exists yet.
+	if let Some((user, pass)) = &pending.credentials {
+		info!(target: TARGET, user = %user, "Initialising credentials");
+		retry_with_timeout("initialise_credentials", pending.timeout, || async {
+			ds.initialise_credentials(user, pass).await
+		})
+		.await?;
+	}
+	Ok(())
 }
 
 #[cfg(test)]

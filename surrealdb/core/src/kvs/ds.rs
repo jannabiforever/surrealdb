@@ -3225,6 +3225,30 @@ impl Datastore {
 		}
 	}
 
+	/// Returns how long ago the current node last refreshed its cluster
+	/// heartbeat.
+	///
+	/// The node-membership refresh background task rewrites this node's
+	/// heartbeat to the KV store every `node_membership_refresh_interval`. A
+	/// small age therefore confirms, from work the node already performs, that
+	/// the refresh task is running and that both the storage write path (the
+	/// heartbeat was recently committed) and read path (it is readable here in
+	/// a fresh transaction) are healthy. Readiness probes use this instead of a
+	/// dedicated health check to avoid duplicating that work.
+	pub async fn node_heartbeat_age(&self) -> Result<Duration> {
+		// Open a fresh read transaction so the lookup misses the per-transaction
+		// cache and actually reads the node key from storage.
+		let tx = self.transaction(Read, Optimistic).await?;
+		let res = tx.get_node(self.id).await;
+		// Always release the transaction, regardless of the lookup result.
+		let _ = tx.cancel().await;
+		let node = res?;
+		// Heartbeats are stored as milliseconds since the epoch; saturate to
+		// avoid underflow from minor clock skew between writes and this read.
+		let now = self.clock_now();
+		Ok(Duration::from_millis(now.value.saturating_sub(node.heartbeat.value)))
+	}
+
 	/// Parse and execute an SQL query
 	///
 	/// ```rust,no_run
@@ -4548,6 +4572,36 @@ mod test {
 		assert!(!txn.closed());
 		txn.commit().await.unwrap();
 		assert!(txn.closed());
+	}
+
+	#[tokio::test]
+	async fn node_heartbeat_age_is_small_after_insert() {
+		let ds = Datastore::new("memory").await.unwrap();
+		// `insert_node` writes the current node's heartbeat at `clock_now()`.
+		ds.insert_node().await.unwrap();
+		let age = ds.node_heartbeat_age().await.unwrap();
+		assert!(age < Duration::from_secs(5), "heartbeat should be fresh, got {age:?}");
+	}
+
+	#[tokio::test]
+	async fn node_heartbeat_age_reflects_a_stale_heartbeat() {
+		let ds = Datastore::new("memory").await.unwrap();
+		// Write this node's registration with a heartbeat 60s in the past.
+		let now = ds.clock_now().value;
+		let stale = Node::new(
+			ds.id(),
+			Timestamp {
+				value: now.saturating_sub(60_000),
+			},
+			false,
+		);
+		let key = crate::key::root::nd::new(ds.id());
+		let txn = ds.transaction(Write, Optimistic).await.unwrap();
+		txn.set(&key, &stale).await.unwrap();
+		txn.commit().await.unwrap();
+		// The reported age should reflect the stale heartbeat.
+		let age = ds.node_heartbeat_age().await.unwrap();
+		assert!(age >= Duration::from_secs(59), "heartbeat should be stale, got {age:?}");
 	}
 
 	#[tokio::test]

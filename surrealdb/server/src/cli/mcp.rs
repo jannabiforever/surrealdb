@@ -118,8 +118,11 @@ pub async fn init<
 	);
 
 	let canceller = CancellationToken::new();
-	let (datastore, _recv, _router_state) =
+	let (datastore, _recv, _router_state, pending_startup) =
 		dbs::init::<C>(composer, &config, canceller.clone(), observer, dbs_opts).await?;
+	// The MCP server has no HTTP listener to bind, so run the deferred startup
+	// work (import then credentials) inline before serving any tool requests.
+	dbs::finish_startup(&datastore, &pending_startup).await?;
 	let datastore = Arc::new(datastore);
 
 	// The STDIO transport is a locally-trusted, in-process connection: the
