@@ -2750,7 +2750,7 @@ impl DatabaseProvider for Transaction {
 				if version.is_some() {
 					let key = crate::key::database::fc::new(ns, db, fc);
 					let val = self.get(&key, version).await?.ok_or_else(|| Error::FcNotFound {
-						name: fc.to_owned(),
+						name: format!("fn::{fc}"),
 					})?;
 					return Ok(Arc::new(val));
 				}
@@ -2760,7 +2760,7 @@ impl DatabaseProvider for Transaction {
 					None => {
 						let key = crate::key::database::fc::new(ns, db, fc);
 						let val = self.get(&key, None).await?.ok_or_else(|| Error::FcNotFound {
-							name: fc.to_owned(),
+							name: format!("fn::{fc}"),
 						})?;
 						let val = Arc::new(val);
 						let entry = cache::tx::Entry::Any(val.clone());

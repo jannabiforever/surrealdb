@@ -1930,6 +1930,67 @@ fn parse_define_analyzer() {
 }
 
 #[test]
+fn parse_define_analyzer_module_function() {
+	// Test statement with surrealism enabled
+	let res = syn::parse_with_settings(
+		r#"DEFINE ANALYZER ana FUNCTION mod::demo::alter_string TOKENIZERS class"#.as_bytes(),
+		ParserSettings {
+			surrealism_enabled: true,
+			..Default::default()
+		},
+		async |parser, stk| parser.parse_expr_inherit(stk).await,
+	)
+	.unwrap();
+	assert_eq!(
+		res,
+		Expr::Define(Box::new(DefineStatement::Analyzer(DefineAnalyzerStatement {
+			kind: DefineKind::Default,
+			name: Expr::Idiom(Idiom::field("ana".to_string())),
+			tokenizers: Some(vec![Tokenizer::Class]),
+			filters: None,
+			comment: Expr::Literal(Literal::None),
+			function: Some("mod::demo::alter_string".into()),
+		}))),
+	);
+
+	// Test statement without surrealism capability enabled
+	let err = syn::parse_with_settings(
+		r#"DEFINE ANALYZER ana FUNCTION mod::demo::alter_string TOKENIZERS class"#.as_bytes(),
+		ParserSettings::default(),
+		async |parser, stk| parser.parse_expr_inherit(stk).await,
+	)
+	.unwrap_err();
+	assert!(err.to_string().contains("Experimental capability `surrealism` is not enabled"));
+}
+
+#[test]
+fn parse_define_analyzer_rejects_function_calls() {
+	let err = syn::parse_with(
+		r#"DEFINE ANALYZER ana FUNCTION fn::foo::bar() TOKENIZERS class"#.as_bytes(),
+		async |parser, stk| parser.parse_expr_inherit(stk).await,
+	)
+	.unwrap_err();
+	assert!(
+		err.to_string().contains("Analyzer FUNCTION expects a function name, not a function call")
+	);
+	assert!(err.to_string().contains("Remove `()` from the analyzer FUNCTION clause"));
+
+	let err = syn::parse_with_settings(
+		r#"DEFINE ANALYZER ana FUNCTION mod::demo::alter_string() TOKENIZERS class"#.as_bytes(),
+		ParserSettings {
+			surrealism_enabled: true,
+			..Default::default()
+		},
+		async |parser, stk| parser.parse_expr_inherit(stk).await,
+	)
+	.unwrap_err();
+	assert!(
+		err.to_string().contains("Analyzer FUNCTION expects a function name, not a function call")
+	);
+	assert!(err.to_string().contains("Remove `()` from the analyzer FUNCTION clause"));
+}
+
+#[test]
 fn parse_delete() {
 	let res = syn::parse_with("DELETE FROM ONLY |foo:32..64| WITH INDEX index,index_2 Where 2 RETURN AFTER TIMEOUT 1s EXPLAIN FULL".as_bytes(),async |parser,stk| parser. parse_expr_inherit(stk).await).unwrap();
 	assert_eq!(

@@ -280,7 +280,7 @@ pub(crate) enum Error {
 	},
 
 	/// The requested function does not exist
-	#[error("The function 'fn::{name}' does not exist")]
+	#[error("The function '{name}' does not exist")]
 	FcNotFound {
 		name: String,
 	},
@@ -848,7 +848,7 @@ pub(crate) enum Error {
 	},
 
 	/// The requested function already exists
-	#[error("The function 'fn::{name}' already exists")]
+	#[error("The function '{name}' already exists")]
 	FcAlreadyExists {
 		name: String,
 	},
