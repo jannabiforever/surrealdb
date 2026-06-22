@@ -30,7 +30,6 @@ use futures_util::future::BoxFuture;
 use http::header::{CONTENT_TYPE, HeaderValue};
 use surrealdb_core::dbs::Session;
 use surrealdb_core::dbs::capabilities::RouteTarget;
-use surrealdb_core::gql::cache::GraphQLSchemaCache;
 use surrealdb_core::observe::Outcome;
 use tower_service::Service;
 use web_time::Instant;
@@ -67,25 +66,16 @@ fn graphql_operation_type_label(req: &mut GraphQLInnerRequest) -> &'static str {
 
 /// Axum service that handles GraphQL HTTP requests.
 ///
-/// Each instance holds a [`GraphQLSchemaCache`] that is shared across all
-/// requests handled by this service.  The cache is cheap to clone (backed
-/// by `Arc<RwLock<...>>`).
-#[derive(Clone)]
-pub struct GraphQLService {
-	cache: GraphQLSchemaCache,
-}
+/// Schema generation and caching are owned by the [`Datastore`] (see
+/// [`Datastore::graphql_schema`]), so this service is stateless and every
+/// transport that serves GraphQL shares one set of compiled schemas.
+#[derive(Clone, Default)]
+pub struct GraphQLService;
 
 impl GraphQLService {
-	/// Create a new GraphQL HTTP service with an empty schema cache.
+	/// Create a new GraphQL HTTP service.
 	pub fn new() -> Self {
-		GraphQLService {
-			cache: GraphQLSchemaCache::default(),
-		}
-	}
-
-	/// Return a clone of the underlying schema cache (cheap -- backed by `Arc`).
-	pub(crate) fn cache(&self) -> GraphQLSchemaCache {
-		self.cache.clone()
+		GraphQLService
 	}
 }
 
@@ -104,7 +94,6 @@ where
 	}
 
 	fn call(&mut self, req: HttpRequest<B>) -> Self::Future {
-		let cache = self.cache.clone();
 		let req = req.map(Body::new);
 
 		Box::pin(async move {
@@ -142,7 +131,7 @@ where
 				));
 			};
 
-			let schema = match cache.get_schema(datastore, session).await {
+			let schema = match datastore.graphql_schema(session).await {
 				Ok(e) => e,
 				Err(e) => {
 					info!(?e, "error generating schema");

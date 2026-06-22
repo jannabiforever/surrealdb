@@ -39,6 +39,7 @@
 mod auth;
 pub mod cache;
 pub mod error;
+pub mod exec;
 mod ext;
 mod functions;
 mod mutations;
@@ -51,4 +52,5 @@ mod utils;
 
 pub use cache::*;
 pub use error::GqlError;
+pub use exec::execute_request;
 pub use subscriptions::NotificationRouter;

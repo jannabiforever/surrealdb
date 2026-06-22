@@ -235,6 +235,13 @@ pub struct Datastore {
 	index_stores: IndexStores,
 	// The cross transaction cache
 	cache: Arc<DatastoreCache>,
+	/// Cache of generated GraphQL schemas, shared across every transport that
+	/// serves GraphQL: the HTTP `/graphql` route, GraphQL-over-WebSocket
+	/// subscriptions, the `graphql` RPC method, and the MCP `graphql` tool.
+	/// Keyed by `(ns, db, config, schema-fingerprint)` so DDL changes invalidate
+	/// it automatically.
+	#[cfg(all(feature = "graphql", not(target_family = "wasm")))]
+	gql_schema_cache: crate::gql::cache::GraphQLSchemaCache,
 	/// Registry of built-in scalar, aggregate, projection and index
 	/// functions, along with the method-dispatch table. Built once when the
 	/// datastore is constructed and shared across all transactions via the
@@ -984,6 +991,8 @@ impl Datastore {
 			#[cfg(storage)]
 			temporary_directory: self.temporary_directory,
 			cache: Arc::new(DatastoreCache::new(self.config.datastore_cache_size)),
+			#[cfg(all(feature = "graphql", not(target_family = "wasm")))]
+			gql_schema_cache: crate::gql::cache::GraphQLSchemaCache::default(),
 			function_registry: Arc::new(FunctionRegistry::with_builtins()),
 			buckets: self.buckets,
 			sequences: Sequences::new(self.transaction_factory.clone(), self.id),
@@ -1029,6 +1038,8 @@ impl Datastore {
 			#[cfg(storage)]
 			temporary_directory: self.temporary_directory.clone(),
 			cache: Arc::new(DatastoreCache::new(self.config.datastore_cache_size)),
+			#[cfg(all(feature = "graphql", not(target_family = "wasm")))]
+			gql_schema_cache: crate::gql::cache::GraphQLSchemaCache::default(),
 			function_registry: Arc::new(FunctionRegistry::with_builtins()),
 			buckets: self.buckets.clone(),
 			sequences: Sequences::new(transaction_factory.clone(), id),
@@ -4228,6 +4239,19 @@ impl Datastore {
 
 	pub fn config(&self) -> Arc<CommonConfig> {
 		Arc::clone(&self.config)
+	}
+
+	/// Retrieve (or generate and cache) the GraphQL schema for the namespace
+	/// and database selected on `session`. Backed by the datastore-wide schema
+	/// cache so every transport (HTTP `/graphql`, WebSocket subscriptions, the
+	/// `graphql` RPC method, the MCP `graphql` tool) shares one set of compiled
+	/// schemas and a single DDL-driven invalidation path.
+	#[cfg(all(feature = "graphql", not(target_family = "wasm")))]
+	pub async fn graphql_schema(
+		self: &Arc<Self>,
+		session: &Session,
+	) -> Result<async_graphql::dynamic::Schema, crate::gql::GqlError> {
+		self.gql_schema_cache.get_schema(self, session).await
 	}
 
 	#[cfg(feature = "http")]

@@ -13,7 +13,6 @@ use axum::{Extension, Router};
 use futures_util::{SinkExt, StreamExt, future};
 use surrealdb_core::dbs::Session;
 use surrealdb_core::dbs::capabilities::RouteTarget;
-use surrealdb_core::gql::cache::GraphQLSchemaCache;
 use tracing::instrument;
 
 use crate::gql::GraphQLService;
@@ -22,9 +21,7 @@ use crate::ntw::error::Error as NetError;
 use crate::rpc::RpcState;
 
 pub fn router() -> Router<Arc<RpcState>> {
-	let service = GraphQLService::new();
-	let cache = service.cache();
-	Router::new().route("/graphql", get(ws_handler).post_service(service)).layer(Extension(cache))
+	Router::new().route("/graphql", get(ws_handler).post_service(GraphQLService::new()))
 }
 
 #[instrument(skip_all)]
@@ -33,7 +30,6 @@ async fn ws_handler(
 	headers: HeaderMap,
 	Extension(state): Extension<AppState>,
 	Extension(session): Extension<Session>,
-	Extension(cache): Extension<GraphQLSchemaCache>,
 	State(rpc_state): State<Arc<RpcState>>,
 ) -> impl IntoResponse {
 	let datastore = &state.datastore;
@@ -55,7 +51,7 @@ async fn ws_handler(
 		return NetError::Request.into_response();
 	}
 
-	let schema = match cache.get_schema(datastore, &session).await {
+	let schema = match datastore.graphql_schema(&session).await {
 		Ok(schema) => schema,
 		Err(err) => {
 			info!(?err, "error generating GraphQL schema for websocket");
