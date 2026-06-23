@@ -1019,6 +1019,7 @@ impl Datastore {
 	/// process-local caches. Tests that exercise cluster liveness should call
 	/// [`Self::insert_node`] for both the original datastore and the fork.
 	#[cfg(test)]
+	#[cfg_attr(not(feature = "kv-mem"), allow(dead_code))]
 	pub(crate) fn fork_for_test_with_node_id(&self, id: Uuid) -> Self {
 		let transaction_factory = self.transaction_factory.clone();
 		Self {
@@ -3207,6 +3208,7 @@ impl Datastore {
 	}
 
 	#[cfg(test)]
+	#[cfg_attr(not(feature = "kv-mem"), allow(dead_code))]
 	pub(crate) fn index_builder(&self) -> &IndexBuilder {
 		&self.index_builder
 	}

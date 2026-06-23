@@ -170,6 +170,7 @@ pub(crate) mod testing {
 		retryable_conflicts().lock().unwrap().get(&(site, node_id)).copied().unwrap_or(0)
 	}
 
+	#[cfg_attr(not(feature = "kv-mem"), allow(dead_code))]
 	pub(crate) fn inject_non_retryable_error(
 		site: NonRetryableErrorSite,
 		node_id: Uuid,
@@ -177,6 +178,7 @@ pub(crate) mod testing {
 		inject_non_retryable_errors(site, node_id, 1)
 	}
 
+	#[cfg_attr(not(feature = "kv-mem"), allow(dead_code))]
 	pub(crate) fn inject_non_retryable_errors(
 		site: NonRetryableErrorSite,
 		node_id: Uuid,
@@ -216,6 +218,7 @@ pub(crate) mod testing {
 		}
 	}
 
+	#[cfg_attr(not(feature = "kv-mem"), allow(dead_code))]
 	pub(crate) struct NonRetryableErrorGuard {
 		site: NonRetryableErrorSite,
 		node_id: Uuid,

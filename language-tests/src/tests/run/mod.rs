@@ -17,6 +17,7 @@ pub struct CaseImports {
 pub struct TestRunId(usize);
 
 impl TestRunId {
+	#[allow(dead_code)]
 	pub fn new(id: usize) -> Self {
 		TestRunId(id)
 	}

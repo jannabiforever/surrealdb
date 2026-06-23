@@ -920,6 +920,7 @@ impl Building {
 	}
 
 	#[cfg(test)]
+	#[cfg_attr(not(feature = "kv-mem"), allow(dead_code))]
 	pub(super) async fn run(&self) -> Result<()> {
 		let Some(acquired) = self.acquire_build_state().await? else {
 			return Ok(());

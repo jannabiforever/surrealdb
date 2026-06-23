@@ -1,7 +1,4 @@
 [env]
-RUSTFLAGS = { value = "--cfg tokio_unstable", condition = { env_not_set = [
-    "RUSTFLAGS",
-] } }
 BENCH_WORKER_THREADS = { value = "1", condition = { env_not_set = [
     "BENCH_WORKER_THREADS",
 ] } }
@@ -200,7 +197,7 @@ args = [
     "surrealdb-server",
     "--each-feature",
     "--exclude-features",
-    "storage-indxdb",
+    "storage-indxdb,tokio-console",
     "--include-features",
     "storage-mem",
     "--exclude-no-default-features",

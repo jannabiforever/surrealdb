@@ -61,6 +61,9 @@ jobs:
             target: aarch64-unknown-linux-gnu
             # amd64 leg stays on-demand (no amd spot pool); arm builds spot on PRs.
             runner: runner-arm-32-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
+    env:
+      SCCACHE_LOG: ${{ (github.event_name == 'push' || github.event_name == 'merge_group') && 'debug' || '' }}
+      SCCACHE_ERROR_LOG: ${{ (github.event_name == 'push' || github.event_name == 'merge_group') && '/tmp/sccache.log' || '' }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -72,6 +75,18 @@ jobs:
 
       - name: Build binary
         run: cargo build --target ${{ matrix.target }}
+
+      - name: sccache stats
+        if: ${{ always() }}
+        run: sccache --show-stats || true
+
+      - name: Upload sccache debug log
+        if: ${{ always() && (github.event_name == 'push' || github.event_name == 'merge_group') }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # (Actions must be pinned by commit hash) v7.0.0
+        with:
+          name: sccache-debug-build-${{ matrix.name }}
+          path: /tmp/sccache.log
+          if-no-files-found: warn
 
       - name: Upload artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # (Actions must be pinned by commit hash) v7.0.0
@@ -566,6 +581,27 @@ jobs:
         run: cargo make ci-lang-upgrade-test-${{ matrix.engine }}
 
   # ----------------------------------------
+  # Tokio-console feature check
+  # ----------------------------------------
+
+  check-tokio-console:
+    name: Check tokio-console feature
+    runs-on: runner-arm-16-cores${{ github.event_name == 'pull_request' && '-spot' || '' }}
+    env:
+      RUSTFLAGS: -D warnings --cfg tokio_unstable
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+        with:
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check tokio-console feature
+        run: cargo check --package surrealdb-server --features tokio-console
+
+  # ----------------------------------------
   # Required checks
   # ----------------------------------------
 
@@ -592,6 +628,7 @@ jobs:
       - check-revision
       - check-docs
       - feature-check
+      - check-tokio-console
       - unused-deps
       # Integration tests
       - integration-tests
@@ -623,6 +660,7 @@ jobs:
             "${{ needs.check-revision.result }}"
             "${{ needs.check-docs.result }}"
             "${{ needs.feature-check.result }}"
+            "${{ needs.check-tokio-console.result }}"
             "${{ needs.unused-deps.result }}"
             "${{ needs.integration-tests.result }}"
             "${{ needs.test.result }}"

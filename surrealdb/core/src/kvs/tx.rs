@@ -825,6 +825,7 @@ impl Transaction {
 	/// a specific `next_mutation_seq`. Used by overflow regression tests so
 	/// the failure mode can be exercised without running `u32::MAX` lookups.
 	#[cfg(test)]
+	#[cfg_attr(not(feature = "kv-mem"), allow(dead_code))]
 	pub(crate) async fn seed_cached_index_build_reservation_for_test(
 		&self,
 		key: CachedIndexBuildReservationKey,

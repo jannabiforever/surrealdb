@@ -367,6 +367,7 @@ impl IndexKeyBase {
 	}
 
 	#[cfg(test)]
+	#[cfg_attr(not(feature = "kv-mem"), allow(dead_code))]
 	/// Range covering primary-appending markers for one build generation.
 	pub(crate) fn new_bp_range(&self, generation: BuildGeneration) -> Result<Range<Key>> {
 		Bp::range(self.0.ns, self.0.db, &self.0.tb, self.0.ix, generation)
