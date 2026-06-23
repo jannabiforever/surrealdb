@@ -1252,34 +1252,22 @@ fn parse_define_access_record() {
 			}))),
 		);
 	}
-	// TODO: Parameterization broke the guarantee that token duration is not none.
-	/*
-	// kjjification with JWT is explicitly defined only with symmetric key. Token
-	// duration is none.
+	// `DURATION FOR TOKEN NONE` on TYPE RECORD used to be rejected at parse
+	// time. Parameterization made the duration an arbitrary expression, so the
+	// rejection now lives in `DefineAccessStatement::to_definition` (and the
+	// matching ALTER path) — see `language-tests/tests/access/*/record_token_duration_*.surql`.
+	// TYPE RECORD is only valid at the database level.
 	{
 		syn::parse_with(
-			r#"DEFINE ACCESS a ON DB TYPE RECORD DURATION FOR TOKEN NONE"#.as_bytes(),
+			r#"DEFINE ACCESS a ON ROOT TYPE RECORD"#.as_bytes(),
 			async |parser, stk| parser.parse_expr_inherit(stk).await,
 		)
 		.unwrap_err();
-	}
-	// Attempt to define record access at the root level.
-	{
-		syn::parse_with(
-			r#"DEFINE ACCESS a ON ROOT TYPE RECORD DURATION FOR TOKEN NONE"#.as_bytes(),
-			async |parser, stk| parser.parse_expr_inherit(stk).await,
-		)
+		syn::parse_with(r#"DEFINE ACCESS a ON NS TYPE RECORD"#.as_bytes(), async |parser, stk| {
+			parser.parse_expr_inherit(stk).await
+		})
 		.unwrap_err();
 	}
-	// Attempt to define record access at the namespace level.
-	{
-		syn::parse_with(
-			r#"DEFINE ACCESS a ON NS TYPE RECORD DURATION FOR TOKEN NONE"#.as_bytes(),
-			async |parser, stk| parser.parse_expr_inherit(stk).await,
-		)
-		.unwrap_err();
-	}
-	*/
 }
 
 #[test]

@@ -1047,6 +1047,11 @@ pub(crate) enum Error {
 	#[error("This access method results in an invalid expiration")]
 	AccessInvalidExpiration,
 
+	#[error(
+		"Tokens issued by record access methods can be consumed by third parties and must have an expiration; DURATION FOR TOKEN cannot be NONE on TYPE RECORD access"
+	)]
+	AccessRecordTokenDurationRequired,
+
 	#[error("The record access signup query failed")]
 	AccessRecordSignupQueryFailed,
 
