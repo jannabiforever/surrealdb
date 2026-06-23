@@ -164,6 +164,20 @@ impl Document {
 	/// only the first key in the graph edge range. If no edges are found, the DELETE
 	/// statement is skipped entirely, avoiding unnecessary overhead.
 	///
+	/// Unlike [`Self::purge_references`], this peek cannot be eliminated with a
+	/// catalog-only check. Edges are created dynamically by `RELATE` with no
+	/// static schema flag, and a record in *any* table — including a default
+	/// `TableType::Any` table that was never declared a relation — can become a
+	/// graph endpoint and gain adjacency keys. So the table catalog cannot
+	/// prove a record has no edges. The only correct way to skip would be a
+	/// durable, per-table "has any edges" hint maintained on edge write/delete;
+	/// that is deferred because a hint cannot be made safe for databases that
+	/// already contain edges from before it existed (an absent hint would have
+	/// to mean "must scan", so it could never enable skipping for pre-existing
+	/// data without a full migration). The per-record peek is therefore left in
+	/// place; eliminating the references scan above already removes the larger,
+	/// always-empty-in-the-common-case scan from the DELETE hot path.
+	///
 	/// The cascade runs with the caller's permissions so that an edge table's
 	/// `PERMISSIONS FOR delete` clause cannot be bypassed by deleting one of its
 	/// endpoint vertices. Edges the caller is not allowed to delete are left in
@@ -235,6 +249,14 @@ impl Document {
 	///
 	/// This function runs with permissions disabled to ensure referential integrity
 	/// operations can complete regardless of user permissions.
+	///
+	/// As an optimization, the reference range scan is skipped entirely when
+	/// the schema proves no `DEFINE FIELD ... REFERENCE` anywhere in the
+	/// database could target this record's table: a reference key is only ever
+	/// written under a record's range while such a field exists, so with none
+	/// present there is nothing to find or clean. This avoids one read
+	/// round-trip per deleted record on the distributed backend for the common
+	/// case of tables with no incoming references.
 	async fn purge_references(
 		&self,
 		stk: &mut Stk,
@@ -248,6 +270,25 @@ impl Document {
 		let ns = self.doc_ctx.ns().namespace_id;
 		// Get the database id
 		let db = self.doc_ctx.db().database_id;
+		// Skip the scan when no reference field in the database can target this
+		// table. A reference key under this record's range is only ever written
+		// while some `DEFINE FIELD ... REFERENCE` can hold a record id of this
+		// table, so if none can, there are no reference keys to process and the
+		// scan (plus its trailing range delete) is pure overhead. This is a
+		// catalog-only check served from the transaction cache, so it costs no
+		// per-record round-trips. The gate is sound because every path that
+		// stops a field from targeting a table also purges that table's
+		// reference keys for it — `REMOVE FIELD`, `ALTER FIELD`, and
+		// `DEFINE FIELD ... OVERWRITE` all call `purge_dropped_reference_keys` —
+		// so "no current reference field can target this table" implies there
+		// are no reference keys left to clean. (Should an inert key nonetheless
+		// outlive its field definition — e.g. data from an older release —
+		// skipping stays correct: with no field definition there is no ON DELETE
+		// strategy to apply, and it avoids the `FdNotFound` the scan would
+		// otherwise raise when decoding such an orphaned key.)
+		if !txn.table_may_have_incoming_references(ns, db, &rid.table).await? {
+			return Ok(());
+		}
 		// Get the key range of the reference keys
 		let prefix = crate::key::r#ref::prefix(ns, db, &rid.table, &rid.key)?;
 		let suffix = crate::key::r#ref::suffix(ns, db, &rid.table, &rid.key)?;

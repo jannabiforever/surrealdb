@@ -98,6 +98,10 @@ impl AlterFieldStatement {
 			}
 		};
 
+		// Snapshot the definition before mutating it so we can tell which
+		// reference target tables the change drops.
+		let old_definition = df.clone();
+
 		match self.kind {
 			AlterKind::Set(ref k) => df.field_kind = Some(k.clone()),
 			AlterKind::Drop => df.field_kind = None,
@@ -167,6 +171,21 @@ impl AlterFieldStatement {
 
 		let key = crate::key::table::fd::new(ns, db, &what, &name);
 		txn.set(&key, &df).await?;
+		// Dropping the REFERENCE clause or narrowing/changing the record kind can
+		// strand reference keys under target tables the field no longer
+		// references. Purge them so the DELETE reference-purge gate stays sound.
+		// Skipped during import, which restores reference keys verbatim.
+		if !opt.import {
+			crate::expr::statements::define::purge_dropped_reference_keys(
+				&txn,
+				ns,
+				db,
+				&what,
+				&old_definition,
+				Some(&df),
+			)
+			.await?;
+		}
 		// Refresh the table cache
 		let Some(tb) = txn.get_tb(ns, db, &what, None).await? else {
 			return Err(Error::TbNotFound {

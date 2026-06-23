@@ -10,7 +10,7 @@
 #![allow(private_bounds, private_interfaces)]
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::{Deref, Range};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -670,7 +670,91 @@ impl<'a> MeteredValsCursor<'a> {
 	}
 }
 
+/// Database-wide summary of which tables any `REFERENCE` field can target,
+/// memoized per transaction for the DELETE reference-purge gate
+/// ([`Transaction::table_may_have_incoming_references`]).
+struct ReferenceTargets {
+	/// Some reference field can hold a record of *any* table (an untyped
+	/// `record`), so every table must be treated as potentially referenced.
+	any: bool,
+	/// The concrete set of tables that typed reference fields can target.
+	tables: HashSet<TableName>,
+}
+
+impl ReferenceTargets {
+	fn can_target(&self, table: &TableName) -> bool {
+		self.any || self.tables.contains(table)
+	}
+}
+
 impl Transaction {
+	/// Returns `true` if any `DEFINE FIELD ... REFERENCE` in this database could
+	/// target a record in `table` (so a record in `table` may have incoming
+	/// reference keys).
+	///
+	/// A reference key is only ever written under a record's range while some
+	/// reference field can hold a record id of that record's table, so when no
+	/// reference field can target `table` there can be no reference keys for any
+	/// record in it. The DELETE purge path uses this to skip the per-record
+	/// reference range scan entirely in that case — on a distributed backend
+	/// that scan is a read round-trip per deleted record.
+	///
+	/// The per-database answer is derived from the (transaction-cached) table
+	/// and field catalog and memoized for the transaction, so a batch delete
+	/// computes it at most once regardless of how many records or tables it
+	/// touches. It is conservative: any reference field whose kind is not
+	/// provably unable to hold a record of `table` keeps the scan, so a record
+	/// that genuinely needs its references cleaned is never skipped.
+	pub(crate) async fn table_may_have_incoming_references(
+		&self,
+		ns: NamespaceId,
+		db: DatabaseId,
+		table: &TableName,
+	) -> Result<bool> {
+		Ok(self.database_reference_targets(ns, db).await?.can_target(table))
+	}
+
+	/// Compute, or fetch the memoized, [`ReferenceTargets`] summary for a
+	/// database. Invalidated alongside field definitions (see `put_tb_field`
+	/// and the `clear_cache` on ALTER/REMOVE FIELD).
+	async fn database_reference_targets(
+		&self,
+		ns: NamespaceId,
+		db: DatabaseId,
+	) -> Result<Arc<ReferenceTargets>> {
+		let qey = cache::tx::Lookup::DbReferenceTargets(ns, db);
+		if let Some(entry) = self.cache.get(&qey) {
+			return entry.try_into_type::<ReferenceTargets>();
+		}
+		let mut any = false;
+		let mut tables = HashSet::new();
+		for tb in self.all_tb(ns, db, None).await?.iter() {
+			for fd in self.all_tb_fields(ns, db, &tb.name, None).await?.iter() {
+				// Only reference fields write reference keys.
+				if fd.reference.is_none() {
+					continue;
+				}
+				match &fd.field_kind {
+					Some(kind) => {
+						if kind.collect_reference_target_tables(&mut tables) {
+							any = true;
+						}
+					}
+					// A reference field always has a record-like kind (enforced
+					// at DEFINE FIELD time); treat a missing kind as able to
+					// target anything, erring towards running the scan.
+					None => any = true,
+				}
+			}
+		}
+		let targets = Arc::new(ReferenceTargets {
+			any,
+			tables,
+		});
+		self.cache.insert(qey, cache::tx::Entry::Any(targets.clone()));
+		Ok(targets)
+	}
+
 	/// Create a new transaction.
 	///
 	/// `observer` is dispatched to on commit/cancel; pass
@@ -3509,6 +3593,13 @@ impl TableProvider for Transaction {
 			// Invalidate the cached list of all fields for this table
 			let list_key = cache::tx::Lookup::Fds(ns, db, tb.as_ref());
 			self.cache.remove(&list_key);
+
+			// Defining a field can add (or change) a REFERENCE, so the
+			// database-wide reference-target summary memoized for the DELETE
+			// purge gate may now be stale. Drop it so it is recomputed on next
+			// use. (ALTER/REMOVE FIELD instead clear the whole transaction
+			// cache, which covers this entry too.)
+			self.cache.remove(&cache::tx::Lookup::DbReferenceTargets(ns, db));
 
 			// Set the entry in the cache
 			let qey = cache::tx::Lookup::Fd(ns, db, tb, &name);
