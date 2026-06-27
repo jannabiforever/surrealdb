@@ -210,6 +210,33 @@ jobs:
             echo "::error title=Downstream compatibility::could not find the surrealdb-server git source in downstream/Cargo.toml"
             exit 1
           fi
+
+          # Cargo records the git source's resolved version as an available
+          # version and selects the newest semver-compatible one. When this
+          # engine is OLDER than the version downstream already locked from git
+          # (e.g. a release branch: 3.2.x here vs 3.3.0-nightly on main), cargo
+          # prefers the original git source over the path [patch] below and tries
+          # to fetch the pinned private rev — which the runner cannot
+          # authenticate, so the build fails before it starts. Stamp this
+          # engine's surrealdb-server crate to the exact version downstream
+          # locked, so the patch is the preferred (equal-version) source and the
+          # original git source is never fetched. Only the server crate's own
+          # version is rewritten; its path deps on -core/-types are unaffected,
+          # and on main (where the versions already match) this is a no-op.
+          want_ver="$(awk '
+            /^\[\[package\]\]/ { name = ""; ver = "" }
+            /^name = / { name = $3; gsub(/"/, "", name) }
+            /^version = / { ver = $3; gsub(/"/, "", ver) }
+            name == "surrealdb-server" && ver != "" { print ver; exit }
+          ' downstream/Cargo.lock)"
+          server_toml="${ENGINE}/surrealdb/server/Cargo.toml"
+          if [ -n "${want_ver}" ] && grep -qE '^version\.workspace = true$' "${server_toml}"; then
+            sed -i -E "s/^version\.workspace = true$/version = \"${want_ver}\"/" "${server_toml}"
+            echo "Stamped engine surrealdb-server version -> ${want_ver} (matches downstream lock)"
+          else
+            echo "::warning title=Downstream compatibility::could not stamp engine surrealdb-server version (want_ver='${want_ver}'); cargo may skip the [patch] if the engine version differs from the downstream lock"
+          fi
+
           {
             echo ""
             echo "# CI-only (downstream-compat): build against this PR's engine checkout."
